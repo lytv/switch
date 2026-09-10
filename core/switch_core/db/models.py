@@ -981,10 +981,11 @@ class JiraTrigger(Base):
 class JiraTriggerFiring(Base):
     """Delivery history and dedupe / burst / cool-down ledger for Jira triggers.
 
-    Claim rows (``pending`` / ``delivered`` / ``error``) block a repeat of the
-    same ``(issue_key, rule_id, transition_key)`` inside the dedupe window.
-    Suppression rows (``suppressed_*``) are logged for operators but do not
-    claim the key. Older rows are pruned by retention bounds.
+    At most one row per ``(issue_key, rule_id, transition_key)`` may hold
+    ``claim_held=True`` (partial unique index). That holds the dedupe claim
+    atomically across workers. When the dedupe window expires the claim is
+    released (``claim_held=False``) without deleting the delivery row — retention
+    pruning owns deletion. Suppression rows never hold the claim.
     """
 
     __tablename__ = "jira_trigger_firings"
@@ -993,6 +994,14 @@ class JiraTriggerFiring(Base):
         Index("ix_jira_trigger_firings_created", "created_at"),
         Index("ix_jira_trigger_firings_instance_created", "instance", "created_at"),
         Index("ix_jira_trigger_firings_status_created", "status", "created_at"),
+        Index(
+            "uq_jira_trigger_firings_active_claim",
+            "issue_key",
+            "rule_id",
+            "transition_key",
+            unique=True,
+            postgresql_where=text("claim_held IS TRUE"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
@@ -1013,6 +1022,8 @@ class JiraTriggerFiring(Base):
     room_results: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # True while this row blocks a repeat of the same dedupe key.
+    claim_held: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

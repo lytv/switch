@@ -271,6 +271,47 @@ async def test_process_event_cooldown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transient_valueerror_send_failure_is_retried() -> None:
+    rule = _room_rule(message_template="x", project_key="", issue_type="")
+    trigger_store = _trigger_store()
+    trigger_store.list = AsyncMock(return_value=[rule])
+    agent_store = AsyncMock()
+    agent_store.get_by_name = AsyncMock(
+        return_value=SimpleNamespace(id="jira-agent-id")
+    )
+    room_store = AsyncMock()
+    room_store.get = AsyncMock(
+        return_value=SimpleNamespace(id="room-1", name="Feature")
+    )
+    protocol = AsyncMock()
+    protocol.send_targeted_message = AsyncMock(
+        side_effect=[
+            ValueError("Failed to send message"),
+            SendTargetedResult(
+                event_id="$evt",
+                target_statuses={"coder": AgentStatus.LIVE},
+            ),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    service = _service(
+        trigger_store=trigger_store,
+        agent_store=agent_store,
+        protocol=protocol,
+        room_store=room_store,
+        sleep=_sleep,
+    )
+    await service.process_event(instance="acme", event=_event())
+    assert protocol.send_targeted_message.await_count == 2
+    assert sleeps == [0.01]
+    assert trigger_store.finalize_firing.await_args.kwargs["status"] == "delivered"
+
+
+@pytest.mark.asyncio
 async def test_transient_failure_retries_then_succeeds() -> None:
     rule = _room_rule(message_template="x", project_key="", issue_type="")
     trigger_store = _trigger_store()
@@ -345,10 +386,15 @@ async def test_permanent_failure_is_not_retried() -> None:
 
 
 def test_permanent_classifier() -> None:
-    assert is_permanent_delivery_error(ValueError("x"))
+    assert is_permanent_delivery_error(ValueError("Targets not in room: coder"))
     assert is_permanent_delivery_error(PermissionError("x"))
     assert not is_permanent_delivery_error(RuntimeError("x"))
     assert not is_permanent_delivery_error(TimeoutError("x"))
+    assert not is_permanent_delivery_error(ValueError("Failed to send message"))
+    assert not is_permanent_delivery_error(ValueError("Agent client not running"))
+    assert not is_permanent_delivery_error(
+        ValueError("Agent client not connected to Matrix")
+    )
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.db.models import JiraTrigger, JiraTriggerFiring, Room
-from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
+from switch_core.db.stores.jira_trigger_store import ATTEMPT_STATUSES, JiraTriggerStore
 
 
 async def _make_room(session: AsyncSession, name: str) -> Room:
@@ -185,6 +185,7 @@ async def test_delivery_log_list_finalize_and_prune(
                 instance="acme",
                 rule_name="log",
                 status="delivered",
+                claim_held=False,
                 created_at=now - timedelta(days=30),
             )
         )
@@ -206,3 +207,122 @@ async def test_delivery_log_list_finalize_and_prune(
     async with session_factory() as session:
         remaining = await store.list_deliveries(session, instance="acme", limit=50)
         assert all(r.issue_key != "OLD-1" for r in remaining)
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_keeps_delivery_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Dedupe window expiry releases the claim without deleting history."""
+    store = JiraTriggerStore()
+    async with session_factory() as session:
+        room = await _make_room(session, "retain-room")
+        trigger = JiraTrigger(
+            name="retain",
+            instance="acme",
+            fire_on="transition",
+            target_room_id=room.id,
+            agent_name="coder",
+            message_template="x",
+        )
+        await store.create(session, trigger)
+        await session.commit()
+        rule_id = trigger.id
+
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        first = await store.try_record_firing(
+            session,
+            issue_key="PROJ-RET",
+            rule_id=rule_id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="retain",
+            now=t0,
+        )
+        assert first is not None
+        await store.finalize_firing(
+            session,
+            first,
+            status="delivered",
+            room_results=[{"room_id": "r", "status": "ok", "attempts": 1}],
+            error=None,
+            attempt_count=1,
+        )
+        await session.commit()
+
+    t1 = t0 + timedelta(seconds=120)
+    async with session_factory() as session:
+        second = await store.try_record_firing(
+            session,
+            issue_key="PROJ-RET",
+            rule_id=rule_id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="retain",
+            now=t1,
+        )
+        assert second is not None
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = await store.list_deliveries(session, rule_id=rule_id, limit=20)
+        delivered_or_pending = [
+            r
+            for r in rows
+            if r.issue_key == "PROJ-RET" and r.status in ATTEMPT_STATUSES
+        ]
+        assert len(delivered_or_pending) == 2
+        held = [r for r in delivered_or_pending if r.claim_held]
+        assert len(held) == 1
+        assert held[0].id == second
+        first_row = next(r for r in delivered_or_pending if r.id == first)
+        assert first_row.claim_held is False
+        assert first_row.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claims_only_one_succeeds(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two workers racing on the same dedupe key: partial unique index admits one."""
+    import asyncio
+
+    store = JiraTriggerStore()
+    async with session_factory() as session:
+        room = await _make_room(session, "race-room")
+        trigger = JiraTrigger(
+            name="race",
+            instance="acme",
+            fire_on="transition",
+            target_room_id=room.id,
+            agent_name="coder",
+            message_template="x",
+        )
+        await store.create(session, trigger)
+        await session.commit()
+        rule_id = trigger.id
+
+    async def _claim() -> str | None:
+        async with session_factory() as session:
+            firing_id = await store.try_record_firing(
+                session,
+                issue_key="PROJ-RACE",
+                rule_id=rule_id,
+                transition_key="created",
+                dedupe_window=timedelta(seconds=300),
+                instance="acme",
+                rule_name="race",
+            )
+            await session.commit()
+            return firing_id
+
+    results = await asyncio.gather(_claim(), _claim(), _claim())
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1
+
+    async with session_factory() as session:
+        held = await store.list_deliveries(session, rule_id=rule_id, limit=20)
+        assert sum(1 for r in held if r.claim_held and r.issue_key == "PROJ-RACE") == 1

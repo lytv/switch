@@ -70,6 +70,38 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
+    # Active dedupe claim flag: at most one held claim per key (atomic).
+    # Suppression rows and expired claims set this false so history is kept.
+    op.add_column(
+        "jira_trigger_firings",
+        sa.Column(
+            "claim_held",
+            sa.Boolean(),
+            server_default=sa.text("true"),
+            nullable=False,
+        ),
+    )
+    # Existing Phase-1 rows were unique claims; keep them held until expiry logic
+    # releases them. Suppression inserts always write claim_held=false.
+    op.execute(
+        sa.text(
+            "UPDATE jira_trigger_firings SET claim_held = true "
+            "WHERE status IN ('pending', 'delivered', 'error')"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE jira_trigger_firings SET claim_held = false "
+            "WHERE status LIKE 'suppressed_%'"
+        )
+    )
+    op.create_index(
+        "uq_jira_trigger_firings_active_claim",
+        "jira_trigger_firings",
+        ["issue_key", "rule_id", "transition_key"],
+        unique=True,
+        postgresql_where=sa.text("claim_held IS TRUE"),
+    )
     op.create_index(
         "ix_jira_trigger_firings_created",
         "jira_trigger_firings",
@@ -100,6 +132,39 @@ def downgrade() -> None:
         "ix_jira_trigger_firings_created",
         table_name="jira_trigger_firings",
     )
+    op.drop_index(
+        "uq_jira_trigger_firings_active_claim",
+        table_name="jira_trigger_firings",
+    )
+    # Collapse duplicate (issue_key, rule_id, transition_key) rows that the
+    # delivery log intentionally allowed (claim + suppressed_dedupe, etc.)
+    # before recreating the Phase-1 unique constraint.
+    op.execute(
+        sa.text(
+            """
+            DELETE FROM jira_trigger_firings a
+            USING jira_trigger_firings b
+            WHERE a.issue_key = b.issue_key
+              AND a.rule_id = b.rule_id
+              AND a.transition_key = b.transition_key
+              AND a.created_at < b.created_at
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            """
+            DELETE FROM jira_trigger_firings a
+            USING jira_trigger_firings b
+            WHERE a.issue_key = b.issue_key
+              AND a.rule_id = b.rule_id
+              AND a.transition_key = b.transition_key
+              AND a.created_at = b.created_at
+              AND a.id < b.id
+            """
+        )
+    )
+    op.drop_column("jira_trigger_firings", "claim_held")
     op.drop_column("jira_trigger_firings", "attempt_count")
     op.drop_column("jira_trigger_firings", "error")
     op.drop_column("jira_trigger_firings", "room_results")

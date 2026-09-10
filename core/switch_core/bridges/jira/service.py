@@ -33,8 +33,23 @@ def transition_key_for(event: ParsedJiraEvent) -> str:
 
 
 def is_permanent_delivery_error(exc: BaseException) -> bool:
-    """Authorization / validation failures must not be retried."""
-    return isinstance(exc, (PermissionError, ValueError))
+    """Authorization / validation failures must not be retried.
+
+    Transport send failures are often wrapped as ``ValueError("Failed to send
+    message")`` (and similar client-not-ready messages); those stay retryable.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    if not isinstance(exc, ValueError):
+        return False
+    msg = str(exc)
+    retryable_markers = (
+        "Failed to send message",
+        "Failed to send media message",
+        "Agent client not running",
+        "Agent client not connected",
+    )
+    return not any(marker in msg for marker in retryable_markers)
 
 
 def safe_error_text(exc: BaseException) -> str:

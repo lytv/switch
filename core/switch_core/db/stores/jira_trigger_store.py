@@ -3,15 +3,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from switch_core.db.models import JiraIssueThread, JiraTrigger, JiraTriggerFiring
 
-# Claim statuses block a repeat of the same dedupe key inside the window.
-CLAIM_STATUSES = frozenset({"pending", "delivered", "error"})
-# Rows that count toward burst / cool-down (actual fire attempts).
+# Claim statuses count toward burst / cool-down (actual fire attempts).
 ATTEMPT_STATUSES = frozenset({"pending", "delivered", "error"})
 
 
@@ -78,48 +78,68 @@ class JiraTriggerStore:
         matched_rule_ids: Sequence[str] | None = None,
         now: datetime | None = None,
     ) -> str | None:
-        """Insert a ``pending`` claim row when the dedupe key is free.
+        """Atomically insert a ``pending`` claim row when the dedupe key is free.
+
+        Releases expired held claims (``claim_held=False``) without deleting
+        delivery history, then inserts with ``ON CONFLICT DO NOTHING`` against
+        the partial unique index on active claims.
 
         Returns the new firing id when this caller should proceed, or None when
-        a recent claim already exists.
+        a recent claim already exists (or another worker won the race).
         """
+        clock = now or datetime.now(UTC)
+        cutoff = clock - dedupe_window
+
+        # Release stale claims so a new fire can proceed after the window
+        # without erasing audit rows (retention prune owns deletion).
+        await session.execute(
+            update(JiraTriggerFiring)
+            .where(
+                JiraTriggerFiring.issue_key == issue_key,
+                JiraTriggerFiring.rule_id == rule_id,
+                JiraTriggerFiring.transition_key == transition_key,
+                JiraTriggerFiring.claim_held.is_(True),
+                JiraTriggerFiring.created_at < cutoff,
+            )
+            .values(claim_held=False)
+        )
+
         if await self.has_recent_claim(
             session,
             issue_key=issue_key,
             rule_id=rule_id,
             transition_key=transition_key,
             dedupe_window=dedupe_window,
-            now=now,
+            now=clock,
         ):
             return None
 
-        clock = now or datetime.now(UTC)
-        cutoff = clock - dedupe_window
-        # Drop stale claim rows for the same key so history stays readable and
-        # old pending/error rows outside the window do not confuse operators.
-        await session.execute(
-            delete(JiraTriggerFiring).where(
-                JiraTriggerFiring.issue_key == issue_key,
-                JiraTriggerFiring.rule_id == rule_id,
-                JiraTriggerFiring.transition_key == transition_key,
-                JiraTriggerFiring.status.in_(CLAIM_STATUSES),
-                JiraTriggerFiring.created_at < cutoff,
+        firing_id = str(uuid4())
+        stmt = (
+            insert(JiraTriggerFiring)
+            .values(
+                id=firing_id,
+                issue_key=issue_key,
+                rule_id=rule_id,
+                transition_key=transition_key,
+                instance=instance,
+                rule_name=rule_name,
+                status="pending",
+                matched_rule_ids=list(matched_rule_ids) if matched_rule_ids else None,
+                attempt_count=1,
+                claim_held=True,
+                created_at=clock,
             )
+            .on_conflict_do_nothing(
+                index_elements=["issue_key", "rule_id", "transition_key"],
+                index_where=text("claim_held IS TRUE"),
+            )
+            .returning(JiraTriggerFiring.id)
         )
-        row = JiraTriggerFiring(
-            issue_key=issue_key,
-            rule_id=rule_id,
-            transition_key=transition_key,
-            instance=instance,
-            rule_name=rule_name,
-            status="pending",
-            matched_rule_ids=list(matched_rule_ids) if matched_rule_ids else None,
-            attempt_count=1,
-            created_at=clock,
-        )
-        session.add(row)
+        result = await session.execute(stmt)
+        inserted = result.scalar_one_or_none()
         await session.flush()
-        return row.id
+        return inserted
 
     async def has_recent_claim(
         self,
@@ -138,7 +158,7 @@ class JiraTriggerStore:
                 JiraTriggerFiring.issue_key == issue_key,
                 JiraTriggerFiring.rule_id == rule_id,
                 JiraTriggerFiring.transition_key == transition_key,
-                JiraTriggerFiring.status.in_(CLAIM_STATUSES),
+                JiraTriggerFiring.claim_held.is_(True),
                 JiraTriggerFiring.created_at >= cutoff,
             )
         )
@@ -170,6 +190,7 @@ class JiraTriggerStore:
             matched_rule_ids=list(matched_rule_ids) if matched_rule_ids else None,
             error=error,
             attempt_count=0,
+            claim_held=False,
             created_at=clock,
         )
         session.add(row)
@@ -193,6 +214,7 @@ class JiraTriggerStore:
         row.room_results = list(room_results) if room_results is not None else None
         row.error = error
         row.attempt_count = attempt_count
+        # Keep claim_held so the dedupe window still blocks repeats.
         await session.flush()
 
     async def count_firings_in_window(
@@ -324,8 +346,6 @@ class JiraTriggerStore:
         issue_key: str,
         thread_root_event_id: str,
     ) -> None:
-        from sqlalchemy.dialects.postgresql import insert
-
         stmt = (
             insert(JiraIssueThread)
             .values(
