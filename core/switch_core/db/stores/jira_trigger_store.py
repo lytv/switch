@@ -6,7 +6,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from switch_core.db.models import JiraTrigger, JiraTriggerFiring
+from switch_core.db.models import JiraIssueThread, JiraTrigger, JiraTriggerFiring
 
 
 class JiraTriggerStore:
@@ -129,3 +129,38 @@ class JiraTriggerStore:
             )
         )
         return int(result.scalar_one())
+
+    async def get_issue_thread_root(
+        self,
+        session: AsyncSession,
+        *,
+        room_id: str,
+        issue_key: str,
+    ) -> str | None:
+        result = await session.execute(
+            select(JiraIssueThread.thread_root_event_id).where(
+                JiraIssueThread.room_id == room_id,
+                JiraIssueThread.issue_key == issue_key,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert_issue_thread(
+        self,
+        session: AsyncSession,
+        *,
+        room_id: str,
+        issue_key: str,
+        thread_root_event_id: str,
+    ) -> None:
+        stmt = (
+            insert(JiraIssueThread)
+            .values(
+                room_id=room_id,
+                issue_key=issue_key,
+                thread_root_event_id=thread_root_event_id,
+            )
+            .on_conflict_do_nothing(constraint="uq_jira_issue_threads_room_issue")
+        )
+        await session.execute(stmt)
+        await session.flush()

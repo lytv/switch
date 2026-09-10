@@ -1009,6 +1009,35 @@ class JiraTriggerFiring(Base):
     )
 
 
+class JiraIssueThread(Base):
+    """Thread root for ``thread_by=issue_key`` deliveries in one room."""
+
+    __tablename__ = "jira_issue_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "room_id",
+            "issue_key",
+            name="uq_jira_issue_threads_room_issue",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    room_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("rooms.id", ondelete="CASCADE"), nullable=False
+    )
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_root_event_id: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 

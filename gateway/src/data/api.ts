@@ -1495,3 +1495,172 @@ export async function detachPackageFromRoom(
     throw new Error(body?.detail ?? `${res.status} ${res.statusText}`);
   }
 }
+
+// ── Jira triggers ────────────────────────────────────────────────────────────
+
+export interface JiraTriggerDetail {
+  id: string;
+  name: string;
+  enabled: boolean;
+  instance: string;
+  project_key: string;
+  issue_type: string;
+  fire_on: string;
+  target_status: string;
+  jql: string;
+  target_kind: string;
+  target_room_id: string | null;
+  target_room_name: string | null;
+  target_group_id: string | null;
+  target_group_name: string | null;
+  agent_name: string;
+  message_template: string;
+  thread_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JiraTriggerInput {
+  name: string;
+  enabled?: boolean;
+  instance: string;
+  project_key?: string;
+  issue_type?: string;
+  fire_on: string;
+  target_status?: string;
+  jql?: string;
+  target_kind: string;
+  target_room_id?: string | null;
+  target_group_id?: string | null;
+  agent_name: string;
+  message_template: string;
+  thread_by?: string;
+}
+
+export interface JiraTriggerUpdateInput {
+  name?: string;
+  enabled?: boolean;
+  instance?: string;
+  project_key?: string;
+  issue_type?: string;
+  fire_on?: string;
+  target_status?: string;
+  jql?: string;
+  target_kind?: string;
+  target_room_id?: string | null;
+  target_group_id?: string | null;
+  agent_name?: string;
+  message_template?: string;
+  thread_by?: string;
+}
+
+export interface JiraDryRunTarget {
+  room_id: string;
+  room_name: string | null;
+  agent_name: string;
+  group_id?: string | null;
+  group_name?: string | null;
+}
+
+export interface JiraDryRunResult {
+  matched: boolean;
+  reasons: string[];
+  rendered_message: string | null;
+  targets: JiraDryRunTarget[];
+  would_post: boolean;
+  issue_key: string;
+  event_kind: string;
+}
+
+export interface JiraInstanceSetup {
+  instance: string;
+  webhook_url: string;
+  secret_masked: string;
+  secret_configured: boolean;
+}
+
+export interface JiraSetupInfo {
+  instances: JiraInstanceSetup[];
+  jira_agent_name: string;
+  gateway_public_url: string | null;
+  guidance: Record<string, string>;
+}
+
+export async function fetchJiraTriggers(): Promise<JiraTriggerDetail[] | null> {
+  return fetchJson<JiraTriggerDetail[]>("/jira-triggers");
+}
+
+export async function fetchJiraSetup(): Promise<JiraSetupInfo | null> {
+  return fetchJson<JiraSetupInfo>("/jira-triggers/setup");
+}
+
+export async function fetchJiraMessageTokens(): Promise<string[] | null> {
+  return fetchJson<string[]>("/jira-triggers/message-tokens");
+}
+
+export async function fetchJiraAgentOptions(params: {
+  roomId?: string;
+  groupId?: string;
+}): Promise<{ id: string; name: string }[] | null> {
+  const q = new URLSearchParams();
+  if (params.roomId) q.set("room_id", params.roomId);
+  if (params.groupId) q.set("group_id", params.groupId);
+  return fetchJson<{ id: string; name: string }[]>(
+    `/jira-triggers/agent-options?${q.toString()}`,
+  );
+}
+
+export async function createJiraTrigger(
+  input: JiraTriggerInput,
+): Promise<JiraTriggerDetail> {
+  return jsonRequest<JiraTriggerDetail>("/jira-triggers", "POST", input);
+}
+
+export async function updateJiraTrigger(
+  id: string,
+  input: JiraTriggerUpdateInput,
+): Promise<JiraTriggerDetail> {
+  return jsonRequest<JiraTriggerDetail>(`/jira-triggers/${id}`, "PATCH", input);
+}
+
+export async function deleteJiraTrigger(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/jira-triggers/${id}`, {
+    method: "DELETE",
+    credentials: "include",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(errorText(body?.detail, `${res.status} ${res.statusText}`));
+  }
+}
+
+export async function dryRunJiraTrigger(
+  id: string,
+  body: {
+    payload?: Record<string, unknown>;
+    sample_overrides?: Record<string, unknown>;
+  } = {},
+): Promise<JiraDryRunResult> {
+  return jsonRequest<JiraDryRunResult>(
+    `/jira-triggers/${id}/dry-run`,
+    "POST",
+    body,
+  );
+}
+
+export async function revealJiraInstanceSecret(instance: string): Promise<string> {
+  const res = await jsonRequest<{ key: string }>(
+    `/jira-triggers/setup/${encodeURIComponent(instance)}/reveal`,
+    "GET",
+  );
+  return res.key;
+}
+
+export async function rotateJiraInstanceSecret(
+  instance: string,
+): Promise<{ secret: string; webhook_url: string; note: string }> {
+  return jsonRequest(
+    `/jira-triggers/setup/${encodeURIComponent(instance)}/rotate`,
+    "POST",
+  );
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -11,9 +12,10 @@ from switch_core.bridges.jira.matching import matching_rules
 from switch_core.bridges.jira.parse import ParsedJiraEvent
 from switch_core.bridges.jira.template import render_template
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraTrigger
+from switch_core.db.models import JiraTrigger, Room
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
+from switch_core.db.stores.room_store import RoomStore
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +35,14 @@ class JiraBridgeService:
         session_factory: async_sessionmaker,
         trigger_store: JiraTriggerStore,
         agent_store: AgentStore,
+        room_store: RoomStore,
         protocol: ProtocolService,
         config: SwitchConfig,
     ) -> None:
         self._session_factory = session_factory
         self._trigger_store = trigger_store
         self._agent_store = agent_store
+        self._room_store = room_store
         self._protocol = protocol
         self._config = config
 
@@ -78,24 +82,26 @@ class JiraBridgeService:
             )
         return agent.id if agent is not None else None
 
-    async def _fire_rule(
-        self,
-        *,
-        jira_agent_id: str,
-        rule: JiraTrigger,
-        event: ParsedJiraEvent,
-    ) -> None:
-        if rule.target_kind != "room" or not rule.target_room_id:
-            logger.warning(
-                "Jira rule %s (%s) skipped: Phase 1 only supports room targets "
-                "(target_kind=%r target_room_id=%r)",
-                rule.id,
-                rule.name,
-                rule.target_kind,
-                rule.target_room_id,
-            )
-            return
+    async def _resolve_target_rooms(self, rule: JiraTrigger) -> list[Room]:
+        async with self._session_factory() as session:
+            if rule.target_kind == "room":
+                if not rule.target_room_id:
+                    return []
+                room = await self._room_store.get(session, rule.target_room_id)
+                return [room] if room is not None else []
+            if rule.target_kind == "group":
+                if not rule.target_group_id:
+                    return []
+                result = await session.execute(
+                    select(Room).where(
+                        Room.group_id == rule.target_group_id,
+                        Room.archived_at.is_(None),
+                    )
+                )
+                return list(result.scalars().all())
+        return []
 
+    async def _claim_firing(self, *, rule: JiraTrigger, event: ParsedJiraEvent) -> bool:
         t_key = transition_key_for(event)
         dedupe_window = timedelta(seconds=self._config.jira_dedupe_window_seconds)
         rate_window = timedelta(seconds=self._config.jira_rate_limit_window_seconds)
@@ -114,7 +120,7 @@ class JiraBridgeService:
                     event.key,
                     recent,
                 )
-                return
+                return False
 
             claimed = await self._trigger_store.try_record_firing(
                 session,
@@ -132,48 +138,142 @@ class JiraBridgeService:
                     event.key,
                     t_key,
                 )
-                return
+                return False
+        return True
+
+    async def _fire_rule(
+        self,
+        *,
+        jira_agent_id: str,
+        rule: JiraTrigger,
+        event: ParsedJiraEvent,
+    ) -> None:
+        rooms = await self._resolve_target_rooms(rule)
+        if rule.target_kind not in ("room", "group"):
+            logger.warning(
+                "Jira rule %s (%s) skipped: unknown target_kind=%r",
+                rule.id,
+                rule.name,
+                rule.target_kind,
+            )
+            return
+
+        if rule.target_kind == "room" and not rooms:
+            logger.warning(
+                "Jira rule %s (%s) skipped: room target missing (target_room_id=%r)",
+                rule.id,
+                rule.name,
+                rule.target_room_id,
+            )
+            return
+
+        if rule.target_kind == "group" and not rooms:
+            logger.info(
+                "Jira rule %s (%s) group %r has no member rooms; nothing to post",
+                rule.id,
+                rule.name,
+                rule.target_group_id,
+            )
+            return
+
+        if not await self._claim_firing(rule=rule, event=event):
+            return
 
         body = render_template(
             rule.message_template,
             event,
             max_chars=self._config.jira_message_max_chars,
         )
+
+        for room in rooms:
+            await self._post_to_room(
+                jira_agent_id=jira_agent_id,
+                rule=rule,
+                event=event,
+                room=room,
+                body=body,
+            )
+
+    async def _post_to_room(
+        self,
+        *,
+        jira_agent_id: str,
+        rule: JiraTrigger,
+        event: ParsedJiraEvent,
+        room: Room,
+        body: str,
+    ) -> None:
+        thread_id: str | None = None
+        if rule.thread_by.strip().casefold() == "issue_key":
+            async with self._session_factory() as session:
+                thread_id = await self._trigger_store.get_issue_thread_root(
+                    session, room_id=room.id, issue_key=event.key
+                )
+
         try:
             result = await self._protocol.send_targeted_message(
                 agent_id=jira_agent_id,
-                room_id=rule.target_room_id,
+                room_id=room.id,
                 target_names=[rule.agent_name],
                 content=body,
+                thread_id=thread_id,
             )
         except Exception:
             logger.exception(
-                "Jira rule %s (%s) failed to post for issue %s to room %s",
+                "Jira rule %s (%s) failed to post for issue %s to room %s (%s)",
                 rule.id,
                 rule.name,
                 event.key,
-                rule.target_room_id,
+                room.id,
+                room.name,
+            )
+            logger.info(
+                "Jira rule %s room_result room_id=%s room_name=%s status=error",
+                rule.id,
+                room.id,
+                room.name,
             )
             return
 
+        if rule.thread_by.strip().casefold() == "issue_key" and thread_id is None:
+            async with self._session_factory() as session:
+                await self._trigger_store.upsert_issue_thread(
+                    session,
+                    room_id=room.id,
+                    issue_key=event.key,
+                    thread_root_event_id=result.event_id,
+                )
+                await session.commit()
+
+        soft = (
+            AgentStatus.NOT_PERMITTED,
+            AgentStatus.NO_SESSION,
+            AgentStatus.DORMANT,
+            AgentStatus.AWAITING_MANUAL_POLL,
+        )
         for name, status in result.target_statuses.items():
-            if status in (
-                AgentStatus.NOT_PERMITTED,
-                AgentStatus.NO_SESSION,
-                AgentStatus.DORMANT,
-                AgentStatus.AWAITING_MANUAL_POLL,
-            ):
+            if status in soft:
                 logger.warning(
-                    "Jira rule %s addressed %s with status %s (logged, not a hard failure)",
+                    "Jira rule %s addressed %s in room %s with status %s "
+                    "(logged, not a hard failure)",
                     rule.id,
                     name,
+                    room.name,
                     status.value,
                 )
             else:
                 logger.info(
-                    "Jira rule %s addressed %s with status %s (event_id=%s)",
+                    "Jira rule %s addressed %s in room %s with status %s (event_id=%s)",
                     rule.id,
                     name,
+                    room.name,
                     status.value,
                     result.event_id,
                 )
+        logger.info(
+            "Jira rule %s room_result room_id=%s room_name=%s status=ok event_id=%s",
+            rule.id,
+            room.id,
+            room.name,
+            result.event_id,
+        )

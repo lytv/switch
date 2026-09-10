@@ -7,6 +7,7 @@ import AgentsPage from "./pages/agents/AgentsPage";
 import LoginPage from "./pages/auth/LoginPage";
 import CollaborationsPage from "./pages/collaborations/CollaborationsPage";
 import EcosystemGraphPage from "./pages/ecosystem/EcosystemGraphPage";
+import JiraTriggersPage from "./pages/jira-triggers/JiraTriggersPage";
 import RegistrationKeysPage from "./pages/registration-keys/RegistrationKeysPage";
 import DocumentDetailPage from "./pages/resources/DocumentDetailPage";
 import PackageDetailPage from "./pages/resources/PackageDetailPage";
@@ -77,6 +78,7 @@ function AppRoutes() {
         <Route path="agents" element={<AgentsPage />} />
         <Route path="agents/:agentId" element={<AgentDetailPage />} />
         <Route path="collaborations" element={<CollaborationsPage />} />
+        <Route path="jira-triggers" element={<JiraTriggersPage />} />
         <Route path="registration-keys" element={<RegistrationKeysPage />} />
         <Route path="users" element={<UsersPage />} />
       </Route>
