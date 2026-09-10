@@ -21,7 +21,8 @@ shared onboarding model, then the per-platform guide:
 
 **Inbound Jira triggers** (webhook → stored rules → addressed room post) are a
 separate integration, not a collaboration bridge. See
-[`JIRA_SETUP.md`](JIRA_SETUP.md).
+[`JIRA_SETUP.md`](JIRA_SETUP.md) and the operator guideline
+[`jira-operator-guide.html`](jira-operator-guide.html).
 
 ## The onboarding model (same for every bridge)
 

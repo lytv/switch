@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch × Jira — full guideline</title>
+<style>
+  :root{--bg:#0e1116;--panel:#161b22;--panel2:#1c232d;--line:#2a323d;--ink:#e6edf3;--dim:#9aa7b4;--faint:#6b7887;--accent:#ff895e;--good:#3fb950;--bad:#f85149;--warn:#d29922;--chip:#222b36}
+  html[data-theme="light"]{--bg:#f6f8fa;--panel:#fff;--panel2:#f0f3f6;--line:#d8dee4;--ink:#1f2328;--dim:#57606a;--faint:#8b949e;--accent:#e5613c;--good:#1a7f37;--bad:#cf222e;--warn:#9a6700;--chip:#eaeef2}
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:920px;margin:0 auto;padding:0 22px 88px}
+  header.bar{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  header.bar .row{max-width:920px;margin:0 auto;padding:10px 22px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  header.bar a{color:var(--dim);text-decoration:none;font-size:13px;padding:4px 8px;border-radius:8px}
+  header.bar a:hover{color:var(--ink);background:var(--panel2)}
+  .brand{font-weight:700;margin-right:auto}
+  button{border:1px solid var(--line);background:var(--panel);color:var(--dim);border-radius:8px;padding:6px 10px;cursor:pointer}
+  h1{font-size:32px;letter-spacing:-.4px;margin:28px 0 8px}
+  h2{font-size:21px;margin:40px 0 10px;scroll-margin-top:56px}
+  h3{font-size:16px;margin:18px 0 8px}
+  .lede{color:var(--dim);font-size:18px;max-width:70ch}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
+  .good{border-left:3px solid var(--good)}
+  .warn{border-left:3px solid var(--warn)}
+  .bad{border-left:3px solid var(--bad)}
+  code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.86em;background:var(--chip);padding:.1em .35em;border-radius:6px}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace}
+  ol,ul{padding-left:22px} li{margin:6px 0}
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+  .ok{color:var(--good)} .no{color:var(--bad)}
+  .meta{color:var(--faint);font-size:13px}
+  .flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:14px}
+  .chip{background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:5px 9px}
+  .arr{color:var(--faint)}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="row">
+    <div class="brand">Switch × Jira guideline</div>
+    <a href="#idea">Idea</a>
+    <a href="#places">Places</a>
+    <a href="#login">Login</a>
+    <a href="#daily">Daily use</a>
+    <a href="#rules">Rules</a>
+    <a href="#live">Live setup</a>
+    <a href="#add">Add a rule</a>
+    <a href="#trouble">If it fails</a>
+    <a href="#board">Jira board</a>
+    <button id="tg">◐ Theme</button>
+  </div>
+</header>
+<div class="wrap">
+  <h1>Full guideline: Jira triggers a Switch agent</h1>
+  <p class="lede">Jira does not open a chat. Jira sends an event. Switch posts one addressed message in a Mattermost room. The named agent then wakes and works.</p>
+  <p class="meta">Local machine guide. Verified 10 Sep 2026. Secrets stay in <code>.env</code> and the dashboard Setup panel. Do not put tokens in this file or in a rule field.</p>
+
+  <h2 id="idea">1. The idea</h2>
+  <div class="card">
+    <div class="flow">
+      <span class="chip">Jira story moves</span><span class="arr">→</span>
+      <span class="chip">Webhook POST</span><span class="arr">→</span>
+      <span class="chip">Switch matches a rule</span><span class="arr">→</span>
+      <span class="chip">Room message @agent</span><span class="arr">→</span>
+      <span class="chip">Agent starts</span>
+    </div>
+    <p>The poster is the system agent <code>jira</code>. The worker is the agent you name on the rule, for example <code>opencode</code>.</p>
+  </div>
+
+  <h2 id="places">2. Three places (do not mix them)</h2>
+  <table>
+    <tr><th>Place</th><th>URL</th><th>What you do there</th></tr>
+    <tr><td>Operator dashboard</td><td><code>http://localhost:5173/</code></td><td>Sign in. Open <b>Jira</b> for rules, secret, Test rule, Delivery history. Open <b>Rooms</b> only to list rooms. This is not chat.</td></tr>
+    <tr><td>Chat (Mattermost)</td><td><code>http://localhost:8065/</code></td><td>Read and talk in rooms: Off-Topic, Town Square, <b>jira</b>.</td></tr>
+    <tr><td>Jira board</td><td>Atlassian site, project <code>KAN</code></td><td>Move a Story. That is what fires Switch.</td></tr>
+    <tr><td>Switch API</td><td><code>http://localhost:8000</code></td><td>Backend. Jira must reach this port, not 3000 and not 5173.</td></tr>
+  </table>
+
+  <h2 id="login">3. How to sign in</h2>
+  <div class="card">
+    <h3>Dashboard</h3>
+    <ul>
+      <li>Email: <code>admin@switch.local</code></li>
+      <li>Password: field <code>GATEWAY_ADMIN_PASSWORD</code> in the repo-root <code>.env</code></li>
+    </ul>
+    <h3>Mattermost</h3>
+    <ul>
+      <li>Team: <code>switch</code></li>
+      <li>Admin user: <code>admin</code> - password <code>MATTERMOST_ADMIN_PASSWORD</code> in the same <code>.env</code></li>
+      <li>Normal user: <code>user</code> — password <code>MATTERMOST_USER_PASSWORD</code></li>
+    </ul>
+    <p>The long dashboard password is <b>not</b> the Mattermost password.</p>
+  </div>
+
+  <h2 id="daily">4. Daily use</h2>
+  <ol>
+    <li>Keep these running: Postgres/Mattermost (<code>just up</code>), Switch core (<code>just run</code>), dashboard (<code>just gateway-dev</code>), ngrok to <b>port 8000</b>.</li>
+    <li>Open Mattermost room <b>jira</b>.</li>
+    <li>In Jira project <code>KAN</code>, move a <b>Story</b> to <b>Done</b>.</li>
+    <li>Switch posts: <code>KAN-123 summary is now Done</code>, addressed to <code>opencode</code>.</li>
+    <li>If you need to change who wakes, or which status fires, edit the rule on the dashboard Jira page. Click <b>Test rule</b> before you rely on it.</li>
+    <li>If nothing appears, open <b>Delivery history</b> on the Jira page. A good fire shows status <code>delivered</code>.</li>
+  </ol>
+
+  <h2 id="rules">5. Rule fields</h2>
+  <table>
+    <tr><th>Field</th><th>Meaning</th><th>Your live value</th></tr>
+    <tr><td>Name</td><td>Label only</td><td><code>dev</code></td></tr>
+    <tr><td>Enabled</td><td>Off means it never fires</td><td>on</td></tr>
+    <tr><td>Instance</td><td>Must match the URL path after <code>/integrations/jira/</code></td><td><code>local</code></td></tr>
+    <tr><td>Project key</td><td>Jira project key only. Never a token.</td><td><code>KAN</code></td></tr>
+    <tr><td>Issue type</td><td>Blank = any</td><td><code>Story</code></td></tr>
+    <tr><td>Fire on</td><td><code>created</code>, <code>updated</code>, or <code>transition</code></td><td><code>transition</code></td></tr>
+    <tr><td>Target status</td><td>For transition: fire when status becomes this</td><td><code>Done</code></td></tr>
+    <tr><td>Send to</td><td>Room or group</td><td>room <code>jira</code></td></tr>
+    <tr><td>Address agent</td><td>Worker name</td><td><code>opencode</code></td></tr>
+    <tr><td>Message</td><td>Tokens like <code>{{issue.key}}</code></td><td><code>{{issue.key}} {{issue.summary}} is now {{issue.status}}</code></td></tr>
+    <tr><td>Thread</td><td><code>new</code> or <code>issue_key</code></td><td><code>new</code></td></tr>
+  </table>
+  <div class="card warn">Do not paste a Jira API token into Project key, Instance, or JQL. A token is not a project key. Project key is <code>KAN</code>.</div>
+
+  <h2 id="live">6. Live setup (this machine)</h2>
+  <div class="card good">
+    <p><b class="ok">Verified working.</b> A real Jira Cloud transition of <code>KAN-111</code> returned Switch delivery <code>delivered</code>.</p>
+    <ul>
+      <li>Webhook URL shape: <code>https://&lt;public-host&gt;/integrations/jira/local</code></li>
+      <li>Tunnel target: Switch API <code>localhost:8000</code> (not 3000, not 5173)</li>
+      <li>Jira Cloud webhook: issue created + updated, JQL filter <code>project = KAN</code> (or your project key)</li>
+      <li>System agent <code>jira</code> exists and is a member of room <code>jira</code></li>
+      <li>Worker <code>opencode</code> is a member of room <code>jira</code></li>
+      <li>The tunnel adds header <code>X-Switch-Secret</code>, so the Jira classic webhook does not need a custom header</li>
+    </ul>
+  </div>
+  <p>Copy or rotate the secret only from the dashboard Jira <b>Setup</b> panel. After a rotate, restart Switch core and ngrok so both still match.</p>
+
+  <h2 id="add">7. Add another rule</h2>
+  <ol>
+    <li>Dashboard → Jira → New rule.</li>
+    <li>Set instance to <code>local</code> (same as the webhook path).</li>
+    <li>Set project key to <code>KAN</code> or leave blank for every project.</li>
+    <li>Pick fire-on, status, room, and agent.</li>
+    <li>Invite both <code>jira</code> and the target agent into that room.</li>
+    <li>Click <b>Test rule</b>. Confirm match and rendered text. Test does not post.</li>
+    <li>Save. Move a matching Jira story. Check Delivery history, then Mattermost.</li>
+  </ol>
+  <h3>Useful fire-on choices</h3>
+  <ul>
+    <li><code>transition</code> + status <code>Done</code> — when a story enters Done (your current rule).</li>
+    <li><code>created</code> — when a new Story is filed.</li>
+    <li><code>updated</code> + status <code>In Progress</code> — when the current status is In Progress.</li>
+  </ul>
+
+  <h2 id="trouble">8. If it fails</h2>
+  <table>
+    <tr><th>What you see</th><th>Cause</th><th>Fix</th></tr>
+    <tr><td>Dashboard Rooms looks empty</td><td>You are not signed in, or you expected chat</td><td>Sign in on :5173. Chat is :8065.</td></tr>
+    <tr><td>Webhook 401</td><td>Missing or wrong secret</td><td>Copy secret from Setup. Restart ngrok with the same secret if you inject the header there.</td></tr>
+    <tr><td>Webhook 400</td><td>Body is not a Jira issue JSON</td><td>Use the classic webhook (full issue body) or Automation JSON that includes <code>issue</code>.</td></tr>
+    <tr><td>202 but no room message</td><td>Rule miss, or agent not in room</td><td>Delivery history: suppressed vs error. Confirm instance <code>local</code>, project <code>KAN</code>, agents in room.</td></tr>
+    <tr><td><code>suppressed_dedupe</code></td><td>Same issue + rule + transition inside 5 minutes</td><td>Wait, or use another story.</td></tr>
+    <tr><td>ngrok error about port 3000</td><td>Tunnel points at the wrong process</td><td><code>ngrok http --domain=&lt;your-domain&gt; 8000</code></td></tr>
+    <tr><td>Setup shows zero instances</td><td><code>JIRA_WEBHOOK_SECRETS</code> missing; core not restarted</td><td>Set it in <code>.env</code>, then <code>just run</code> again.</td></tr>
+  </table>
+
+  <h2 id="board">9. Jira board map</h2>
+  <table>
+    <tr><th>Keys</th><th>What they are</th></tr>
+    <tr><td>KAN-84 to KAN-104</td><td>Built the feature (webhook, rules UI, hardening, source seam).</td></tr>
+    <tr><td>KAN-106 to KAN-110</td><td>Live integration fixes. All Done.</td></tr>
+    <tr><td>KAN-111</td><td>Live fire test. Delivery = delivered.</td></tr>
+    <tr><td>KAN-83</td><td>Original spike row. The live path now works; you may close it if you want.</td></tr>
+  </table>
+
+  <h2>10. Start the stack after a reboot</h2>
+<pre>just up
+just migrate
+just run          # API :8000
+just gateway-dev  # dashboard :5173
+ngrok http --domain=&lt;your-ngrok-domain&gt; 8000</pre>
+  <p>If you inject <code>X-Switch-Secret</code> on ngrok, add <code>--request-header-add "X-Switch-Secret:&lt;secret&gt;"</code> using the current Setup secret.</p>
+
+  <h2>11. Security</h2>
+  <ul>
+    <li>Never commit <code>.env</code>.</li>
+    <li>Never put an API token in a rule field.</li>
+    <li>Rotate any Jira API token that was pasted in chat.</li>
+    <li>The ngrok URL is public. Keep the secret strong. Stop ngrok when you do not need Jira to reach this laptop.</li>
+  </ul>
+</div>
+<script>
+  const tg=document.getElementById('tg'), root=document.documentElement;
+  const saved=localStorage.getItem('sj-howto-theme'); if(saved) root.setAttribute('data-theme',saved);
+  tg.onclick=()=>{const n=root.getAttribute('data-theme')==='light'?'dark':'light'; root.setAttribute('data-theme',n); localStorage.setItem('sj-howto-theme',n);};
+</script>
+</body>
+</html>

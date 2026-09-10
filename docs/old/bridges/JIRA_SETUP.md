@@ -5,6 +5,9 @@ rules, and post an **addressed** message into a Switch room (or every room in a
 room group). This is not a collaboration bridge: traffic is one-way from Jira
 into Switch. The operator UI lives under **Jira** in the gateway dashboard.
 
+For a full operator guideline (where to click, daily use, rule fields,
+troubleshooting), open [`jira-operator-guide.html`](jira-operator-guide.html).
+
 For collaboration platforms (Slack, Teams, …), see [`README.md`](README.md).
 
 ## Prerequisites
