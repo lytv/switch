@@ -114,6 +114,19 @@ class SwitchConfig(BaseSettings):
     # unset, the raw `switchdash://` deeplink is posted as-is.
     gateway_public_url: str | None = None
 
+    # Jira inbound webhook (Phase 1). Map of instance path segment → shared
+    # secret for the X-Switch-Secret header. Empty disables provisioning and
+    # rejects every webhook (no secret configured). Example env:
+    # JIRA_WEBHOOK_SECRETS={"acme":"…"}
+    jira_webhook_secrets: dict[str, str] = {}
+    # Shared system agent that posts trigger messages. Must be a member of
+    # each target room.
+    jira_agent_name: str = "jira"
+    jira_message_max_chars: int = 4000
+    jira_dedupe_window_seconds: int = 300
+    jira_rate_limit_per_rule: int = 10
+    jira_rate_limit_window_seconds: int = 60
+
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead
     # of being truncated or silently dropped.

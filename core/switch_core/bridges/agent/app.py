@@ -20,6 +20,9 @@ from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.collaboration.lifecycle_service import (
     CollaborationBridgeLifecycleService,
 )
+from switch_core.bridges.jira.routes import init_jira_routes
+from switch_core.bridges.jira.routes import router as jira_router
+from switch_core.bridges.jira.service import JiraBridgeService
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.client_lifecycle_service import ClientLifecycleService
 from switch_core.config import SwitchConfig
@@ -28,6 +31,7 @@ from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.api_key_store import ApiKeyStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_store import RoomStore
 from switch_core.db.stores.task_store import TaskStore
 from switch_core.request_context import RequestContextMiddleware
@@ -141,6 +145,18 @@ def create_agent_bridge_app(
     app.include_router(operations_router)
     app.include_router(deeplink_router, tags=["deeplink"])
     app.include_router(version_router, tags=["version"])
+    jira_service = JiraBridgeService(
+        session_factory=session_factory,  # type: ignore[arg-type]
+        trigger_store=JiraTriggerStore(),
+        agent_store=agent_store,
+        protocol=protocol,
+        config=config,
+    )
+    init_jira_routes(
+        service=jira_service,
+        secrets_by_instance=config.jira_webhook_secrets,
+    )
+    app.include_router(jira_router, tags=["jira"])
 
     app.state.config = config
 

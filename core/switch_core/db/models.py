@@ -925,6 +925,90 @@ class FeatureFlag(Base):
     )
 
 
+# ── Jira trigger rules ───────────────────────────────────────────────────────
+
+
+class JiraTrigger(Base):
+    """One rule that maps a Jira event to an addressed room message.
+
+    Blank ``project_key`` / ``issue_type`` / ``target_status`` / ``jql`` mean
+    "any". Phase 1 only fires ``target_kind='room'``; group fan-out is Phase 2.
+    """
+
+    __tablename__ = "jira_triggers"
+    __table_args__ = (
+        Index("ix_jira_triggers_instance_enabled", "instance", "enabled"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Path segment of POST /integrations/jira/{instance}.
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    # Blank string = any project / issue type.
+    project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    issue_type: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # created | updated | transition
+    fire_on: Mapped[str] = mapped_column(Text, nullable=False)
+    # When fire_on is transition: fire when the issue enters this status.
+    # Blank = any transition.
+    target_status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Optional simple JQL-style filter (labels/priority/assignee equality).
+    jql: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # room (Phase 1) or group (Phase 2).
+    target_kind: Mapped[str] = mapped_column(Text, nullable=False, default="room")
+    target_room_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("rooms.id", ondelete="CASCADE"), nullable=True
+    )
+    target_group_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("room_groups.id", ondelete="CASCADE"), nullable=True
+    )
+    agent_name: Mapped[str] = mapped_column(Text, nullable=False)
+    message_template: Mapped[str] = mapped_column(Text, nullable=False)
+    # new | issue_key — Phase 2 threading; stored now so Phase 2 does not migrate.
+    thread_by: Mapped[str] = mapped_column(Text, nullable=False, default="new")
+    created_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class JiraTriggerFiring(Base):
+    """Dedupe / rate-limit ledger for Jira trigger deliveries.
+
+    Unique on (issue_key, rule_id, transition_key) so a burst of the same
+    transition for the same issue against the same rule is stored once; older
+    rows outside the window are ignored by the reader and may be pruned later.
+    """
+
+    __tablename__ = "jira_trigger_firings"
+    __table_args__ = (
+        UniqueConstraint(
+            "issue_key",
+            "rule_id",
+            "transition_key",
+            name="uq_jira_trigger_firings_dedupe",
+        ),
+        Index("ix_jira_trigger_firings_rule_created", "rule_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False)
+    rule_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("jira_triggers.id", ondelete="CASCADE"), nullable=False
+    )
+    # Normalised "from->to" (or "created" / "updated") for the dedupe key.
+    transition_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 

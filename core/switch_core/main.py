@@ -61,6 +61,7 @@ from switch_core.bridges.collaboration.telegram.adapter import (
     TelegramAdapter,
     TelegramConnectionConfig,
 )
+from switch_core.bridges.jira.identity import ensure_jira_system_agent
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.admin_client import AdminClient
 from switch_core.clients.agent_client import AgentClient
@@ -409,6 +410,16 @@ async def run(config: SwitchConfig) -> None:
 
     # ── Ensure system clients exist ─────────────────────────────────────────
     await client_lifecycle.ensure_system_client("admin")
+
+    # Shared Jira poster (when JIRA_WEBHOOK_SECRETS is set). Created before
+    # start_all so its always-on client is included in the startup sweep.
+    await ensure_jira_system_agent(
+        protocol=protocol,
+        session_factory=session_factory,
+        agent_store=agent_store,
+        user_store=user_store,
+        config=config,
+    )
 
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     original_lifespan = agent_bridge_app.router.lifespan_context
