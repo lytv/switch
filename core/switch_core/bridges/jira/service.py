@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.agent.protocol.types import AgentStatus
 from switch_core.bridges.jira.matching import matching_rules
-from switch_core.bridges.jira.parse import ParsedJiraEvent
 from switch_core.bridges.jira.template import render_template
+from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraTrigger, Room
 from switch_core.db.stores.agent_store import AgentStore
@@ -26,7 +26,7 @@ SleepFn = Callable[[float], Awaitable[None]]
 ClockFn = Callable[[], datetime]
 
 
-def transition_key_for(event: ParsedJiraEvent) -> str:
+def transition_key_for(event: NormalizedTriggerEvent) -> str:
     if event.transition is not None:
         return f"{event.transition.from_status}->{event.transition.to_status}"
     return event.event_kind
@@ -81,7 +81,9 @@ class JiraBridgeService:
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
 
-    async def process_event(self, *, instance: str, event: ParsedJiraEvent) -> None:
+    async def process_event(
+        self, *, instance: str, event: NormalizedTriggerEvent
+    ) -> None:
         async with self._session_factory() as session:
             rules = await self._trigger_store.list(
                 session, instance=instance, enabled_only=True
@@ -149,7 +151,7 @@ class JiraBridgeService:
         self,
         *,
         rule: JiraTrigger,
-        event: ParsedJiraEvent,
+        event: NormalizedTriggerEvent,
         instance: str,
         matched_rule_ids: list[str],
     ) -> str | None:
@@ -284,7 +286,7 @@ class JiraBridgeService:
         *,
         jira_agent_id: str,
         rule: JiraTrigger,
-        event: ParsedJiraEvent,
+        event: NormalizedTriggerEvent,
         instance: str,
         matched_rule_ids: list[str],
     ) -> None:
@@ -371,7 +373,7 @@ class JiraBridgeService:
         *,
         jira_agent_id: str,
         rule: JiraTrigger,
-        event: ParsedJiraEvent,
+        event: NormalizedTriggerEvent,
         room: Room,
         body: str,
     ) -> dict[str, Any]:

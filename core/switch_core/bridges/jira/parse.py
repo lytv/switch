@@ -1,35 +1,21 @@
+"""Jira webhook payload → NormalizedTriggerEvent."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any
 
+from switch_core.bridges.trigger_source import (
+    NormalizedTriggerEvent,
+    PayloadParseError,
+    StatusTransition,
+)
 
-class JiraPayloadError(ValueError):
+# Public aliases — callers and tests keep importing these from this module.
+ParsedJiraEvent = NormalizedTriggerEvent
+
+
+class JiraPayloadError(PayloadParseError):
     """The webhook body is not a usable Jira issue event."""
-
-
-@dataclass(frozen=True)
-class StatusTransition:
-    from_status: str
-    to_status: str
-
-
-@dataclass(frozen=True)
-class ParsedJiraEvent:
-    event_kind: str  # created | updated
-    webhook_event: str
-    key: str
-    summary: str
-    issue_type: str
-    project: str
-    status: str
-    assignee: str
-    priority: str
-    reporter: str
-    url: str
-    labels: tuple[str, ...] = ()
-    transition: StatusTransition | None = None
-    raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 def _text(value: Any) -> str:
@@ -92,70 +78,81 @@ def _event_kind(webhook_event: str, payload: dict[str, Any]) -> str:
     return "created"
 
 
+class JiraPayloadParser:
+    """TriggerSourceParser for Atlassian Jira / Automation webhook bodies."""
+
+    def parse(self, payload: Any) -> NormalizedTriggerEvent:
+        """Extract the issue fields a trigger rule needs.
+
+        Tolerates unknown/extra fields. Raises ``JiraPayloadError`` when the body
+        is not a dict or has no usable issue key.
+        """
+        if not isinstance(payload, dict):
+            raise JiraPayloadError("Jira payload must be a JSON object")
+
+        issue = payload.get("issue")
+        if not isinstance(issue, dict):
+            # Some Automation payloads flatten the issue to the top level.
+            if "key" in payload and isinstance(payload.get("fields"), dict):
+                issue = payload
+            else:
+                raise JiraPayloadError("Jira payload missing issue object")
+
+        key = _text(issue.get("key"))
+        if not key:
+            raise JiraPayloadError("Jira issue missing key")
+
+        fields = issue.get("fields")
+        if not isinstance(fields, dict):
+            fields = {}
+
+        project_raw = _field(fields, "project")
+        project = _text(
+            project_raw.get("key") if isinstance(project_raw, dict) else project_raw
+        )
+
+        issue_type_raw = _field(fields, "issuetype") or _field(fields, "issueType")
+        issue_type = _text(
+            issue_type_raw.get("name")
+            if isinstance(issue_type_raw, dict)
+            else issue_type_raw
+        )
+
+        status_raw = _field(fields, "status")
+        status = _text(
+            status_raw.get("name") if isinstance(status_raw, dict) else status_raw
+        )
+
+        labels_raw = _field(fields, "labels")
+        labels: tuple[str, ...] = ()
+        if isinstance(labels_raw, list):
+            labels = tuple(str(x) for x in labels_raw if x is not None)
+
+        webhook_event = _text(payload.get("webhookEvent") or payload.get("event") or "")
+        kind = _event_kind(webhook_event, payload)
+        transition = _status_transition(payload)
+
+        return NormalizedTriggerEvent(
+            event_kind=kind,
+            webhook_event=webhook_event or f"inferred:{kind}",
+            key=key,
+            summary=_text(_field(fields, "summary")),
+            issue_type=issue_type,
+            project=project,
+            status=status,
+            assignee=_text(_field(fields, "assignee")),
+            priority=_text(_field(fields, "priority")),
+            reporter=_text(_field(fields, "reporter")),
+            url=_issue_url(payload, issue, key),
+            labels=labels,
+            transition=transition,
+            raw=payload,
+        )
+
+
+_DEFAULT_PARSER = JiraPayloadParser()
+
+
 def parse_jira_payload(payload: Any) -> ParsedJiraEvent:
-    """Extract the issue fields a trigger rule needs.
-
-    Tolerates unknown/extra fields. Raises ``JiraPayloadError`` when the body
-    is not a dict or has no usable issue key.
-    """
-    if not isinstance(payload, dict):
-        raise JiraPayloadError("Jira payload must be a JSON object")
-
-    issue = payload.get("issue")
-    if not isinstance(issue, dict):
-        # Some Automation payloads flatten the issue to the top level.
-        if "key" in payload and isinstance(payload.get("fields"), dict):
-            issue = payload
-        else:
-            raise JiraPayloadError("Jira payload missing issue object")
-
-    key = _text(issue.get("key"))
-    if not key:
-        raise JiraPayloadError("Jira issue missing key")
-
-    fields = issue.get("fields")
-    if not isinstance(fields, dict):
-        fields = {}
-
-    project_raw = _field(fields, "project")
-    project = _text(
-        project_raw.get("key") if isinstance(project_raw, dict) else project_raw
-    )
-
-    issue_type_raw = _field(fields, "issuetype") or _field(fields, "issueType")
-    issue_type = _text(
-        issue_type_raw.get("name")
-        if isinstance(issue_type_raw, dict)
-        else issue_type_raw
-    )
-
-    status_raw = _field(fields, "status")
-    status = _text(
-        status_raw.get("name") if isinstance(status_raw, dict) else status_raw
-    )
-
-    labels_raw = _field(fields, "labels")
-    labels: tuple[str, ...] = ()
-    if isinstance(labels_raw, list):
-        labels = tuple(str(x) for x in labels_raw if x is not None)
-
-    webhook_event = _text(payload.get("webhookEvent") or payload.get("event") or "")
-    kind = _event_kind(webhook_event, payload)
-    transition = _status_transition(payload)
-
-    return ParsedJiraEvent(
-        event_kind=kind,
-        webhook_event=webhook_event or f"inferred:{kind}",
-        key=key,
-        summary=_text(_field(fields, "summary")),
-        issue_type=issue_type,
-        project=project,
-        status=status,
-        assignee=_text(_field(fields, "assignee")),
-        priority=_text(_field(fields, "priority")),
-        reporter=_text(_field(fields, "reporter")),
-        url=_issue_url(payload, issue, key),
-        labels=labels,
-        transition=transition,
-        raw=payload,
-    )
+    """Parse a Jira webhook body into the shared trigger-event contract."""
+    return _DEFAULT_PARSER.parse(payload)

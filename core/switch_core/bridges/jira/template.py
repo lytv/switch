@@ -4,7 +4,7 @@ import html
 import re
 from html.parser import HTMLParser
 
-from switch_core.bridges.jira.parse import ParsedJiraEvent
+from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 
 # Proposal tokens: {{issue.key}}, {{transition.from}}, …
 _TOKEN_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
@@ -69,7 +69,7 @@ def strip_html(value: str) -> str:
     return html.unescape(text)
 
 
-def _token_values(event: ParsedJiraEvent) -> dict[str, str]:
+def _token_values(event: NormalizedTriggerEvent) -> dict[str, str]:
     transition_from = event.transition.from_status if event.transition else ""
     transition_to = event.transition.to_status if event.transition else ""
     transition = f"{transition_from} → {transition_to}" if event.transition else ""
@@ -98,7 +98,7 @@ def _token_values(event: ParsedJiraEvent) -> dict[str, str]:
 
 def render_template(
     template: str,
-    event: ParsedJiraEvent,
+    event: NormalizedTriggerEvent,
     *,
     max_chars: int,
 ) -> str:
