@@ -81,7 +81,9 @@ just test -k "test_name"         # run specific test
 - `bridges/` — External integrations
   - `agent/` — Agent Bridge (HTTP API, MCP server, server-side connectors)
   - `collaboration/` — Collaboration Bridge (Slack, Mattermost, Discord, Teams, Telegram adapters)
-  - `jira/` — inbound Jira webhook → stored trigger rules → addressed room post
+  - `jira/` — inbound Jira webhook → stored trigger rules → addressed room post.
+    Payload parsing implements `bridges/trigger_source/` (`NormalizedTriggerEvent`
+    + `TriggerSourceParser`); matching/rendering/delivery consume that contract.
   - `resource/` — Resource Bridge (platform resource management)
 - `gateway/` — Management API for the frontend
 

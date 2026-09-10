@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
-from switch_core.bridges.jira.parse import ParsedJiraEvent
+from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.db.models import JiraTrigger
 
 # Minimal JQL-style filter: `field = value` and `field in (a, b)` joined by AND.
@@ -20,7 +20,7 @@ def _blank_is_any(rule_value: str, actual: str) -> bool:
     return rule_value.strip().casefold() == actual.strip().casefold()
 
 
-def _field_value(event: ParsedJiraEvent, field: str) -> str | set[str]:
+def _field_value(event: NormalizedTriggerEvent, field: str) -> str | set[str]:
     key = field.casefold()
     if key == "labels":
         return {label.casefold() for label in event.labels}
@@ -41,7 +41,7 @@ def _field_value(event: ParsedJiraEvent, field: str) -> str | set[str]:
     return ""
 
 
-def _match_clause(clause: str, event: ParsedJiraEvent) -> bool:
+def _match_clause(clause: str, event: NormalizedTriggerEvent) -> bool:
     clause = clause.strip()
     if not clause:
         return True
@@ -70,7 +70,7 @@ def _match_clause(clause: str, event: ParsedJiraEvent) -> bool:
     return False
 
 
-def match_jql(jql: str, event: ParsedJiraEvent) -> bool:
+def match_jql(jql: str, event: NormalizedTriggerEvent) -> bool:
     """Apply a blank-or-simple JQL-style filter. Blank jql always matches."""
     text = jql.strip()
     if not text:
@@ -80,7 +80,7 @@ def match_jql(jql: str, event: ParsedJiraEvent) -> bool:
     return all(_match_clause(clause, event) for clause in clauses)
 
 
-def rule_matches(rule: JiraTrigger, event: ParsedJiraEvent) -> bool:
+def rule_matches(rule: JiraTrigger, event: NormalizedTriggerEvent) -> bool:
     """Deterministic match of one enabled rule against a parsed event."""
     if not rule.enabled:
         return False
@@ -115,13 +115,15 @@ def rule_matches(rule: JiraTrigger, event: ParsedJiraEvent) -> bool:
 
 
 def matching_rules(
-    rules: Sequence[JiraTrigger], event: ParsedJiraEvent
+    rules: Sequence[JiraTrigger], event: NormalizedTriggerEvent
 ) -> list[JiraTrigger]:
     """Return every matching rule independently (one event may fire several)."""
     return [rule for rule in rules if rule_matches(rule, event)]
 
 
-def explain_match(rule: JiraTrigger, event: ParsedJiraEvent) -> tuple[bool, list[str]]:
+def explain_match(
+    rule: JiraTrigger, event: NormalizedTriggerEvent
+) -> tuple[bool, list[str]]:
     """Return (matched, human-readable reasons). Reasons explain a miss or a hit."""
     reasons: list[str] = []
 
