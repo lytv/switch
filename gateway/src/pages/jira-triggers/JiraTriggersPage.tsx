@@ -32,6 +32,7 @@ import { useAuth } from "../../data/AuthContext";
 import { useJiraSetup, useJiraTriggers } from "../../data/hooks";
 import { MONO_SX } from "../../theme/hootFormat";
 import JiraSetupPanel from "./JiraSetupPanel";
+import DeliveryHistoryPanel from "./DeliveryHistoryPanel";
 import RuleFormDialog from "./RuleFormDialog";
 
 function flowSummary(row: JiraTriggerDetail): string {
@@ -272,6 +273,8 @@ export default function JiraTriggersPage() {
       ) : (
         <DataTable rows={rows} columns={columns} />
       )}
+
+      <DeliveryHistoryPanel />
 
       <RuleFormDialog
         open={editorOpen}

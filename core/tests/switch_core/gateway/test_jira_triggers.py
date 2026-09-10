@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from switch_core.gateway.jira_triggers import (
     delete_trigger,
     dry_run_trigger,
     get_setup,
+    list_deliveries,
     list_triggers,
     patch_trigger,
     reveal_instance_secret,
@@ -355,3 +357,81 @@ async def test_group_target_create(
         assert created.target_kind == "group"
         assert created.target_group_name == "fleet"
         assert created.target_room_id is None
+
+
+@pytest.mark.asyncio
+async def test_list_deliveries(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        admin = await _make_user(session, "del-admin")
+        room = await _make_room(session, "del-room")
+        agent = await _make_agent(session, "del-coder")
+        await _ROOM_STORE.add_agents(session, room.id, [agent.id])
+        await session.commit()
+
+        trigger = await create_trigger(
+            JiraTriggerCreateRequest(
+                name="Deliver",
+                instance="acme",
+                fire_on="created",
+                target_kind="room",
+                target_room_id=room.id,
+                agent_name="del-coder",
+                message_template="{{issue.key}}",
+            ),
+            session,
+            _TRIGGER_STORE,
+            _ROOM_STORE,
+            _ROOM_GROUP_STORE,
+            _AGENT_STORE,
+            admin,
+        )
+        firing_id = await _TRIGGER_STORE.try_record_firing(
+            session,
+            issue_key="DEL-1",
+            rule_id=trigger.id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name=trigger.name,
+            matched_rule_ids=[trigger.id],
+        )
+        assert firing_id is not None
+        await _TRIGGER_STORE.finalize_firing(
+            session,
+            firing_id,
+            status="delivered",
+            room_results=[
+                {
+                    "room_id": room.id,
+                    "room_name": room.name,
+                    "status": "ok",
+                    "event_id": "$x",
+                    "attempts": 1,
+                }
+            ],
+            error=None,
+            attempt_count=1,
+        )
+        await session.commit()
+
+        listed = await list_deliveries(
+            admin,
+            session,
+            _TRIGGER_STORE,
+            _config(),
+            instance="acme",
+            rule_id=None,
+            limit=20,
+            offset=0,
+        )
+        assert listed.retain_seconds > 0
+        assert listed.max_rows > 0
+        assert any(
+            d.issue_key == "DEL-1" and d.status == "delivered"
+            for d in listed.deliveries
+        )
+        row = next(d for d in listed.deliveries if d.issue_key == "DEL-1")
+        assert row.matched_rule_ids == [trigger.id]
+        assert row.room_results[0].event_id == "$x"

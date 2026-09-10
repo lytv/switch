@@ -124,8 +124,17 @@ class SwitchConfig(BaseSettings):
     jira_agent_name: str = "jira"
     jira_message_max_chars: int = 4000
     jira_dedupe_window_seconds: int = 300
+    # Per-rule burst cap: at most N claim/attempt rows in this window.
     jira_rate_limit_per_rule: int = 10
     jira_rate_limit_window_seconds: int = 60
+    # Minimum gap between claim attempts for one rule (after a prior attempt).
+    jira_rule_cooldown_seconds: int = 5
+    # Bounded inline retry for transient room-post failures.
+    jira_retry_max_attempts: int = 3
+    jira_retry_backoff_seconds: float = 0.5
+    # Delivery-log retention: prune rows older than this, and cap total rows.
+    jira_delivery_log_retain_seconds: int = 7 * 24 * 3600
+    jira_delivery_log_max_rows: int = 5000
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

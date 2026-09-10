@@ -19,6 +19,10 @@ shared onboarding model, then the per-platform guide:
 | Discord | [`DISCORD_SETUP.md`](DISCORD_SETUP.md) | single bot app | Gateway WebSocket (outbound) | not required |
 | Telegram | [`TELEGRAM_SETUP.md`](TELEGRAM_SETUP.md) | single bot, agent named in the message body | long polling (outbound) | not required |
 
+**Inbound Jira triggers** (webhook → stored rules → addressed room post) are a
+separate integration, not a collaboration bridge. See
+[`JIRA_SETUP.md`](JIRA_SETUP.md).
+
 ## The onboarding model (same for every bridge)
 
 A bridge is an **unowned, workspace-wide integration** that holds platform

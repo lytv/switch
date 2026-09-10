@@ -1109,3 +1109,33 @@ class JiraRotateSecretResponse(BaseModel):
     secret: str
     webhook_url: str
     note: str
+
+
+class JiraRoomDeliveryResult(BaseModel):
+    room_id: str
+    room_name: str | None = None
+    status: str
+    event_id: str | None = None
+    error: str | None = None
+    attempts: int | None = None
+
+
+class JiraDeliveryDetail(BaseModel):
+    id: str
+    issue_key: str
+    rule_id: str
+    rule_name: str
+    instance: str
+    transition_key: str
+    status: str
+    matched_rule_ids: list[str] = []
+    room_results: list[JiraRoomDeliveryResult] = []
+    error: str | None = None
+    attempt_count: int
+    created_at: str
+
+
+class JiraDeliveryListResponse(BaseModel):
+    deliveries: list[JiraDeliveryDetail]
+    retain_seconds: int
+    max_rows: int
