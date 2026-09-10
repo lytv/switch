@@ -1,4 +1,5 @@
 import AccountTreeOutlined from "@mui/icons-material/AccountTreeOutlined";
+import BugReportOutlined from "@mui/icons-material/BugReportOutlined";
 import ChatBubbleOutlineOutlined from "@mui/icons-material/ChatBubbleOutlineOutlined";
 import FolderOutlined from "@mui/icons-material/FolderOutlined";
 import LockOutlined from "@mui/icons-material/LockOutlined";
@@ -27,6 +28,7 @@ const NAV_ITEMS: NavItem[] = [
   { label: "Resources", path: "/resources", icon: FolderOutlined },
   { label: "Agents", path: "/agents", icon: SmartToyOutlined },
   { label: "Apps", path: "/collaborations", icon: ChatBubbleOutlineOutlined },
+  { label: "Jira", path: "/jira-triggers", icon: BugReportOutlined },
   { label: "API Keys", path: "/registration-keys", icon: VpnKeyOutlined },
 ];
 

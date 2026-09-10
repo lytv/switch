@@ -25,7 +25,16 @@ def init_jira_routes(
 ) -> None:
     global _service, _secrets
     _service = service
+    # Keep a mutable copy so Gateway rotate can update live auth without restart.
     _secrets = dict(secrets_by_instance)
+
+
+def get_jira_secrets() -> dict[str, str]:
+    return _secrets
+
+
+def set_jira_instance_secret(instance: str, secret: str) -> None:
+    _secrets[instance] = secret
 
 
 def _require_service() -> JiraBridgeService:

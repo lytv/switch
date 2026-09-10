@@ -9,6 +9,29 @@ from switch_core.bridges.jira.parse import ParsedJiraEvent
 # Proposal tokens: {{issue.key}}, {{transition.from}}, …
 _TOKEN_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
 
+# Stable list for the Gateway token helper (order is display order).
+MESSAGE_TOKENS: tuple[str, ...] = (
+    "issue.key",
+    "issue.summary",
+    "issue.status",
+    "issue.assignee",
+    "issue.priority",
+    "issue.url",
+    "issue.reporter",
+    "issue.type",
+    "issue.project",
+    "key",
+    "summary",
+    "status",
+    "assignee",
+    "priority",
+    "url",
+    "reporter",
+    "transition",
+    "transition.from",
+    "transition.to",
+)
+
 
 class _StripTags(HTMLParser):
     def __init__(self) -> None:

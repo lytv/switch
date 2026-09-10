@@ -103,3 +103,22 @@ class TestRuleMatching:
         c = _rule(name="c", project_key="NO")
         matches = matching_rules([a, b, c], _event())
         assert matches == [a, b]
+
+
+def test_explain_match_reports_miss_reason() -> None:
+    from switch_core.bridges.jira.matching import explain_match
+
+    matched, reasons = explain_match(
+        _rule(project_key="OTHER"),  # type: ignore[arg-type]
+        _event(),
+    )
+    assert matched is False
+    assert any("Project filter" in r for r in reasons)
+
+
+def test_explain_match_reports_hit() -> None:
+    from switch_core.bridges.jira.matching import explain_match
+
+    matched, reasons = explain_match(_rule(), _event())  # type: ignore[arg-type]
+    assert matched is True
+    assert reasons == ["All filters matched."]

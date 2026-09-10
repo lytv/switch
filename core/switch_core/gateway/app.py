@@ -18,6 +18,7 @@ from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.api_key_store import ApiKeyStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
 from switch_core.db.stores.room_store import RoomStore
 from switch_core.db.stores.server_connector_store import ServerConnectorStore
@@ -30,6 +31,7 @@ from switch_core.gateway.connectors import router as connectors_router
 from switch_core.gateway.dependencies import init_dependencies
 from switch_core.gateway.documents import router as documents_router
 from switch_core.gateway.ecosystem import router as ecosystem_router
+from switch_core.gateway.jira_triggers import router as jira_triggers_router
 from switch_core.gateway.oidc_routes import register_oidc_client
 from switch_core.gateway.oidc_routes import router as oidc_router
 from switch_core.gateway.packages import router as packages_router
@@ -56,6 +58,7 @@ def create_gateway_app(
     user_store: UserStore,
     external_user_store: ExternalUserStore,
     api_key_store: ApiKeyStore,
+    jira_trigger_store: JiraTriggerStore,
     resource_service: ResourceService,
     protocol: ProtocolService,
     config: SwitchConfig,
@@ -75,6 +78,7 @@ def create_gateway_app(
         user_store=user_store,
         external_user_store=external_user_store,
         api_key_store=api_key_store,
+        jira_trigger_store=jira_trigger_store,
         resource_service=resource_service,
         protocol=protocol,
         config=config,
@@ -105,6 +109,9 @@ def create_gateway_app(
     )
     app.include_router(connectors_router, prefix="/connectors", tags=["connectors"])
     app.include_router(api_keys_router, prefix="/api-keys", tags=["api-keys"])
+    app.include_router(
+        jira_triggers_router, prefix="/jira-triggers", tags=["jira-triggers"]
+    )
     app.include_router(references_router, tags=["references"])
     app.include_router(room_links_router, tags=["linked-rooms"])
     app.include_router(documents_router, tags=["documents"])

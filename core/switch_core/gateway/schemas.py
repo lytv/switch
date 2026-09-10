@@ -1006,3 +1006,106 @@ class PackageMemberRemoveResponse(BaseModel):
     member_id: str
     affected_room_ids: list[str]
     affected_room_names: list[str]
+
+
+# ── Jira triggers ────────────────────────────────────────────────────────────
+
+
+class JiraTriggerDetail(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    instance: str
+    project_key: str
+    issue_type: str
+    fire_on: str
+    target_status: str
+    jql: str
+    target_kind: str
+    target_room_id: str | None
+    target_room_name: str | None = None
+    target_group_id: str | None
+    target_group_name: str | None = None
+    agent_name: str
+    message_template: str
+    thread_by: str
+    created_at: str
+    updated_at: str
+
+
+class JiraTriggerCreateRequest(BaseModel):
+    name: str
+    enabled: bool = True
+    instance: str
+    project_key: str = ""
+    issue_type: str = ""
+    fire_on: str
+    target_status: str = ""
+    jql: str = ""
+    target_kind: str = "room"
+    target_room_id: str | None = None
+    target_group_id: str | None = None
+    agent_name: str
+    message_template: str
+    thread_by: str = "new"
+
+
+class JiraTriggerUpdateRequest(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+    instance: str | None = None
+    project_key: str | None = None
+    issue_type: str | None = None
+    fire_on: str | None = None
+    target_status: str | None = None
+    jql: str | None = None
+    target_kind: str | None = None
+    target_room_id: str | None = None
+    target_group_id: str | None = None
+    agent_name: str | None = None
+    message_template: str | None = None
+    thread_by: str | None = None
+
+
+class JiraDryRunRequest(BaseModel):
+    payload: dict[str, Any] | None = None
+    sample_overrides: dict[str, Any] | None = None
+
+
+class JiraDryRunTarget(BaseModel):
+    room_id: str
+    room_name: str | None = None
+    agent_name: str
+    group_id: str | None = None
+    group_name: str | None = None
+
+
+class JiraDryRunResponse(BaseModel):
+    matched: bool
+    reasons: list[str]
+    rendered_message: str | None
+    targets: list[JiraDryRunTarget]
+    would_post: bool = False
+    issue_key: str
+    event_kind: str
+
+
+class JiraInstanceSetup(BaseModel):
+    instance: str
+    webhook_url: str
+    secret_masked: str
+    secret_configured: bool
+
+
+class JiraSetupResponse(BaseModel):
+    instances: list[JiraInstanceSetup]
+    jira_agent_name: str
+    gateway_public_url: str | None
+    guidance: dict[str, str]
+
+
+class JiraRotateSecretResponse(BaseModel):
+    instance: str
+    secret: str
+    webhook_url: str
+    note: str

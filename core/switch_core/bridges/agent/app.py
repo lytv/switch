@@ -149,6 +149,7 @@ def create_agent_bridge_app(
         session_factory=session_factory,  # type: ignore[arg-type]
         trigger_store=JiraTriggerStore(),
         agent_store=agent_store,
+        room_store=room_store,
         protocol=protocol,
         config=config,
     )

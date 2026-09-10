@@ -119,3 +119,71 @@ def matching_rules(
 ) -> list[JiraTrigger]:
     """Return every matching rule independently (one event may fire several)."""
     return [rule for rule in rules if rule_matches(rule, event)]
+
+
+def explain_match(rule: JiraTrigger, event: ParsedJiraEvent) -> tuple[bool, list[str]]:
+    """Return (matched, human-readable reasons). Reasons explain a miss or a hit."""
+    reasons: list[str] = []
+
+    if not rule.enabled:
+        reasons.append("Rule is disabled.")
+        return False, reasons
+
+    if not _blank_is_any(rule.project_key, event.project):
+        reasons.append(
+            f"Project filter {rule.project_key!r} does not match event project "
+            f"{event.project!r}."
+        )
+        return False, reasons
+
+    if not _blank_is_any(rule.issue_type, event.issue_type):
+        reasons.append(
+            f"Issue type filter {rule.issue_type!r} does not match "
+            f"{event.issue_type!r}."
+        )
+        return False, reasons
+
+    fire_on = rule.fire_on.strip().casefold()
+    if fire_on == "created":
+        if event.event_kind != "created":
+            reasons.append(
+                f"Rule fires on created events; sample event_kind is {event.event_kind!r}."
+            )
+            return False, reasons
+    elif fire_on == "updated":
+        if event.event_kind != "updated":
+            reasons.append(
+                f"Rule fires on updated events; sample event_kind is {event.event_kind!r}."
+            )
+            return False, reasons
+    elif fire_on == "transition":
+        if event.transition is None:
+            reasons.append(
+                "Rule fires on transitions; sample has no status transition."
+            )
+            return False, reasons
+        if rule.target_status.strip() and not _blank_is_any(
+            rule.target_status, event.transition.to_status
+        ):
+            reasons.append(
+                f"Transition target status {rule.target_status!r} does not match "
+                f"{event.transition.to_status!r}."
+            )
+            return False, reasons
+    else:
+        reasons.append(f"Unknown fire_on value {rule.fire_on!r}.")
+        return False, reasons
+
+    if rule.target_status.strip() and fire_on != "transition":
+        if not _blank_is_any(rule.target_status, event.status):
+            reasons.append(
+                f"Status filter {rule.target_status!r} does not match {event.status!r}."
+            )
+            return False, reasons
+
+    if not match_jql(rule.jql, event):
+        reasons.append(f"JQL filter {rule.jql!r} did not match the sample event.")
+        return False, reasons
+
+    reasons.append("All filters matched.")
+    return True, reasons

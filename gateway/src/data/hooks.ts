@@ -38,6 +38,8 @@ import {
   fetchLinkedRooms,
   fetchRoomGraph,
   fetchEcosystemGraph,
+  fetchJiraSetup,
+  fetchJiraTriggers,
   fetchPackage,
   fetchPackageDocuments,
   fetchPackageReferences,
@@ -55,6 +57,8 @@ import {
   fetchRoomReferences,
   fetchRooms,
   fetchUsers,
+  type JiraSetupInfo,
+  type JiraTriggerDetail,
 } from "./api";
 
 export interface UseQueryResult<T> {
@@ -319,4 +323,12 @@ export function usePackageDocuments(
     [packageId],
   );
   return useQuery(fetcher);
+}
+
+export function useJiraTriggers(): UseQueryResult<JiraTriggerDetail[]> {
+  return useQuery(fetchJiraTriggers);
+}
+
+export function useJiraSetup(): UseQueryResult<JiraSetupInfo> {
+  return useQuery(fetchJiraSetup);
 }
