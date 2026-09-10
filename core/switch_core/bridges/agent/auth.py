@@ -31,6 +31,8 @@ PUBLIC_PATH_PREFIXES: tuple[str, ...] = (
     # Public switchdash:// deeplink HTTP redirect — followed by whoever clicks
     # the "Open in Switch Console" link in an external channel, so no bearer token.
     "/deeplink",
+    # Signed Jira webhooks authenticate with X-Switch-Secret, not a bearer key.
+    "/integrations",
 )
 
 
