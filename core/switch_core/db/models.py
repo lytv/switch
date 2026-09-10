@@ -979,22 +979,29 @@ class JiraTrigger(Base):
 
 
 class JiraTriggerFiring(Base):
-    """Dedupe / rate-limit ledger for Jira trigger deliveries.
+    """Delivery history and dedupe / burst / cool-down ledger for Jira triggers.
 
-    Unique on (issue_key, rule_id, transition_key) so a burst of the same
-    transition for the same issue against the same rule is stored once; older
-    rows outside the window are ignored by the reader and may be pruned later.
+    At most one row per ``(issue_key, rule_id, transition_key)`` may hold
+    ``claim_held=True`` (partial unique index). That holds the dedupe claim
+    atomically across workers. When the dedupe window expires the claim is
+    released (``claim_held=False``) without deleting the delivery row — retention
+    pruning owns deletion. Suppression rows never hold the claim.
     """
 
     __tablename__ = "jira_trigger_firings"
     __table_args__ = (
-        UniqueConstraint(
+        Index("ix_jira_trigger_firings_rule_created", "rule_id", "created_at"),
+        Index("ix_jira_trigger_firings_created", "created_at"),
+        Index("ix_jira_trigger_firings_instance_created", "instance", "created_at"),
+        Index("ix_jira_trigger_firings_status_created", "status", "created_at"),
+        Index(
+            "uq_jira_trigger_firings_active_claim",
             "issue_key",
             "rule_id",
             "transition_key",
-            name="uq_jira_trigger_firings_dedupe",
+            unique=True,
+            postgresql_where=text("claim_held IS TRUE"),
         ),
-        Index("ix_jira_trigger_firings_rule_created", "rule_id", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
@@ -1004,6 +1011,19 @@ class JiraTriggerFiring(Base):
     )
     # Normalised "from->to" (or "created" / "updated") for the dedupe key.
     transition_key: Mapped[str] = mapped_column(Text, nullable=False)
+    instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    rule_name: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # pending | delivered | error | suppressed_dedupe | suppressed_burst |
+    # suppressed_cooldown
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    # All rule ids that matched the webhook event this row belongs to.
+    matched_rule_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Per-room send outcomes: [{room_id, room_name, status, event_id?, error?, attempts?}]
+    room_results: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # True while this row blocks a repeat of the same dedupe key.
+    claim_held: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

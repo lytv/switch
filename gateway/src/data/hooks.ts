@@ -40,6 +40,7 @@ import {
   fetchEcosystemGraph,
   fetchJiraSetup,
   fetchJiraTriggers,
+  fetchJiraDeliveries,
   fetchPackage,
   fetchPackageDocuments,
   fetchPackageReferences,
@@ -57,6 +58,7 @@ import {
   fetchRoomReferences,
   fetchRooms,
   fetchUsers,
+  type JiraDeliveryList,
   type JiraSetupInfo,
   type JiraTriggerDetail,
 } from "./api";
@@ -331,4 +333,12 @@ export function useJiraTriggers(): UseQueryResult<JiraTriggerDetail[]> {
 
 export function useJiraSetup(): UseQueryResult<JiraSetupInfo> {
   return useQuery(fetchJiraSetup);
+}
+
+export function useJiraDeliveries(limit = 50): UseQueryResult<JiraDeliveryList> {
+  const fetcher = useCallback(
+    () => fetchJiraDeliveries({ limit }),
+    [limit],
+  );
+  return useQuery(fetcher);
 }

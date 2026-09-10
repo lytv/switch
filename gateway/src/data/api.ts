@@ -1586,12 +1586,55 @@ export interface JiraSetupInfo {
   guidance: Record<string, string>;
 }
 
+export interface JiraRoomDeliveryResult {
+  room_id: string;
+  room_name: string | null;
+  status: string;
+  event_id?: string | null;
+  error?: string | null;
+  attempts?: number | null;
+}
+
+export interface JiraDeliveryDetail {
+  id: string;
+  issue_key: string;
+  rule_id: string;
+  rule_name: string;
+  instance: string;
+  transition_key: string;
+  status: string;
+  matched_rule_ids: string[];
+  room_results: JiraRoomDeliveryResult[];
+  error: string | null;
+  attempt_count: number;
+  created_at: string;
+}
+
+export interface JiraDeliveryList {
+  deliveries: JiraDeliveryDetail[];
+  retain_seconds: number;
+  max_rows: number;
+}
+
 export async function fetchJiraTriggers(): Promise<JiraTriggerDetail[] | null> {
   return fetchJson<JiraTriggerDetail[]>("/jira-triggers");
 }
 
 export async function fetchJiraSetup(): Promise<JiraSetupInfo | null> {
   return fetchJson<JiraSetupInfo>("/jira-triggers/setup");
+}
+
+export async function fetchJiraDeliveries(params?: {
+  instance?: string;
+  ruleId?: string;
+  limit?: number;
+}): Promise<JiraDeliveryList | null> {
+  const q = new URLSearchParams();
+  if (params?.instance) q.set("instance", params.instance);
+  if (params?.ruleId) q.set("rule_id", params.ruleId);
+  if (params?.limit != null) q.set("limit", String(params.limit));
+  const suffix = q.toString() ? `?${q.toString()}` : "";
+  return fetchJson<JiraDeliveryList>(`/jira-triggers/deliveries${suffix}`);
 }
 
 export async function fetchJiraMessageTokens(): Promise<string[] | null> {

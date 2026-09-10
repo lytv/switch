@@ -8,7 +8,10 @@ import pytest
 
 from switch_core.bridges.agent.protocol.types import AgentStatus, SendTargetedResult
 from switch_core.bridges.jira.parse import ParsedJiraEvent, StatusTransition
-from switch_core.bridges.jira.service import JiraBridgeService
+from switch_core.bridges.jira.service import (
+    JiraBridgeService,
+    is_permanent_delivery_error,
+)
 from switch_core.config import SwitchConfig
 
 
@@ -30,6 +33,11 @@ def _config(**overrides: object) -> SwitchConfig:
         "jira_dedupe_window_seconds": 300,
         "jira_rate_limit_per_rule": 10,
         "jira_rate_limit_window_seconds": 60,
+        "jira_rule_cooldown_seconds": 0,
+        "jira_retry_max_attempts": 3,
+        "jira_retry_backoff_seconds": 0.01,
+        "jira_delivery_log_retain_seconds": 3600,
+        "jira_delivery_log_max_rows": 100,
     }
     base.update(overrides)
     return SwitchConfig(**base)
@@ -85,6 +93,20 @@ class _SessionCM:
         return None
 
 
+def _trigger_store(**overrides: object) -> AsyncMock:
+    store = AsyncMock()
+    store.count_firings_in_window = AsyncMock(return_value=0)
+    store.has_recent_claim = AsyncMock(return_value=False)
+    store.try_record_firing = AsyncMock(return_value="firing-1")
+    store.record_suppressed_firing = AsyncMock(return_value="sup-1")
+    store.finalize_firing = AsyncMock()
+    store.prune_firings = AsyncMock(return_value=0)
+    store.seconds_since_last_attempt = AsyncMock(return_value=None)
+    for key, value in overrides.items():
+        setattr(store, key, value)
+    return store
+
+
 def _service(
     *,
     trigger_store: Any,
@@ -92,6 +114,7 @@ def _service(
     protocol: Any,
     room_store: Any,
     config: SwitchConfig | None = None,
+    sleep: Any = None,
 ) -> JiraBridgeService:
     session = AsyncMock()
     session.commit = AsyncMock()
@@ -103,16 +126,15 @@ def _service(
         room_store=room_store,
         protocol=protocol,
         config=config or _config(),
+        sleep=sleep or AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
 async def test_process_event_posts_addressed_message() -> None:
     rule = _room_rule()
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store()
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=0)
-    trigger_store.try_record_firing = AsyncMock(return_value=True)
 
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
@@ -146,15 +168,18 @@ async def test_process_event_posts_addressed_message() -> None:
     assert kwargs["thread_id"] is None
     assert "PROJ-1" in kwargs["content"]
     assert "In Progress" in kwargs["content"]
+    trigger_store.finalize_firing.assert_awaited()
+    fin = trigger_store.finalize_firing.await_args
+    assert fin.args[1] == "firing-1"
+    assert fin.kwargs["status"] == "delivered"
+    assert fin.kwargs["room_results"][0]["status"] == "ok"
 
 
 @pytest.mark.asyncio
 async def test_process_event_dedupes() -> None:
     rule = _room_rule(message_template="x", project_key="", issue_type="")
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store(has_recent_claim=AsyncMock(return_value=True))
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=0)
-    trigger_store.try_record_firing = AsyncMock(return_value=False)
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
         return_value=SimpleNamespace(id="jira-agent-id")
@@ -173,14 +198,20 @@ async def test_process_event_dedupes() -> None:
     )
     await service.process_event(instance="acme", event=_event())
     protocol.send_targeted_message.assert_not_called()
+    trigger_store.record_suppressed_firing.assert_awaited()
+    assert (
+        trigger_store.record_suppressed_firing.await_args.kwargs["status"]
+        == "suppressed_dedupe"
+    )
 
 
 @pytest.mark.asyncio
-async def test_process_event_rate_limits() -> None:
+async def test_process_event_burst_caps() -> None:
     rule = _room_rule(message_template="x", project_key="", issue_type="")
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store(
+        count_firings_in_window=AsyncMock(return_value=10),
+    )
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=10)
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
         return_value=SimpleNamespace(id="jira-agent-id")
@@ -201,6 +232,169 @@ async def test_process_event_rate_limits() -> None:
     await service.process_event(instance="acme", event=_event())
     protocol.send_targeted_message.assert_not_called()
     trigger_store.try_record_firing.assert_not_called()
+    assert (
+        trigger_store.record_suppressed_firing.await_args.kwargs["status"]
+        == "suppressed_burst"
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_event_cooldown() -> None:
+    rule = _room_rule(message_template="x", project_key="", issue_type="")
+    trigger_store = _trigger_store(
+        seconds_since_last_attempt=AsyncMock(return_value=1.0),
+    )
+    trigger_store.list = AsyncMock(return_value=[rule])
+    agent_store = AsyncMock()
+    agent_store.get_by_name = AsyncMock(
+        return_value=SimpleNamespace(id="jira-agent-id")
+    )
+    room_store = AsyncMock()
+    room_store.get = AsyncMock(
+        return_value=SimpleNamespace(id="room-1", name="Feature")
+    )
+    protocol = AsyncMock()
+
+    service = _service(
+        trigger_store=trigger_store,
+        agent_store=agent_store,
+        protocol=protocol,
+        room_store=room_store,
+        config=_config(jira_rule_cooldown_seconds=5),
+    )
+    await service.process_event(instance="acme", event=_event())
+    protocol.send_targeted_message.assert_not_called()
+    assert (
+        trigger_store.record_suppressed_firing.await_args.kwargs["status"]
+        == "suppressed_cooldown"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_valueerror_send_failure_is_retried() -> None:
+    rule = _room_rule(message_template="x", project_key="", issue_type="")
+    trigger_store = _trigger_store()
+    trigger_store.list = AsyncMock(return_value=[rule])
+    agent_store = AsyncMock()
+    agent_store.get_by_name = AsyncMock(
+        return_value=SimpleNamespace(id="jira-agent-id")
+    )
+    room_store = AsyncMock()
+    room_store.get = AsyncMock(
+        return_value=SimpleNamespace(id="room-1", name="Feature")
+    )
+    protocol = AsyncMock()
+    protocol.send_targeted_message = AsyncMock(
+        side_effect=[
+            ValueError("Failed to send message"),
+            SendTargetedResult(
+                event_id="$evt",
+                target_statuses={"coder": AgentStatus.LIVE},
+            ),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    service = _service(
+        trigger_store=trigger_store,
+        agent_store=agent_store,
+        protocol=protocol,
+        room_store=room_store,
+        sleep=_sleep,
+    )
+    await service.process_event(instance="acme", event=_event())
+    assert protocol.send_targeted_message.await_count == 2
+    assert sleeps == [0.01]
+    assert trigger_store.finalize_firing.await_args.kwargs["status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_retries_then_succeeds() -> None:
+    rule = _room_rule(message_template="x", project_key="", issue_type="")
+    trigger_store = _trigger_store()
+    trigger_store.list = AsyncMock(return_value=[rule])
+    agent_store = AsyncMock()
+    agent_store.get_by_name = AsyncMock(
+        return_value=SimpleNamespace(id="jira-agent-id")
+    )
+    room_store = AsyncMock()
+    room_store.get = AsyncMock(
+        return_value=SimpleNamespace(id="room-1", name="Feature")
+    )
+    protocol = AsyncMock()
+    protocol.send_targeted_message = AsyncMock(
+        side_effect=[
+            RuntimeError("Failed to send message"),
+            SendTargetedResult(
+                event_id="$evt",
+                target_statuses={"coder": AgentStatus.LIVE},
+            ),
+        ]
+    )
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    service = _service(
+        trigger_store=trigger_store,
+        agent_store=agent_store,
+        protocol=protocol,
+        room_store=room_store,
+        sleep=_sleep,
+    )
+    await service.process_event(instance="acme", event=_event())
+    assert protocol.send_targeted_message.await_count == 2
+    assert sleeps == [0.01]
+    fin = trigger_store.finalize_firing.await_args.kwargs
+    assert fin["status"] == "delivered"
+    assert fin["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_is_not_retried() -> None:
+    rule = _room_rule(message_template="x", project_key="", issue_type="")
+    trigger_store = _trigger_store()
+    trigger_store.list = AsyncMock(return_value=[rule])
+    agent_store = AsyncMock()
+    agent_store.get_by_name = AsyncMock(
+        return_value=SimpleNamespace(id="jira-agent-id")
+    )
+    room_store = AsyncMock()
+    room_store.get = AsyncMock(
+        return_value=SimpleNamespace(id="room-1", name="Feature")
+    )
+    protocol = AsyncMock()
+    protocol.send_targeted_message = AsyncMock(
+        side_effect=ValueError("Targets not in room: coder")
+    )
+
+    service = _service(
+        trigger_store=trigger_store,
+        agent_store=agent_store,
+        protocol=protocol,
+        room_store=room_store,
+    )
+    await service.process_event(instance="acme", event=_event())
+    assert protocol.send_targeted_message.await_count == 1
+    fin = trigger_store.finalize_firing.await_args.kwargs
+    assert fin["status"] == "error"
+    assert "ValueError" in (fin["error"] or "")
+
+
+def test_permanent_classifier() -> None:
+    assert is_permanent_delivery_error(ValueError("Targets not in room: coder"))
+    assert is_permanent_delivery_error(PermissionError("x"))
+    assert not is_permanent_delivery_error(RuntimeError("x"))
+    assert not is_permanent_delivery_error(TimeoutError("x"))
+    assert not is_permanent_delivery_error(ValueError("Failed to send message"))
+    assert not is_permanent_delivery_error(ValueError("Agent client not running"))
+    assert not is_permanent_delivery_error(
+        ValueError("Agent client not connected to Matrix")
+    )
 
 
 @pytest.mark.asyncio
@@ -213,10 +407,8 @@ async def test_group_fan_out_posts_to_each_room() -> None:
         issue_type="",
         message_template="hi {{issue.key}}",
     )
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store()
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=0)
-    trigger_store.try_record_firing = AsyncMock(return_value=True)
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
         return_value=SimpleNamespace(id="jira-agent-id")
@@ -248,6 +440,7 @@ async def test_group_fan_out_posts_to_each_room() -> None:
         room_store=AsyncMock(),
         protocol=protocol,
         config=_config(),
+        sleep=AsyncMock(),
     )
     await service.process_event(instance="acme", event=_event())
     assert protocol.send_targeted_message.await_count == 2
@@ -267,7 +460,7 @@ async def test_group_empty_is_noop() -> None:
         issue_type="",
         message_template="x",
     )
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store()
     trigger_store.list = AsyncMock(return_value=[rule])
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
@@ -302,10 +495,8 @@ async def test_thread_by_issue_reuses_root() -> None:
         message_template="x",
         thread_by="issue_key",
     )
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store()
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=0)
-    trigger_store.try_record_firing = AsyncMock(return_value=True)
     trigger_store.get_issue_thread_root = AsyncMock(return_value="$root")
     agent_store = AsyncMock()
     agent_store.get_by_name = AsyncMock(
@@ -343,10 +534,8 @@ async def test_thread_by_issue_opens_new_thread() -> None:
         message_template="x",
         thread_by="issue_key",
     )
-    trigger_store = AsyncMock()
+    trigger_store = _trigger_store()
     trigger_store.list = AsyncMock(return_value=[rule])
-    trigger_store.count_firings_in_window = AsyncMock(return_value=0)
-    trigger_store.try_record_firing = AsyncMock(return_value=True)
     trigger_store.get_issue_thread_root = AsyncMock(return_value=None)
     trigger_store.upsert_issue_thread = AsyncMock()
     agent_store = AsyncMock()

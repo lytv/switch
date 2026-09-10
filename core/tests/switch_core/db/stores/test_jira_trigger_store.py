@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from switch_core.db.models import JiraTrigger, Room
-from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
+from switch_core.db.models import JiraTrigger, JiraTriggerFiring, Room
+from switch_core.db.stores.jira_trigger_store import ATTEMPT_STATUSES, JiraTriggerStore
 
 
 async def _make_room(session: AsyncSession, name: str) -> Room:
@@ -85,16 +85,17 @@ async def test_firing_dedupe_and_rate_count(
 
     window = timedelta(seconds=300)
     async with session_factory() as session:
-        assert (
-            await store.try_record_firing(
-                session,
-                issue_key="PROJ-1",
-                rule_id=rule_id,
-                transition_key="To Do->In Progress",
-                dedupe_window=window,
-            )
-            is True
+        firing_id = await store.try_record_firing(
+            session,
+            issue_key="PROJ-1",
+            rule_id=rule_id,
+            transition_key="To Do->In Progress",
+            dedupe_window=window,
+            instance="acme",
+            rule_name="rate",
+            matched_rule_ids=[rule_id],
         )
+        assert firing_id is not None
         await session.commit()
 
     async with session_factory() as session:
@@ -106,10 +107,222 @@ async def test_firing_dedupe_and_rate_count(
                 transition_key="To Do->In Progress",
                 dedupe_window=window,
             )
-            is False
+            is None
         )
         count = await store.count_firings_in_window(
             session, rule_id=rule_id, window=window
         )
         assert count == 1
         await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_delivery_log_list_finalize_and_prune(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    store = JiraTriggerStore()
+    async with session_factory() as session:
+        room = await _make_room(session, "log-room")
+        trigger = JiraTrigger(
+            name="log",
+            instance="acme",
+            fire_on="transition",
+            target_room_id=room.id,
+            agent_name="coder",
+            message_template="x",
+        )
+        await store.create(session, trigger)
+        await session.commit()
+        rule_id = trigger.id
+
+    now = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        firing_id = await store.try_record_firing(
+            session,
+            issue_key="PROJ-9",
+            rule_id=rule_id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="log",
+            matched_rule_ids=[rule_id],
+            now=now,
+        )
+        assert firing_id is not None
+        await store.finalize_firing(
+            session,
+            firing_id,
+            status="delivered",
+            room_results=[
+                {
+                    "room_id": "r1",
+                    "room_name": "log-room",
+                    "status": "ok",
+                    "event_id": "$e",
+                    "attempts": 1,
+                }
+            ],
+            error=None,
+            attempt_count=1,
+        )
+        await store.record_suppressed_firing(
+            session,
+            issue_key="PROJ-9",
+            rule_id=rule_id,
+            transition_key="created",
+            status="suppressed_dedupe",
+            instance="acme",
+            rule_name="log",
+            matched_rule_ids=[rule_id],
+            now=now,
+        )
+        # Old row outside retention.
+        session.add(
+            JiraTriggerFiring(
+                issue_key="OLD-1",
+                rule_id=rule_id,
+                transition_key="created",
+                instance="acme",
+                rule_name="log",
+                status="delivered",
+                claim_held=False,
+                created_at=now - timedelta(days=30),
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = await store.list_deliveries(session, instance="acme", limit=10)
+        assert len(rows) >= 2
+        assert rows[0].created_at >= rows[-1].created_at
+        deleted = await store.prune_firings(
+            session,
+            retain_seconds=7 * 24 * 3600,
+            max_rows=5000,
+            now=now,
+        )
+        assert deleted >= 1
+        await session.commit()
+
+    async with session_factory() as session:
+        remaining = await store.list_deliveries(session, instance="acme", limit=50)
+        assert all(r.issue_key != "OLD-1" for r in remaining)
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_keeps_delivery_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Dedupe window expiry releases the claim without deleting history."""
+    store = JiraTriggerStore()
+    async with session_factory() as session:
+        room = await _make_room(session, "retain-room")
+        trigger = JiraTrigger(
+            name="retain",
+            instance="acme",
+            fire_on="transition",
+            target_room_id=room.id,
+            agent_name="coder",
+            message_template="x",
+        )
+        await store.create(session, trigger)
+        await session.commit()
+        rule_id = trigger.id
+
+    t0 = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    async with session_factory() as session:
+        first = await store.try_record_firing(
+            session,
+            issue_key="PROJ-RET",
+            rule_id=rule_id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="retain",
+            now=t0,
+        )
+        assert first is not None
+        await store.finalize_firing(
+            session,
+            first,
+            status="delivered",
+            room_results=[{"room_id": "r", "status": "ok", "attempts": 1}],
+            error=None,
+            attempt_count=1,
+        )
+        await session.commit()
+
+    t1 = t0 + timedelta(seconds=120)
+    async with session_factory() as session:
+        second = await store.try_record_firing(
+            session,
+            issue_key="PROJ-RET",
+            rule_id=rule_id,
+            transition_key="created",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="retain",
+            now=t1,
+        )
+        assert second is not None
+        await session.commit()
+
+    async with session_factory() as session:
+        rows = await store.list_deliveries(session, rule_id=rule_id, limit=20)
+        delivered_or_pending = [
+            r
+            for r in rows
+            if r.issue_key == "PROJ-RET" and r.status in ATTEMPT_STATUSES
+        ]
+        assert len(delivered_or_pending) == 2
+        held = [r for r in delivered_or_pending if r.claim_held]
+        assert len(held) == 1
+        assert held[0].id == second
+        first_row = next(r for r in delivered_or_pending if r.id == first)
+        assert first_row.claim_held is False
+        assert first_row.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claims_only_one_succeeds(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two workers racing on the same dedupe key: partial unique index admits one."""
+    import asyncio
+
+    store = JiraTriggerStore()
+    async with session_factory() as session:
+        room = await _make_room(session, "race-room")
+        trigger = JiraTrigger(
+            name="race",
+            instance="acme",
+            fire_on="transition",
+            target_room_id=room.id,
+            agent_name="coder",
+            message_template="x",
+        )
+        await store.create(session, trigger)
+        await session.commit()
+        rule_id = trigger.id
+
+    async def _claim() -> str | None:
+        async with session_factory() as session:
+            firing_id = await store.try_record_firing(
+                session,
+                issue_key="PROJ-RACE",
+                rule_id=rule_id,
+                transition_key="created",
+                dedupe_window=timedelta(seconds=300),
+                instance="acme",
+                rule_name="race",
+            )
+            await session.commit()
+            return firing_id
+
+    results = await asyncio.gather(_claim(), _claim(), _claim())
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1
+
+    async with session_factory() as session:
+        held = await store.list_deliveries(session, rule_id=rule_id, limit=20)
+        assert sum(1 for r in held if r.claim_held and r.issue_key == "PROJ-RACE") == 1

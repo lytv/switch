@@ -34,10 +34,13 @@ from switch_core.gateway.dependencies import (
     get_session,
 )
 from switch_core.gateway.schemas import (
+    JiraDeliveryDetail,
+    JiraDeliveryListResponse,
     JiraDryRunRequest,
     JiraDryRunResponse,
     JiraDryRunTarget,
     JiraInstanceSetup,
+    JiraRoomDeliveryResult,
     JiraRotateSecretResponse,
     JiraSetupResponse,
     JiraTriggerCreateRequest,
@@ -236,6 +239,62 @@ async def list_message_tokens(
     return list(MESSAGE_TOKENS)
 
 
+def _delivery_to_detail(row: object) -> JiraDeliveryDetail:
+    room_results_raw = getattr(row, "room_results", None) or []
+    room_results = [
+        JiraRoomDeliveryResult(
+            room_id=str(item.get("room_id", "")),
+            room_name=item.get("room_name"),
+            status=str(item.get("status", "")),
+            event_id=item.get("event_id"),
+            error=item.get("error"),
+            attempts=item.get("attempts"),
+        )
+        for item in room_results_raw
+        if isinstance(item, dict)
+    ]
+    matched = getattr(row, "matched_rule_ids", None) or []
+    return JiraDeliveryDetail(
+        id=row.id,  # type: ignore[attr-defined]
+        issue_key=row.issue_key,  # type: ignore[attr-defined]
+        rule_id=row.rule_id,  # type: ignore[attr-defined]
+        rule_name=row.rule_name or "",  # type: ignore[attr-defined]
+        instance=row.instance or "",  # type: ignore[attr-defined]
+        transition_key=row.transition_key,  # type: ignore[attr-defined]
+        status=row.status,  # type: ignore[attr-defined]
+        matched_rule_ids=[str(x) for x in matched],
+        room_results=room_results,
+        error=row.error,  # type: ignore[attr-defined]
+        attempt_count=int(row.attempt_count or 0),  # type: ignore[attr-defined]
+        created_at=str(row.created_at),  # type: ignore[attr-defined]
+    )
+
+
+@router.get("/deliveries")
+async def list_deliveries(
+    _admin: Annotated[User, Depends(require_admin)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    store: Annotated[JiraTriggerStore, Depends(get_jira_trigger_store)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    instance: Annotated[str | None, Query()] = None,
+    rule_id: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> JiraDeliveryListResponse:
+    rows = await store.list_deliveries(
+        session,
+        instance=instance,
+        rule_id=rule_id,
+        limit=limit,
+        offset=offset,
+    )
+    return JiraDeliveryListResponse(
+        deliveries=[_delivery_to_detail(row) for row in rows],
+        retain_seconds=config.jira_delivery_log_retain_seconds,
+        max_rows=config.jira_delivery_log_max_rows,
+    )
+
+
 @router.get("/setup")
 async def get_setup(
     _admin: Annotated[User, Depends(require_admin)],
@@ -271,6 +330,11 @@ async def get_setup(
                 f"Add the Switch system agent {config.jira_agent_name!r} as a "
                 "member of every target room (and every room in a target group) "
                 "so it can post addressed messages."
+            ),
+            "docs": (
+                "Full setup guide: docs/old/bridges/JIRA_SETUP.md — Cloud and "
+                "Server/Data Center webhooks, secrets, rule fields, dry-run, "
+                "and troubleshooting."
             ),
         },
     )
