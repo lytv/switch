@@ -2,6 +2,7 @@ import { isTransportFailure } from '@switch-console/core/exec';
 import { isSshChannelOpenFailure } from '@main/core/ssh/lifecycle/ssh-channel-open-failure';
 import type { CredentialsLogger } from '@main/core/switch-rooms/switch-credentials';
 import { parseSwitchAgentCredentials } from '@main/core/switch-rooms/switch-credentials';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
 
 /**
  * Verifies an agent's remote host is ready to run a session before Switch Console
@@ -30,7 +31,6 @@ import { parseSwitchAgentCredentials } from '@main/core/switch-rooms/switch-cred
  * fail with a misleading message.
  */
 
-const REQUIRED_BINARIES = ['tmux', 'node', 'git'] as const;
 const REACHABILITY_TIMEOUT_MS = 5000;
 // Global `fetch` and `AbortSignal.timeout` (used by the reachability probe below
 // and throughout the sidecar bundle) are only stable from Node 18.
@@ -41,9 +41,15 @@ const MIN_NODE_MAJOR = 18;
 // dir resolves with this report on stdout rather than rejecting. A rejected exec
 // therefore means the prepended `cd <workDir>` failed (or the SSH channel could
 // not open) — not a missing tool.
-const HOST_READY_SCRIPT = `for b in ${REQUIRED_BINARIES.join(
-  ' '
-)}; do command -v "$b" >/dev/null 2>&1 || printf 'missing %s\\n' "$b"; done; command -v node >/dev/null 2>&1 && printf 'node %s\\n' "$(node -v 2>/dev/null)"`;
+function requiredBinaries(sessionHost: SessionHost): readonly string[] {
+  if (sessionHost === 'tmux') return ['tmux', 'node', 'git'] as const;
+  if (sessionHost === 'herdr') return ['herdr', 'node', 'git'] as const;
+  return ['node', 'git'] as const;
+}
+
+function hostReadyScript(required: readonly string[]): string {
+  return `for b in ${required.join(' ')}; do command -v "$b" >/dev/null 2>&1 || printf 'missing %s\\n' "$b"; done; command -v node >/dev/null 2>&1 && printf 'node %s\\n' "$(node -v 2>/dev/null)"`;
+}
 
 // Resolves on any HTTP response (even 4xx) and rejects only on a network/egress
 // failure, so a reachable-but-unauthenticated endpoint still passes. No string
@@ -101,11 +107,22 @@ export interface RemotePreflightDeps {
    * order — the agent's neutral `.switch/agents/<name>.json` first, then the
    * legacy `.claude/settings.local.json`. The first that parses is used. */
   credsRelPaths: string[];
+  sessionHost?: SessionHost;
+  herdrProtocolMin?: number;
 }
 
 export async function preflightRemoteSession(deps: RemotePreflightDeps): Promise<void> {
+  const sessionHost = deps.sessionHost ?? 'tmux';
   const [hostReady, endpoint] = await Promise.allSettled([
-    assertHostReady(deps.ctx, deps.workDir, deps.host, deps.log, deps.isAuthSuspended),
+    assertHostReady(
+      deps.ctx,
+      deps.workDir,
+      deps.host,
+      deps.log,
+      deps.isAuthSuspended,
+      sessionHost,
+      deps.herdrProtocolMin ?? 14
+    ),
     readRemoteEndpoint(deps),
   ]);
   if (hostReady.status === 'rejected') throw hostReady.reason;
@@ -121,11 +138,14 @@ async function assertHostReady(
   workDir: string,
   host: string,
   log: CredentialsLogger,
-  isAuthSuspended: () => boolean
+  isAuthSuspended: () => boolean,
+  sessionHost: SessionHost,
+  herdrProtocolMin: number
 ): Promise<void> {
+  const required = requiredBinaries(sessionHost);
   let stdout: string;
   try {
-    ({ stdout } = await ctx.exec('sh', ['-c', HOST_READY_SCRIPT]));
+    ({ stdout } = await ctx.exec('sh', ['-c', hostReadyScript(required)]));
   } catch (error) {
     const detail = probeDetail(error);
     const cause = error instanceof Error ? error.cause : undefined;
@@ -187,6 +207,55 @@ async function assertHostReady(
   if (!Number.isFinite(major) || major < MIN_NODE_MAJOR) {
     throw new Error(
       `remote host '${host}' has Node ${nodeVersion || '(unknown)'}, but the Switch Console sidecar needs Node ${MIN_NODE_MAJOR} or newer. Install a current Node on the host (e.g. via NodeSource or nvm) so it is the default \`node\` on PATH, then retry.`
+    );
+  }
+
+  if (sessionHost === 'herdr') {
+    await assertHerdrProtocol(ctx, host, herdrProtocolMin);
+  }
+}
+
+async function assertHerdrProtocol(
+  ctx: RemotePreflightExec,
+  host: string,
+  minProtocol: number
+): Promise<void> {
+  let stdout: string;
+  try {
+    ({ stdout } = await ctx.exec('herdr', ['status', '--json']));
+  } catch (error) {
+    throw new Error(
+      `remote host '${host}' could not query herdr protocol with \`herdr status --json\` (${probeDetail(
+        error
+      )}). Ensure herdr is installed and on PATH, then re-run host setup.`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(
+      `remote host '${host}' returned invalid JSON from \`herdr status --json\` (${probeDetail(
+        error
+      )}). Upgrade herdr and re-run host setup.`
+    );
+  }
+  const protocol =
+    parsed &&
+    typeof parsed === 'object' &&
+    (parsed as { client?: unknown }).client &&
+    typeof (parsed as { client: unknown }).client === 'object' &&
+    typeof ((parsed as { client: { protocol?: unknown } }).client.protocol ?? null) === 'number'
+      ? ((parsed as { client: { protocol: number } }).client.protocol ?? null)
+      : null;
+  if (protocol === null || !Number.isInteger(protocol)) {
+    throw new Error(
+      `remote host '${host}' did not report herdr client.protocol. Upgrade herdr and re-run host setup.`
+    );
+  }
+  if (protocol < minProtocol) {
+    throw new Error(
+      `remote host '${host}' has herdr protocol ${protocol}, but this location requires ${minProtocol}+ for sessionHost=herdr. Upgrade herdr and re-run host setup.`
     );
   }
 }

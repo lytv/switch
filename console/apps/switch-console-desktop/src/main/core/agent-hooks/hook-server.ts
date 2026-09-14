@@ -109,12 +109,18 @@ export interface HookServerLogger {
 
 export type HookHandler = (raw: RawHookRequest) => Promise<void>;
 
+export type SidecarSessionTargetInfo =
+  | { kind: 'tmux'; tmuxTarget: string }
+  | { kind: 'herdr'; paneId: string; tabId: string; workspaceId: string };
+
 /** One VM-side session Switch Console can reconcile into its UI. */
 export interface SidecarSessionInfo {
   sessionId: string;
   /** The Switch room the agent is attending, or null for a session that has
    * not joined a room (still discoverable so it can be attached to). */
   roomId: string | null;
+  /** Host target backing this session (for exact stop/reset targeting). */
+  target?: SidecarSessionTargetInfo;
 }
 
 /** Snapshot of the sessions the sidecar currently has live on the VM. */
@@ -139,7 +145,11 @@ export type SidecarDisconnectHandler = (sessionId: string, terminated: boolean) 
  * starts; this is the same hand-off for a session Switch Console starts over SSH,
  * which would otherwise own a connection nobody on the VM reads.
  */
-export type SidecarConnectionHandler = (sessionId: string, providerId: string) => string;
+export type SidecarConnectionHandler = (
+  sessionId: string,
+  providerId: string,
+  target: SidecarSessionTargetInfo | null
+) => string;
 
 export class HookServer {
   private server: http.Server | null = null;
@@ -374,10 +384,16 @@ export class HookServer {
     req.on('end', () => {
       let sessionId = '';
       let providerId = '';
+      let target: SidecarSessionTargetInfo | null = null;
       try {
-        const parsed = JSON.parse(body) as { sessionId?: unknown; providerId?: unknown };
+        const parsed = JSON.parse(body) as {
+          sessionId?: unknown;
+          providerId?: unknown;
+          target?: unknown;
+        };
         if (typeof parsed.sessionId === 'string') sessionId = parsed.sessionId;
         if (typeof parsed.providerId === 'string') providerId = parsed.providerId;
+        target = parseSessionTarget(parsed.target);
       } catch {
         sessionId = '';
       }
@@ -389,7 +405,7 @@ export class HookServer {
       }
       let connectionId: string;
       try {
-        connectionId = handler(sessionId, providerId);
+        connectionId = handler(sessionId, providerId, target);
       } catch (err) {
         this.log.warn('HookServer: /connection handler error', { error: String(err) });
         res.writeHead(500);
@@ -424,4 +440,26 @@ export class HookServer {
   getToken(): string {
     return this.token;
   }
+}
+
+function parseSessionTarget(raw: unknown): SidecarSessionTargetInfo | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Record<string, unknown>;
+  if (candidate.kind === 'tmux' && typeof candidate.tmuxTarget === 'string') {
+    return { kind: 'tmux', tmuxTarget: candidate.tmuxTarget };
+  }
+  if (
+    candidate.kind === 'herdr' &&
+    typeof candidate.paneId === 'string' &&
+    typeof candidate.tabId === 'string' &&
+    typeof candidate.workspaceId === 'string'
+  ) {
+    return {
+      kind: 'herdr',
+      paneId: candidate.paneId,
+      tabId: candidate.tabId,
+      workspaceId: candidate.workspaceId,
+    };
+  }
+  return null;
 }

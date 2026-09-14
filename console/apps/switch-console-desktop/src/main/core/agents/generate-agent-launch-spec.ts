@@ -6,6 +6,8 @@ import type { IExecutionContext } from '@main/core/execution-context/types';
 import { getPlugin } from '@main/core/providers/plugin-registry';
 import { providerOverrideSettings } from '@main/core/settings/provider-settings-service';
 import { appSettingsService } from '@main/core/settings/settings-service';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
+import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
 import {
   type AgentLaunchSpec,
   INITIAL_PROMPT_PLACEHOLDER,
@@ -45,6 +47,8 @@ export async function generateAgentLaunchSpec(params: {
   credsSlug: string;
   /** Per-agent model / effort / instructions folded into the launch profile. */
   specialization?: SwitchLaunchSpecialization;
+  sessionHost: SessionHost;
+  herdr?: ResolvedHerdrSettings;
   ctx: IExecutionContext;
   connectionId: string;
 }): Promise<AgentLaunchSpec> {
@@ -56,6 +60,8 @@ export async function generateAgentLaunchSpec(params: {
     agentName,
     credsSlug,
     specialization,
+    sessionHost,
+    herdr,
     ctx,
     connectionId,
   } = params;
@@ -122,5 +128,7 @@ export async function generateAgentLaunchSpec(params: {
     // Read here rather than passed in: it is one global app setting, not a
     // per-call decision, and the sidecar has no way to reach it.
     autoTrustWorktrees: (await appSettingsService.get('sessions')).autoTrustWorktrees,
+    sessionHost,
+    herdr,
   };
 }

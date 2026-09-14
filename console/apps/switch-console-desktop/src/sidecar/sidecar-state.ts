@@ -5,6 +5,7 @@ import { defineVersionedSchema } from '@shared/lib/versioned-schema/versioned-sc
 import { atomicWriteFile } from './atomic-file';
 import type { WatcherLogger } from './notification-watcher';
 import { sidecarStateRelPath } from './sidecar-paths';
+import type { SessionHostTarget } from './session-host-backend';
 
 /**
  * The sidecar's durable state.
@@ -21,7 +22,21 @@ import { sidecarStateRelPath } from './sidecar-paths';
  * from the moment it boots, before any agent says anything.
  */
 
-const sessionEntry = z.object({
+const tmuxTargetSchema = z.object({
+  kind: z.literal('tmux'),
+  tmuxTarget: z.string(),
+});
+
+const herdrTargetSchema = z.object({
+  kind: z.literal('herdr'),
+  paneId: z.string(),
+  tabId: z.string(),
+  workspaceId: z.string(),
+});
+
+const sessionTargetSchema = z.discriminatedUnion('kind', [tmuxTargetSchema, herdrTargetSchema]);
+
+const sessionEntryV1 = z.object({
   sessionId: z.string(),
   /** The Switch room this session attends, or null for a bare session. */
   roomId: z.string().nullable(),
@@ -39,15 +54,40 @@ const stateV1 = z.object({
    * mistaken for the same stream continuing.
    */
   epoch: z.number().int().nonnegative(),
+  sessions: z.array(sessionEntryV1),
+});
+
+const sessionEntry = z.object({
+  sessionId: z.string(),
+  roomId: z.string().nullable(),
+  providerId: z.string(),
+  target: sessionTargetSchema,
+});
+
+const stateV2 = z.object({
+  version: z.literal('2'),
+  epoch: z.number().int().nonnegative(),
   sessions: z.array(sessionEntry),
 });
 
-export const sidecarStateSchema = defineVersionedSchema().initial('1', stateV1).build();
+export const sidecarStateSchema = defineVersionedSchema()
+  .initial('1', stateV1)
+  .version('2', stateV2, (v1) => ({
+    version: '2' as const,
+    epoch: v1.epoch,
+    sessions: v1.sessions.map((entry) => ({
+      sessionId: entry.sessionId,
+      roomId: entry.roomId,
+      providerId: entry.providerId,
+      target: { kind: 'tmux', tmuxTarget: entry.tmuxTarget } as const,
+    })),
+  }))
+  .build();
 
 export type SidecarSessionEntry = z.infer<typeof sessionEntry>;
-export type SidecarState = z.infer<typeof stateV1>;
+export type SidecarState = z.infer<typeof stateV2>;
 
-const EMPTY_STATE: SidecarState = { version: '1', epoch: 0, sessions: [] };
+const EMPTY_STATE: SidecarState = { version: '2', epoch: 0, sessions: [] };
 
 /** Raised when the state on disk was written by a NEWER sidecar than this one. */
 export class SidecarStateTooNewError extends Error {
@@ -152,15 +192,15 @@ export class SidecarStateStore {
   static async open(opts: {
     repoDir: string;
     slug: string;
-    isPaneAlive: (tmuxTarget: string) => Promise<boolean>;
+    isTargetAlive: (target: SessionHostTarget) => Promise<boolean>;
     log: WatcherLogger;
   }): Promise<SidecarStateStore> {
-    const { repoDir, slug, isPaneAlive, log } = opts;
+    const { repoDir, slug, isTargetAlive, log } = opts;
     const loaded = await loadSidecarState(repoDir, slug, log);
     const store = new SidecarStateStore(repoDir, slug, loaded.epoch + 1, log);
 
     const alive = await Promise.all(
-      loaded.sessions.map(async (s) => ((await isPaneAlive(s.tmuxTarget)) ? s : null))
+      loaded.sessions.map(async (s) => ((await isTargetAlive(s.target)) ? s : null))
     );
     for (const entry of alive) if (entry) store.sessions.set(entry.sessionId, entry);
 
@@ -205,7 +245,7 @@ export class SidecarStateStore {
       prev &&
       prev.roomId === merged.roomId &&
       prev.providerId === merged.providerId &&
-      prev.tmuxTarget === merged.tmuxTarget
+      sameTarget(prev.target, merged.target)
     ) {
       return;
     }
@@ -243,7 +283,7 @@ export class SidecarStateStore {
 
   private async flush(): Promise<void> {
     const state: SidecarState = {
-      version: '1',
+      version: '2',
       epoch: this.epoch,
       sessions: this.entries(),
     };
@@ -266,4 +306,13 @@ export class SidecarStateStore {
     this.stopped = true;
     await this.flushing;
   }
+}
+
+function sameTarget(a: SessionHostTarget, b: SessionHostTarget): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'tmux' && b.kind === 'tmux') return a.tmuxTarget === b.tmuxTarget;
+  if (a.kind === 'herdr' && b.kind === 'herdr') {
+    return a.paneId === b.paneId && a.tabId === b.tabId && a.workspaceId === b.workspaceId;
+  }
+  return false;
 }

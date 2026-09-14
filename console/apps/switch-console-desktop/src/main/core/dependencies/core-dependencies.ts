@@ -75,6 +75,26 @@ export const CORE_DEPENDENCIES: DependencyDescriptor[] = [
     },
   },
   {
+    id: 'herdr',
+    name: 'Herdr CLI',
+    category: 'core',
+    commands: ['herdr'],
+    versionArgs: ['--version'],
+    docUrl: 'https://github.com/sandboxaq/herdr',
+    installCommands: {
+      macos: [{ method: 'homebrew', command: 'brew install herdr', recommended: true }],
+      linux: [
+        {
+          method: 'apt',
+          command:
+            'echo "Install Herdr CLI from your organization package source, then re-run setup." >&2 && exit 1',
+          label: 'Manual install',
+          recommended: true,
+        },
+      ],
+    },
+  },
+  {
     id: 'node',
     name: 'Node.js',
     category: 'core',
@@ -110,3 +130,5 @@ export const CORE_DEPENDENCIES: DependencyDescriptor[] = [
     },
   },
 ];
+
+export const OPTIONAL_CORE_DEPENDENCY_IDS = new Set<DependencyDescriptor['id']>(['herdr']);

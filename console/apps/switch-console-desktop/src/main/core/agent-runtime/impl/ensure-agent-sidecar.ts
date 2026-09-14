@@ -3,6 +3,8 @@ import { generateAgentLaunchSpec } from '@main/core/agents/generate-agent-launch
 import type { IExecutionContext } from '@main/core/execution-context/types';
 import { deployerIdentity } from '@main/core/sidecar/deployer-identity';
 import { log } from '@main/lib/logger';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
+import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
 import {
   agentSidecarTmuxName,
   RemoteSidecarLauncher,
@@ -32,6 +34,8 @@ export interface AgentSidecarParams {
   /** Per-agent model / effort / instructions folded into auto-started sessions'
    * launch profile. */
   specialization?: SwitchLaunchSpecialization;
+  sessionHost?: SessionHost;
+  herdr?: ResolvedHerdrSettings;
   ctx: IExecutionContext;
   connectionId: string;
   host: SidecarHost;
@@ -47,6 +51,8 @@ async function buildLauncher(params: AgentSidecarParams): Promise<RemoteSidecarL
     agentName: params.agentName,
     credsSlug: params.credsSlug,
     specialization: params.specialization,
+    sessionHost: params.sessionHost ?? 'tmux',
+    herdr: params.herdr,
     ctx: params.ctx,
     connectionId: params.connectionId,
   });

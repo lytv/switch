@@ -2,6 +2,7 @@ import type { IDisposable } from '@switch-console/shared';
 import type { IExecutionContext } from '@main/core/execution-context/types';
 import type { FileSystemProvider } from '@main/core/fs/types';
 import type { Location } from '@shared/core/locations/locations';
+import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
 import type { AgentRuntimeProvider } from '../agent-runtime/types';
 import { sessionRuntimeManager } from '../sessions/session-runtime-manager';
 import { locationRuntimeRegistry } from './location-runtime-registry';
@@ -59,11 +60,15 @@ export class LocationProvider implements IDisposable {
 
   async dispose(): Promise<void> {
     const settings = await this.settings.get();
+    const sessionHost = resolveSessionHostForTransport(this.transport.kind, settings);
     // Detach (don't terminate) when work should outlive the app: tmux sessions,
     // and remote locations whose on-VM sidecar must keep listening to Switch
     // while Switch Console is closed (CHOO-1059). Terminate only cleans up the
     // local pane.
-    const mode = settings.tmux || this.transport.kind === 'ssh' ? 'detach' : 'terminate';
+    const mode =
+      this.transport.kind === 'ssh' || sessionHost.host === 'tmux' || sessionHost.host === 'herdr'
+        ? 'detach'
+        : 'terminate';
     await sessionRuntimeManager.teardownAllForLocation(this.location.id, mode);
     await locationRuntimeRegistry.releaseAll(this.location.id, mode);
   }

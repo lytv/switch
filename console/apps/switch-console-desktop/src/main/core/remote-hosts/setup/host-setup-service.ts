@@ -9,7 +9,10 @@
 
 import type { DependencyId, HostDependencyManager } from '@switch-console/core/deps/runtime';
 import { agentUpdateService } from '@main/core/dependencies/agent-update-service';
-import { CORE_DEPENDENCIES } from '@main/core/dependencies/core-dependencies';
+import {
+  CORE_DEPENDENCIES,
+  OPTIONAL_CORE_DEPENDENCY_IDS,
+} from '@main/core/dependencies/core-dependencies';
 import { installOutput } from '@main/core/dependencies/install-output';
 import {
   getRemoteDependencyManager,
@@ -78,7 +81,11 @@ export async function ensureSetupPlan(sshHost: string): Promise<HostSetupPlan> {
 
   const plan = buildSetupPlan({
     sshHost,
-    coreDependencies: CORE_DEPENDENCIES.map((dep) => ({ id: dep.id, name: dep.name })),
+    coreDependencies: CORE_DEPENDENCIES.map((dep) => ({
+      id: dep.id,
+      name: dep.name,
+      optional: OPTIONAL_CORE_DEPENDENCY_IDS.has(dep.id),
+    })),
     agentTypes: plannableAgentTypes(),
     existing: existing ? reconcileInterruptedPlan(existing, now) : null,
     now,
@@ -108,7 +115,11 @@ export async function ensureSetupPlan(sshHost: string): Promise<HostSetupPlan> {
 export async function readAllSetupPlans(): Promise<HostSetupPlan[]> {
   const persisted = await listSetupPlans();
   const now = new Date().toISOString();
-  const coreDependencies = CORE_DEPENDENCIES.map((dep) => ({ id: dep.id, name: dep.name }));
+  const coreDependencies = CORE_DEPENDENCIES.map((dep) => ({
+    id: dep.id,
+    name: dep.name,
+    optional: OPTIONAL_CORE_DEPENDENCY_IDS.has(dep.id),
+  }));
   const agentTypes = plannableAgentTypes();
 
   const plans: HostSetupPlan[] = [];

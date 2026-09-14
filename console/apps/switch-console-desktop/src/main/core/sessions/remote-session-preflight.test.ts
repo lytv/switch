@@ -21,10 +21,13 @@ function makeDeps(opts: {
   transportDown?: boolean;
   authSuspended?: boolean;
   endpoint?: string;
+  sessionHost?: 'pty' | 'tmux' | 'herdr';
+  herdrProtocol?: number | null;
+  herdrStatusError?: string;
 }) {
   const missing = opts.missingBinaries ?? [];
   const nodeVersion = opts.nodeVersion ?? 'v18.19.0';
-  const exec = vi.fn(async (command: string, _args: string[]) => {
+  const exec = vi.fn(async (command: string, args: string[]) => {
     // Combined working-dir + required-tools probe (`sh -c <script>`). A missing
     // dir or exhausted channel rejects; otherwise missing tools and node's
     // version land on stdout as `missing <tool>` / `node <version>` lines.
@@ -48,6 +51,17 @@ function makeDeps(opts: {
       // Captured remote stderr keeps its trailing newline, which is what put
       // the stray space into `TypeError: fetch failed . The sidecar polls…`.
       if (opts.endpointReachable === false) throw new Error('TypeError: fetch failed\n');
+      return { stdout: '', stderr: '' };
+    }
+    if (command === 'herdr') {
+      if (opts.herdrStatusError) throw new Error(opts.herdrStatusError);
+      if (args[0] === 'status' && args[1] === '--json') {
+        const protocol = opts.herdrProtocol ?? 14;
+        if (protocol === null) {
+          return { stdout: JSON.stringify({ client: {} }), stderr: '' };
+        }
+        return { stdout: JSON.stringify({ client: { protocol } }), stderr: '' };
+      }
       return { stdout: '', stderr: '' };
     }
     return { stdout: '', stderr: '' };
@@ -75,6 +89,8 @@ function makeDeps(opts: {
     host: 'box',
     workDir: '/home/agent/repo',
     credsRelPaths: ['.switch/agents/agent-1.json', '.claude/settings.local.json'],
+    sessionHost: opts.sessionHost ?? 'tmux',
+    herdrProtocolMin: 14,
     isAuthSuspended: () => opts.authSuspended ?? false,
     exec,
   };
@@ -114,6 +130,34 @@ describe('preflightRemoteSession', () => {
   it('fails loud listing every missing binary', async () => {
     const deps = makeDeps({ missingBinaries: ['tmux', 'git'], credsFile: CREDS_FILE });
     await expect(preflightRemoteSession(deps)).rejects.toThrow(/missing required tools: tmux, git/);
+  });
+
+  it('requires herdr when the location explicitly selects sessionHost=herdr', async () => {
+    const deps = makeDeps({
+      sessionHost: 'herdr',
+      missingBinaries: ['herdr'],
+      credsFile: CREDS_FILE,
+    });
+    await expect(preflightRemoteSession(deps)).rejects.toThrow(/missing required tools: herdr/);
+  });
+
+  it('rejects herdr protocol below the configured floor', async () => {
+    const deps = makeDeps({
+      sessionHost: 'herdr',
+      herdrProtocol: 13,
+      credsFile: CREDS_FILE,
+    });
+    await expect(preflightRemoteSession(deps)).rejects.toThrow(/requires 14\+/);
+  });
+
+  it('accepts herdr protocol at or above the configured floor', async () => {
+    const deps = makeDeps({
+      sessionHost: 'herdr',
+      herdrProtocol: 14,
+      credsFile: CREDS_FILE,
+      endpointReachable: true,
+    });
+    await expect(preflightRemoteSession(deps)).resolves.toBeUndefined();
   });
 
   it('fails loud when node is present but too old', async () => {

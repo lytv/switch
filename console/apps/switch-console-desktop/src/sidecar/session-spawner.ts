@@ -8,7 +8,6 @@ import { createDirTrustService } from '@main/core/agent-hooks/dir-trust';
 import type { SessionStartupWatch } from '@main/core/agent-runtime/session-startup-watch';
 import { createPluginFs } from '@main/core/providers/plugin-fs';
 import { getPlugin } from '@main/core/providers/plugin-registry';
-import { quoteShellArg } from '@main/utils/shellEscape';
 import { asAgentProviderId } from '@shared/core/providers/agent-provider-registry';
 import { buildAgentHookEnv } from '@shared/core/pty/hookEnv';
 import { asPtyProviderId, makePtyId } from '@shared/core/pty/ptyId';
@@ -19,7 +18,12 @@ import {
 } from './agent-launch-spec';
 import { atomicWriteFile } from './atomic-file';
 import type { SessionSpawner, WatcherLogger } from './notification-watcher';
-import { makeAgentTmuxSessionName } from './vm-tmux';
+import {
+  HerdrSessionHostBackend,
+  type SessionHostBackend,
+  type SessionHostTarget,
+  TmuxSessionHostBackend,
+} from './session-host-backend';
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +81,8 @@ export interface InProcessSessionSpawnerDeps {
   endpointFile: string;
   /** The multi-session runtime — a room it already serves needs no new session. */
   runtime: RoomLivenessSource;
+  /** Stable per-agent slug used when deriving Herdr workspace names. */
+  agentSlug: string;
   /**
    * Open a connection for a session about to launch and return its id, so the
    * session's tool calls land on the connection this sidecar is reading. Same
@@ -89,12 +95,16 @@ export interface InProcessSessionSpawnerDeps {
     roomId: string,
     startCursor?: number
   ) => string | null;
+  /** Called once a launch has an exact host target id (tmux session or herdr pane). */
+  onTargetCreated?: (sessionId: string, target: SessionHostTarget) => void;
   /** The agent's Switch identity as `SWITCH_*` env, injected into every
    * auto-started session so it authenticates as this agent — a `--settings` env
    * block is not reliably propagated to the spawned MCP server (CHOO-1440). */
   switchEnv: Record<string, string>;
   /** Whether a given tmux target is currently live (poller-backed cache). */
   isPaneLive: (tmuxTarget: string) => boolean;
+  /** Whether a given herdr pane is currently live (poller-backed cache). */
+  isHerdrPaneLive?: (paneId: string) => boolean;
   log: WatcherLogger;
   /** Shared with the runtime, which receives the sessions' reports. */
   startupWatch: SessionStartupWatch;
@@ -113,11 +123,9 @@ export class InProcessSessionSpawner implements SessionSpawner {
     command: string,
     args: string[]
   ) => Promise<{ stdout: string; stderr: string }>;
-  /** Room id → the session we launched for it (its minted id + tmux target). */
-  private readonly launched = new Map<
-    string,
-    { sessionId: string; tmuxTarget: string; requesterName: string | null }
-  >();
+  /** Room id → the session we launched for it. */
+  private readonly launched = new Map<string, SpawnedSession>();
+  private readonly backends = new Map<SessionHostTarget['kind'], SessionHostBackend>();
   /** The live launch recipe. Seeded from deps, replaceable via `setSpec` so a
    * bypass-permissions toggle takes effect without restarting the sidecar. */
   private spec: AgentLaunchSpec;
@@ -182,7 +190,19 @@ export class InProcessSessionSpawner implements SessionSpawner {
 
   /** tmux targets of launched sessions, for the entrypoint's pane-liveness poll. */
   pendingTmuxTargets(): string[] {
-    return [...this.launched.values()].map((s) => s.tmuxTarget);
+    return [...this.launched.values()]
+      .map((s) => (s.target.kind === 'tmux' ? s.target.tmuxTarget : null))
+      .filter((target): target is string => target !== null);
+  }
+
+  pendingHerdrPaneIds(): string[] {
+    return [...this.launched.values()]
+      .map((s) => (s.target.kind === 'herdr' ? s.target.paneId : null))
+      .filter((paneId): paneId is string => paneId !== null);
+  }
+
+  pendingTargets(): SessionHostTarget[] {
+    return [...this.launched.values()].map((s) => s.target);
   }
 
   /**
@@ -192,11 +212,11 @@ export class InProcessSessionSpawner implements SessionSpawner {
    * learns of it. Only live panes are reported — a launched-then-dead session
    * (crashed before connecting) is dropped so it doesn't surface as a ghost.
    */
-  spawnedSessions(): Array<{ sessionId: string; roomId: string }> {
-    const out: Array<{ sessionId: string; roomId: string }> = [];
+  spawnedSessions(): Array<{ sessionId: string; roomId: string; target: SessionHostTarget }> {
+    const out: Array<{ sessionId: string; roomId: string; target: SessionHostTarget }> = [];
     for (const [roomId, session] of this.launched) {
-      if (this.deps.isPaneLive(session.tmuxTarget)) {
-        out.push({ sessionId: session.sessionId, roomId });
+      if (this.isTargetLive(session.target)) {
+        out.push({ sessionId: session.sessionId, roomId, target: session.target });
       }
     }
     return out;
@@ -208,7 +228,7 @@ export class InProcessSessionSpawner implements SessionSpawner {
     // Or one we launched that is still booting (its pane is up but it has not
     // called connect_to_room yet) — avoid a duplicate spawn in that window.
     const launched = this.launched.get(roomId);
-    if (launched && this.deps.isPaneLive(launched.tmuxTarget)) return true;
+    if (launched && this.isTargetLive(launched.target)) return true;
     if (launched) this.launched.delete(roomId);
     return false;
   }
@@ -217,7 +237,8 @@ export class InProcessSessionSpawner implements SessionSpawner {
     const { hookPort, hookToken, endpointFile, log } = this.deps;
     const spec = this.spec;
     const sessionId = randomUUID();
-    const tmuxTarget = makeAgentTmuxSessionName(sessionId);
+    const host = this.hostForSpec(spec);
+    const backend = this.backend(host, spec);
 
     // Open the session's connection before launching it: its first
     // connect_to_room arrives tagged with this id, and the server refuses a
@@ -257,12 +278,22 @@ export class InProcessSessionSpawner implements SessionSpawner {
     if (reportsSessionStart(spec.providerId)) {
       this.deps.startupWatch.begin({ ptyId, sessionId, providerId: spec.providerId });
     }
-    await this.startDetachedTmux(tmuxTarget, spec.cwd, command.env, command.command, command.args);
-    this.launched.set(roomId, { sessionId, tmuxTarget, requesterName });
+    await backend.ensureDeps();
+    const target = await backend.create({
+      sessionId,
+      cwd: spec.cwd,
+      env: command.env,
+      command: command.command,
+      args: command.args,
+      roomId,
+      agentSlug: this.deps.agentSlug,
+    });
+    this.deps.onTargetCreated?.(sessionId, target);
+    this.launched.set(roomId, { sessionId, target, requesterName });
     log.info('InProcessSessionSpawner: launched session for room', {
       roomId,
       sessionId,
-      tmuxTarget,
+      target,
     });
   }
 
@@ -339,19 +370,41 @@ export class InProcessSessionSpawner implements SessionSpawner {
     });
   }
 
-  /** Launch a command in a fresh detached tmux session with env set on the process. */
-  private async startDetachedTmux(
-    sessionName: string,
-    cwd: string,
-    env: Record<string, string>,
-    command: string,
-    args: string[]
-  ): Promise<void> {
-    const envPrefix = Object.entries(env)
-      .map(([key, value]) => `${key}=${quoteShellArg(value)}`)
-      .join(' ');
-    const commandLine = [command, ...args].map(quoteShellArg).join(' ');
-    const inner = `${envPrefix} exec ${commandLine}`;
-    await this.exec('tmux', ['new-session', '-d', '-s', sessionName, '-c', cwd, inner]);
+  private isTargetLive(target: SessionHostTarget): boolean {
+    return target.kind === 'tmux'
+      ? this.deps.isPaneLive(target.tmuxTarget)
+      : (this.deps.isHerdrPaneLive?.(target.paneId) ?? false);
+  }
+
+  private hostForSpec(spec: AgentLaunchSpec): SessionHostTarget['kind'] {
+    if (spec.sessionHost === 'herdr') return 'herdr';
+    return 'tmux';
+  }
+
+  private backend(host: SessionHostTarget['kind'], spec: AgentLaunchSpec): SessionHostBackend {
+    const existing = this.backends.get(host);
+    if (existing) return existing;
+
+    const backend =
+      host === 'herdr'
+        ? new HerdrSessionHostBackend(
+            this.exec,
+            {
+              sessionName: spec.herdr?.sessionName ?? 'switchdash',
+              protocolMin: spec.herdr?.protocolMin ?? 14,
+              preferAgentPrompt: spec.herdr?.preferAgentPrompt ?? true,
+              workspaceMode: spec.herdr?.workspaceMode ?? 'flat',
+            },
+            this.deps.isHerdrPaneLive ?? (() => false)
+          )
+        : new TmuxSessionHostBackend(this.exec, this.deps.isPaneLive);
+    this.backends.set(host, backend);
+    return backend;
   }
 }
+
+type SpawnedSession = {
+  sessionId: string;
+  target: SessionHostTarget;
+  requesterName: string | null;
+};

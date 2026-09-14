@@ -5,6 +5,11 @@ import type { ContextResolver, ParsedHookEvent } from '@main/core/agent-hooks/ev
 import { parseHookEvent } from '@main/core/agent-hooks/event-enricher';
 import type { RawHookRequest } from '@main/core/agent-hooks/hook-server';
 import type { SessionStartupWatch } from '@main/core/agent-runtime/session-startup-watch';
+import {
+  HerdrInjectionSink,
+  type HerdrPromptTarget,
+  type HerdrRun,
+} from '@main/core/switch-rooms/herdr-injection-sink';
 import { PluginPromptInjector } from '@main/core/switch-rooms/plugin-prompt-injector';
 import {
   RoomConnection,
@@ -17,6 +22,7 @@ import { resolveSessionControl } from '@main/core/switch-rooms/session-control';
 import { type TmuxRun, TmuxInjectionSink } from '@main/core/switch-rooms/tmux-injection-sink';
 import { asPtyProviderId, makePtyId, parsePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentTmuxSessionName } from './vm-tmux';
+import type { SessionHostTarget } from './session-host-backend';
 
 /** A live per-room connection — the slice of RoomConnection the runtime drives. */
 export interface ManagedConnection {
@@ -41,8 +47,17 @@ export interface SidecarRuntimeDeps {
   creds: SwitchCredentials;
   deeplinkScheme: string;
   tmuxRun: TmuxRun;
+  herdrRun: HerdrRun;
   /** Whether a given agent tmux target is currently live (poller-backed cache). */
-  isPaneLive: (tmuxTarget: string) => boolean;
+  isTmuxPaneLive: (tmuxTarget: string) => boolean;
+  /** Whether a given herdr pane is currently live (poller-backed cache). */
+  isHerdrPaneLive: (paneId: string) => boolean;
+  /** Prompt target for a herdr pane when the agent is recognized and promptable. */
+  herdrPromptTarget: (paneId: string) => HerdrPromptTarget | null;
+  /** Whether a herdr agent pane is currently blocked on human input. */
+  isHerdrPaneBlocked: (paneId: string) => boolean;
+  /** Whether this sidecar should prefer herdr agent-prompt injection over pane send-text. */
+  preferHerdrAgentPrompt: boolean;
   log: RoomConnectionLogger;
   createConnection: RoomConnectionFactory;
   /** Durable registry of the sessions this sidecar owns. Backed by the state
@@ -66,7 +81,7 @@ export interface SessionRegistry {
     sessionId: string;
     roomId: string | null;
     providerId: string;
-    tmuxTarget: string;
+    target: SessionHostTarget;
   }): void;
   /** Drop the session's room while keeping the session. Distinct from `record`
    * with a null room, which means "no room information" and preserves what is
@@ -77,6 +92,7 @@ export interface SessionRegistry {
 
 interface SessionConnection {
   connection: ManagedConnection;
+  providerId: string;
   ptyId: string | null;
   /** Null while the session holds no room — the server has not named one yet,
    * or it named one and then took it away. `connectRoom` branches on this. */
@@ -88,7 +104,7 @@ interface SessionConnection {
    * whereas one that has yet to be told its room must not overwrite the room
    * the durable registry restored for it. */
   lostRoom: boolean;
-  tmuxTarget: string;
+  target: SessionHostTarget | null;
 }
 
 /**
@@ -153,11 +169,16 @@ export class SidecarRuntime {
     // would report other agents' sessions on the same host.
     const pid = parsePtyId(raw.ptyId);
     if (pid) {
+      const target =
+        this.sessions.get(pid.sessionId)?.target ?? {
+          kind: 'tmux',
+          tmuxTarget: makeAgentTmuxSessionName(pid.sessionId),
+        };
       this.deps.registry.record({
         sessionId: pid.sessionId,
         roomId: null,
         providerId: pid.providerId,
-        tmuxTarget: makeAgentTmuxSessionName(pid.sessionId),
+        target,
       });
     }
 
@@ -220,11 +241,22 @@ export class SidecarRuntime {
     sessionId: string,
     providerId: string,
     roomId: string | null,
-    startCursor?: number
+    startCursor?: number,
+    target: SessionHostTarget | null | undefined = undefined
   ): string {
+    const initialTarget: SessionHostTarget | null =
+      target === undefined
+        ? ({ kind: 'tmux', tmuxTarget: makeAgentTmuxSessionName(sessionId) } as const)
+        : target;
     const existing = this.sessions.get(sessionId);
-    if (existing) return existing.connection.connection;
-    return this.openConnection(sessionId, providerId, roomId, null, startCursor);
+    if (existing) {
+      if (initialTarget && !existing.target) {
+        existing.target = initialTarget;
+        this.recordSessionTarget(sessionId, providerId, initialTarget, existing.roomId);
+      }
+      return existing.connection.connection;
+    }
+    return this.openConnection(sessionId, providerId, roomId, null, startCursor, initialTarget);
   }
 
   private connectRoom(
@@ -256,7 +288,7 @@ export class SidecarRuntime {
     // connect_to_room re-targeting independently).
     if (existing) existing.connection.stop();
 
-    this.openConnection(sessionId, providerId, roomId, roomName);
+    this.openConnection(sessionId, providerId, roomId, roomName, undefined, existing?.target);
     this.roomConnectedListener?.(roomId, sessionId);
   }
 
@@ -265,9 +297,13 @@ export class SidecarRuntime {
     providerId: string,
     roomId: string | null,
     roomName: string | null,
-    startCursor?: number
+    startCursor?: number,
+    target: SessionHostTarget | null | undefined = undefined
   ): string {
-    const tmuxTarget = makeAgentTmuxSessionName(sessionId);
+    const resolvedTarget: SessionHostTarget | null =
+      target === undefined
+        ? ({ kind: 'tmux', tmuxTarget: makeAgentTmuxSessionName(sessionId) } as const)
+        : target;
     // A connection can be opened from persisted or test data before the
     // provider has been validated. Only a known provider can have a startup
     // watch; preserve the connection path for unknown values instead of
@@ -289,18 +325,7 @@ export class SidecarRuntime {
       connectionId,
       startCursor,
       sessionId,
-      // A live pane is not a ready session. Until one this sidecar spawned
-      // reports itself up, its pane may be showing a first-run trust or
-      // permissions prompt, and a room message typed there answers it — on
-      // Claude Code's bypass warning the default answer is "No, exit". A
-      // session with no watch (adopted, or already running) is not gated.
-      sink: new TmuxInjectionSink(
-        tmuxTarget,
-        this.deps.tmuxRun,
-        () =>
-          this.deps.isPaneLive(tmuxTarget) &&
-          (ptyId === null || !this.deps.startupWatch.blocksInjection(ptyId))
-      ),
+      sink: this.sinkForSession(sessionId, ptyId),
       injector: new PluginPromptInjector(providerId),
       control: resolveSessionControl(providerId),
       deeplinkScheme: this.deps.deeplinkScheme,
@@ -318,7 +343,8 @@ export class SidecarRuntime {
           if (!room) entry.lostRoom = true;
         }
         if (room) {
-          this.deps.registry.record({ sessionId, roomId: room, providerId, tmuxTarget });
+          const sessionTarget = this.sessions.get(sessionId)?.target;
+          if (sessionTarget) this.recordSessionTarget(sessionId, providerId, sessionTarget, room);
           this.roomConnectedListener?.(room, sessionId);
           return;
         }
@@ -331,8 +357,17 @@ export class SidecarRuntime {
       },
       log: this.deps.log,
     });
-    this.sessions.set(sessionId, { connection, ptyId, roomId, lostRoom: false, tmuxTarget });
-    if (roomId) this.deps.registry.record({ sessionId, roomId, providerId, tmuxTarget });
+    this.sessions.set(sessionId, {
+      connection,
+      providerId,
+      ptyId,
+      roomId,
+      lostRoom: false,
+      target: resolvedTarget,
+    });
+    if (roomId && resolvedTarget) {
+      this.recordSessionTarget(sessionId, providerId, resolvedTarget, roomId);
+    }
     // The other end of the watcher's hand-off. If a spawned session comes up
     // without the message that triggered it, this says whether a cursor was
     // handed over and honoured, or whether it opened at head and read past it.
@@ -348,6 +383,42 @@ export class SidecarRuntime {
     return connectionId;
   }
 
+  private sinkForSession(
+    sessionId: string,
+    ptyId: string | null
+  ): RoomConnectionDeps['sink'] {
+    return {
+      acquire: () => {
+        const current = this.sessions.get(sessionId);
+        if (!current?.target) return null;
+        const target = current.target;
+        const canType = ptyId === null || !this.deps.startupWatch.blocksInjection(ptyId);
+        if (target.kind === 'tmux') {
+          return new TmuxInjectionSink(
+            target.tmuxTarget,
+            this.deps.tmuxRun,
+            () => this.deps.isTmuxPaneLive(target.tmuxTarget) && canType
+          ).acquire();
+        }
+        return new HerdrInjectionSink(target.paneId, this.deps.herdrRun, () => {
+          return this.deps.isHerdrPaneLive(target.paneId) && canType && !this.deps.isHerdrPaneBlocked(target.paneId);
+        }, {
+          preferAgentPrompt: this.deps.preferHerdrAgentPrompt,
+          promptTarget: () => this.deps.herdrPromptTarget(target.paneId),
+        }).acquire();
+      },
+    };
+  }
+
+  private recordSessionTarget(
+    sessionId: string,
+    providerId: string,
+    target: SessionHostTarget,
+    roomId: string | null
+  ): void {
+    this.deps.registry.record({ sessionId, roomId, providerId, target });
+  }
+
   /**
    * Re-establish a room connection for a session restored from durable state.
    *
@@ -357,8 +428,20 @@ export class SidecarRuntime {
    * membership itself is server-side and outlived the restart; only our
    * connection to it did not.
    */
-  restoreSession(entry: { sessionId: string; roomId: string; providerId: string }): void {
-    this.connectRoom(entry.sessionId, entry.providerId, entry.roomId, null);
+  restoreSession(entry: {
+    sessionId: string;
+    roomId: string;
+    providerId: string;
+    target: SessionHostTarget;
+  }): void {
+    this.openConnection(entry.sessionId, entry.providerId, entry.roomId, null, undefined, entry.target);
+  }
+
+  setSessionTarget(sessionId: string, target: SessionHostTarget): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.target = target;
+    this.recordSessionTarget(sessionId, session.providerId, target, session.roomId);
   }
 
   /** The room a session is currently attending, or null if it has none. */
@@ -400,7 +483,7 @@ export class SidecarRuntime {
   }
 
   /**
-   * Reap connections whose tmux pane disappeared since the last liveness poll.
+   * Reap connections whose backing host target disappeared since the last liveness poll.
    *
    * A dead pane must not remain in this map: RoomConnection would otherwise
    * keep its no-target retry timer alive forever, and the durable registry plus
@@ -411,7 +494,7 @@ export class SidecarRuntime {
   reapDeadSessions(): Array<{ sessionId: string; roomId: string | null }> {
     const dead: Array<{ sessionId: string; roomId: string | null }> = [];
     for (const [sessionId, session] of this.sessions) {
-      if (this.deps.isPaneLive(session.tmuxTarget)) continue;
+      if (this.isSessionLive(session)) continue;
       dead.push({ sessionId, roomId: session.roomId });
       this.stopSession(sessionId);
     }
@@ -420,7 +503,15 @@ export class SidecarRuntime {
 
   /** Agent tmux targets the runtime is currently injecting into (for pane-liveness polling). */
   activeTmuxTargets(): string[] {
-    return [...this.sessions.values()].map((s) => s.tmuxTarget);
+    return [...this.sessions.values()]
+      .map((s) => (s.target?.kind === 'tmux' ? s.target.tmuxTarget : null))
+      .filter((target): target is string => target !== null);
+  }
+
+  activeHerdrPaneIds(): string[] {
+    return [...this.sessions.values()]
+      .map((s) => (s.target?.kind === 'herdr' ? s.target.paneId : null))
+      .filter((paneId): paneId is string => paneId !== null);
   }
 
   /**
@@ -433,7 +524,7 @@ export class SidecarRuntime {
   connectedSessions(): Array<{ sessionId: string; roomId: string | null }> {
     const out: Array<{ sessionId: string; roomId: string | null }> = [];
     for (const [sessionId, session] of this.sessions) {
-      if (!this.deps.isPaneLive(session.tmuxTarget)) continue;
+      if (!this.isSessionLive(session)) continue;
       if (session.roomId === null && !session.lostRoom) continue;
       out.push({ sessionId, roomId: session.roomId });
     }
@@ -451,7 +542,7 @@ export class SidecarRuntime {
   /** True when a live session is attending the room and its pane is up (watcher gate). */
   hasLiveRoom(roomId: string): boolean {
     for (const session of this.sessions.values()) {
-      if (session.roomId === roomId && this.deps.isPaneLive(session.tmuxTarget)) return true;
+      if (session.roomId === roomId && this.isSessionLive(session)) return true;
     }
     return false;
   }
@@ -462,5 +553,11 @@ export class SidecarRuntime {
       if (session.ptyId) this.deps.startupWatch.end(session.ptyId);
     }
     this.sessions.clear();
+  }
+
+  private isSessionLive(session: SessionConnection): boolean {
+    if (!session.target) return false;
+    if (session.target.kind === 'tmux') return this.deps.isTmuxPaneLive(session.target.tmuxTarget);
+    return this.deps.isHerdrPaneLive(session.target.paneId);
   }
 }

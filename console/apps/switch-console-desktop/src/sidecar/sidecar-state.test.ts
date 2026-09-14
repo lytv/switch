@@ -32,23 +32,44 @@ const entry = (over: Partial<SidecarSessionEntry> = {}): SidecarSessionEntry => 
   sessionId: 'session-a',
   roomId: 'room-1',
   providerId: 'claude',
-  tmuxTarget: 'switchdash-abc',
+  target: { kind: 'tmux', tmuxTarget: 'switchdash-abc' },
   ...over,
 });
 
 describe('loadSidecarState', () => {
   it('returns empty state on first run', async () => {
     const state = await loadSidecarState(repoDir, SLUG, silentLog);
-    expect(state).toEqual({ version: '1', epoch: 0, sessions: [] });
+    expect(state).toEqual({ version: '2', epoch: 0, sessions: [] });
   });
 
   it('reads back a persisted state file', async () => {
-    await writeState(JSON.stringify({ version: '1', epoch: 4, sessions: [entry()] }));
+    await writeState(JSON.stringify({ version: '2', epoch: 4, sessions: [entry()] }));
 
     const state = await loadSidecarState(repoDir, SLUG, silentLog);
 
     expect(state.epoch).toBe(4);
     expect(state.sessions).toEqual([entry()]);
+  });
+
+  it('upgrades legacy v1 state into tmux targets', async () => {
+    await writeState(
+      JSON.stringify({
+        version: '1',
+        epoch: 1,
+        sessions: [
+          {
+            sessionId: 'session-a',
+            roomId: 'room-1',
+            providerId: 'claude',
+            tmuxTarget: 'switchdash-abc',
+          },
+        ],
+      })
+    );
+
+    const state = await loadSidecarState(repoDir, SLUG, silentLog);
+
+    expect(state).toEqual({ version: '2', epoch: 1, sessions: [entry()] });
   });
 
   it('treats a corrupt file as empty rather than failing to start', async () => {
@@ -73,10 +94,16 @@ describe('loadSidecarState', () => {
 
 describe('SidecarStateStore', () => {
   const open = (isPaneAlive: (t: string) => Promise<boolean> = async () => true) =>
-    SidecarStateStore.open({ repoDir, slug: SLUG, isPaneAlive, log: silentLog });
+    SidecarStateStore.open({
+      repoDir,
+      slug: SLUG,
+      isTargetAlive: (target) =>
+        target.kind === 'tmux' ? isPaneAlive(target.tmuxTarget) : isPaneAlive(target.paneId),
+      log: silentLog,
+    });
 
   it('restores sessions whose pane is still alive', async () => {
-    await writeState(JSON.stringify({ version: '1', epoch: 1, sessions: [entry()] }));
+    await writeState(JSON.stringify({ version: '2', epoch: 1, sessions: [entry()] }));
 
     const store = await open();
 
@@ -89,9 +116,15 @@ describe('SidecarStateStore', () => {
   it('drops restored sessions whose pane is gone, so no ghost row is served', async () => {
     await writeState(
       JSON.stringify({
-        version: '1',
+        version: '2',
         epoch: 1,
-        sessions: [entry(), entry({ sessionId: 'session-dead', tmuxTarget: 'switchdash-dead' })],
+        sessions: [
+          entry(),
+          entry({
+            sessionId: 'session-dead',
+            target: { kind: 'tmux', tmuxTarget: 'switchdash-dead' },
+          }),
+        ],
       })
     );
 
@@ -102,7 +135,7 @@ describe('SidecarStateStore', () => {
   });
 
   it('bumps the epoch on every open so a restarted stream is distinguishable', async () => {
-    await writeState(JSON.stringify({ version: '1', epoch: 7, sessions: [] }));
+    await writeState(JSON.stringify({ version: '2', epoch: 7, sessions: [] }));
 
     const store = await open();
 
@@ -174,7 +207,7 @@ describe('SidecarStateStore', () => {
     await store.close();
 
     const written = JSON.parse(await readFile(statePath(), 'utf8')) as { version: string };
-    expect(written.version).toBe('1');
+    expect(written.version).toBe('2');
     // The temp file the atomic write renames from must not survive.
     const stray = path.join(repoDir, sidecarAgentDir(SLUG));
     const { readdir } = await import('node:fs/promises');

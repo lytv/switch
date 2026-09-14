@@ -20,6 +20,7 @@ import { events } from '@main/lib/events';
 import { log } from '@main/lib/logger';
 import type { Agent } from '@shared/core/agents/agents';
 import { sessionDeletedChannel } from '@shared/core/sessions/sessionEvents';
+import type { SidecarSessionTargetInfo } from '@main/core/agent-hooks/hook-server';
 import { agentLaunchSpecialization } from './agent-launch-config';
 import { getRemoteAgentLocation } from './agent-location';
 import { connectRemoteAgent } from './connect-remote-agent';
@@ -71,7 +72,7 @@ function resetFailureReason(error: unknown): TelemetryAgentResetFailure {
 }
 
 interface SidecarSessionsResponse {
-  sessions: Array<{ sessionId: string; roomId: string | null }>;
+  sessions: Array<{ sessionId: string; roomId: string | null; target?: SidecarSessionTargetInfo }>;
 }
 
 type RemoteConn = Awaited<ReturnType<typeof connectRemoteAgent>>;
@@ -83,7 +84,10 @@ type RemoteConn = Awaited<ReturnType<typeof connectRemoteAgent>>;
  * cover the sessions this client knows about. Real teardown errors surface later,
  * when the tmux sessions are actually killed.
  */
-async function fetchSidecarSessionIds(agent: Agent, conn: RemoteConn): Promise<string[]> {
+async function fetchSidecarSessions(
+  agent: Agent,
+  conn: RemoteConn
+): Promise<Array<{ sessionId: string; target?: SidecarSessionTargetInfo }>> {
   let endpoint: SidecarEndpoint | null;
   try {
     endpoint = await probeAgentSidecar({
@@ -115,7 +119,7 @@ async function fetchSidecarSessionIds(agent: Agent, conn: RemoteConn): Promise<s
       path: '/sessions',
       timeoutMs: SESSIONS_REQUEST_TIMEOUT_MS,
     });
-    return (response.sessions ?? []).map((s) => s.sessionId);
+    return (response.sessions ?? []).map((s) => ({ sessionId: s.sessionId, target: s.target }));
   } catch (error) {
     log.warn('resetRemoteAgent: failed to read sidecar /sessions', {
       agentId: agent.id,
@@ -124,6 +128,19 @@ async function fetchSidecarSessionIds(agent: Agent, conn: RemoteConn): Promise<s
     return [];
   } finally {
     channel.destroy();
+  }
+}
+
+async function closeHerdrPanes(host: SidecarHost, paneIds: string[]): Promise<void> {
+  const unique = [...new Set(paneIds)];
+  for (const paneId of unique) {
+    try {
+      await host.exec('herdr', ['pane', 'close', '--pane', paneId]);
+    } catch (error) {
+      const detail = String(error).toLowerCase();
+      if (detail.includes('pane_not_found') || detail.includes('pane not found')) continue;
+      throw error;
+    }
   }
 }
 
@@ -235,9 +252,14 @@ async function runReset(agentId: string, agent: Agent): Promise<void> {
   const dbSessionIds = (
     await db.select({ id: sessions.id }).from(sessions).where(eq(sessions.agentId, agentId))
   ).map((r) => r.id);
-  const sidecarSessionIds = await fetchSidecarSessionIds(agent, conn);
+  const sidecarSessions = await fetchSidecarSessions(agent, conn);
+  const sidecarSessionIds = sidecarSessions.map((s) => s.sessionId);
+  const herdrPaneIds = sidecarSessions
+    .map((s) => (s.target?.kind === 'herdr' ? s.target.paneId : null))
+    .filter((paneId): paneId is string => paneId !== null);
   const sessionIds = [...new Set([...dbSessionIds, ...sidecarSessionIds])];
 
+  await closeHerdrPanes(conn.host, herdrPaneIds);
   await killTmuxSessions(conn.host, resetTmuxTargets(sessionIds, conn.remoteRepoDir, credsSlug));
   log.info('resetRemoteAgent: killed remote tmux sessions', {
     agentId,

@@ -12,6 +12,7 @@ const CORE = [
   { id: 'git', name: 'Git' },
   { id: 'node', name: 'Node.js' },
   { id: 'tmux', name: 'tmux' },
+  { id: 'herdr', name: 'Herdr CLI', optional: true },
   { id: 'gh', name: 'GitHub CLI' },
 ];
 const AGENTS = [{ agentId: 'claude-code', name: 'Claude Code' }];
@@ -32,16 +33,17 @@ describe('buildSetupPlan', () => {
       'git',
       'node',
       'tmux',
+      'herdr',
       'gh',
       'claude-code',
       agentPluginStepId('claude-code'),
     ]);
   });
 
-  it('leaves every core tool required, so none can strand a host silently', () => {
+  it('keeps optional core tools marked optional in the plan', () => {
     const plan = build();
     const optional = plan.steps.filter((s) => s.optional).map((s) => s.id);
-    expect(optional).toEqual([]);
+    expect(optional).toEqual(['herdr']);
   });
 
   it('keeps the required core tools required', () => {
@@ -147,7 +149,7 @@ describe('buildSetupPlan — rebuilding onto an existing plan', () => {
         { id: 'git', state: 'satisfied' },
       ])
     );
-    expect(plan.steps.map((s) => s.id).slice(0, 3)).toEqual(['git', 'node', 'tmux']);
+    expect(plan.steps.map((s) => s.id).slice(0, 4)).toEqual(['git', 'node', 'tmux', 'herdr']);
   });
 });
 
@@ -251,7 +253,11 @@ describe('buildSetupPlan — against the real registry', () => {
   const realPlan = () =>
     buildSetupPlan({
       sshHost: 'dev-vm',
-      coreDependencies: CORE_DEPENDENCIES.map((dep) => ({ id: dep.id, name: dep.name })),
+      coreDependencies: CORE_DEPENDENCIES.map((dep) => ({
+        id: dep.id,
+        name: dep.name,
+        optional: dep.id === 'herdr',
+      })),
       agentTypes: switchSupported(),
       existing: null,
       now: NOW,

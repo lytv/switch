@@ -85,7 +85,12 @@ export async function migrateLegacyLocationSettingsIfNeeded({
       const normalized = await normalizeStoredWorktreeDirectory(legacy.worktreeDirectory);
       if (normalized.success) next.worktreeDirectory = normalized.data;
     }
-    if (legacy.tmux !== undefined) next.tmux = legacy.tmux;
+    if (legacy.tmux !== undefined) {
+      next.tmux = legacy.tmux;
+      if (next.sessionHost === undefined) {
+        next.sessionHost = legacy.tmux ? 'tmux' : 'pty';
+      }
+    }
     if (legacy.locationProvider !== undefined) {
       next.locationProvider = legacy.locationProvider;
     }

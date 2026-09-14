@@ -29,6 +29,7 @@ export { agentPluginStepId };
 export type PlannableDependency = {
   id: string;
   name: string;
+  optional?: boolean;
 };
 
 /** An agent type that can run under Switch, and therefore needs CLI + plugin. */
@@ -77,7 +78,7 @@ export function buildSetupPlan(input: BuildPlanInput): HostSetupPlan {
   const steps: HostSetupStep[] = [];
 
   for (const dep of coreDependencies) {
-    steps.push(blankStep(dep.id, 'core-dependency', dep.name, now));
+    steps.push(blankStep(dep.id, 'core-dependency', dep.name, now, { optional: dep.optional }));
   }
 
   for (const agent of agentTypes) {

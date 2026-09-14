@@ -21,6 +21,11 @@ import { LocalTerminalProvider } from '@main/core/terminals/impl/local-terminal-
 import { SshTerminalProvider } from '@main/core/terminals/impl/ssh-terminal-provider';
 import { runLifecycleScriptWithPolicy } from '@main/core/terminals/lifecycle-script-coordinator';
 import { log } from '@main/lib/logger';
+import {
+  type ResolvedHerdrSettings,
+  resolveSessionHostForTransport,
+} from '@shared/core/location-settings/session-host';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
 import type { Session } from '@shared/core/sessions/sessions';
 import { getEffectiveSessionSettings } from '../locations/settings/effective-session-settings';
 import type { LocationSettingsProvider } from '../locations/settings/provider';
@@ -81,9 +86,8 @@ export function createLocationRuntimeFactory(
       rootPath: workDir,
       portSeed: workDir,
     });
-    // Remote sessions require tmux — it is the persistence substrate the sidecar
-    // injects into and reattaches to across UI disconnects.
-    const tmuxEnabled = transport.kind === 'ssh' ? true : (locationSettings.tmux ?? false);
+    const sessionHost = resolveSessionHostForTransport(transport.kind, locationSettings);
+    const tmuxEnabled = sessionHost.host === 'tmux';
     const sessionLevelSettings = await getEffectiveSessionSettings({
       locationSettings: context.settings,
       sessionFs: runtimeFs,
@@ -213,7 +217,8 @@ type AgentRuntimeOpts = {
   locationId: string;
   sessionId: string;
   sessionPath: string;
-  tmuxEnabled: boolean;
+  sessionHost: SessionHost;
+  herdr: ResolvedHerdrSettings;
   shellSetup?: string;
   sessionEnvVars: Record<string, string>;
   /** Candidate creds files (relative to the working dir) the remote preflight
@@ -255,16 +260,18 @@ export async function buildAgentRuntime(
       log,
       host: transport.host,
       workDir: transport.dir,
+      sessionHost: opts.sessionHost,
+      herdrProtocolMin: opts.herdr.protocolMin,
       credsRelPaths: opts.credsRelPaths,
       isAuthSuspended: () => sshConnectionManager.isAuthSuspended(transport.connectionId),
     });
-    // Remote sessions always run under tmux — it persists the agent's PTY and
-    // is the pane the sidecar injects into and reattaches to.
     return new SshAgentRuntime({
       locationId: opts.locationId,
       sessionPath: opts.sessionPath,
       sessionId: opts.sessionId,
-      tmux: true,
+      tmux: opts.sessionHost !== 'pty',
+      sessionHost: opts.sessionHost,
+      herdr: opts.herdr,
       shellSetup: opts.shellSetup,
       ctx,
       fs,
@@ -280,7 +287,7 @@ export async function buildAgentRuntime(
     locationId: opts.locationId,
     sessionPath: opts.sessionPath,
     sessionId: opts.sessionId,
-    tmux: opts.tmuxEnabled,
+    tmux: opts.sessionHost === 'tmux',
     shellSetup: opts.shellSetup,
     shellProfile: agentShellProfile,
     ctx,
@@ -296,13 +303,16 @@ export async function buildAgentRuntime(
 export async function resolveSessionEnv(
   session: Pick<Session, 'id' | 'title'>,
   runtime: Pick<LocationRuntime, 'path' | 'fs'>,
+  transport: LocationTransport,
   settings: LocationSettingsProvider
 ): Promise<{
   sessionEnvVars: Record<string, string>;
-  tmuxEnabled: boolean;
+  sessionHost: SessionHost;
+  herdr: ResolvedHerdrSettings;
   shellSetup?: string;
 }> {
   const locationSettings = await settings.get();
+  const hostSettings = resolveSessionHostForTransport(transport.kind, locationSettings);
   const sessionLevelSettings = await getEffectiveSessionSettings({
     locationSettings: settings,
     sessionFs: runtime.fs,
@@ -315,7 +325,8 @@ export async function resolveSessionEnv(
       rootPath: runtime.path,
       portSeed: runtime.path,
     }),
-    tmuxEnabled: locationSettings.tmux ?? false,
+    sessionHost: hostSettings.host,
+    herdr: hostSettings.herdr,
     shellSetup: sessionLevelSettings.shellSetup ?? locationSettings.shellSetup,
   };
 }

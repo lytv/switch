@@ -220,7 +220,7 @@ describe('HookServer /events endpoint', () => {
 
     expect(ok.status).toBe(200);
     expect(JSON.parse(ok.body)).toEqual({ connectionId: 'conn-abc' });
-    expect(connectionHandler).toHaveBeenCalledWith('session-1', 'codex');
+    expect(connectionHandler).toHaveBeenCalledWith('session-1', 'codex', null);
 
     const forbidden = await post(
       server.getPort(),
@@ -245,6 +245,31 @@ describe('HookServer /events endpoint', () => {
 
     expect(res.status).toBe(400);
     expect(connectionHandler).not.toHaveBeenCalled();
+  });
+
+  it('parses and forwards a herdr target in /connection', async () => {
+    const connectionHandler = vi.fn(() => 'conn-herdr');
+    server = new HookServer(noopLog);
+    await server.start(async () => {}, { connectionHandler });
+
+    const ok = await post(
+      server.getPort(),
+      '/connection',
+      server.getToken(),
+      JSON.stringify({
+        sessionId: 'session-1',
+        providerId: 'codex',
+        target: { kind: 'herdr', paneId: 'pane-9', tabId: 'tab-2', workspaceId: 'ws-1' },
+      })
+    );
+
+    expect(ok.status).toBe(200);
+    expect(connectionHandler).toHaveBeenCalledWith('session-1', 'codex', {
+      kind: 'herdr',
+      paneId: 'pane-9',
+      tabId: 'tab-2',
+      workspaceId: 'ws-1',
+    });
   });
 
   // The 404 a client sees from a sidecar too old to have the endpoint. It must

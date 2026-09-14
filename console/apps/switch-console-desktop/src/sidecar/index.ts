@@ -14,7 +14,13 @@ import {
   readSwitchAgentCredentials,
   readSwitchAgentCredentialsFromSettings,
 } from '@main/core/switch-rooms/switch-credentials';
+import {
+  createHerdrRun,
+  type HerdrPromptTarget,
+} from '@main/core/switch-rooms/herdr-injection-sink';
 import { createTmuxRun } from '@main/core/switch-rooms/tmux-injection-sink';
+import { readHerdrPromptStatus } from '@main/core/agent-runtime/impl/herdr-session-host';
+import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
 import { type AgentLaunchSpec } from './agent-launch-spec';
 import { atomicWriteFile } from './atomic-file';
 import {
@@ -37,6 +43,7 @@ import { defaultRoomConnectionFactory, SidecarRuntime } from './sidecar-runtime'
 import { SidecarStateStore } from './sidecar-state';
 import { SIDECAR_CONTROL, SIDECAR_VERSION } from './sidecar-version';
 import { exactTmuxTarget, parseAgentTmuxSessionName } from './vm-tmux';
+import type { SessionHostTarget } from './session-host-backend';
 
 /**
  * Switch Console remote runtime sidecar (CHOO-1059 → CHOO-1085).
@@ -113,6 +120,13 @@ async function readLaunchSpec(
       spec[key] = false;
     }
   }
+  const resolvedHost = resolveSessionHostForTransport('ssh', {
+    sessionHost: spec.sessionHost,
+    tmux: undefined,
+    herdr: spec.herdr,
+  });
+  spec.sessionHost = resolvedHost.host;
+  spec.herdr = resolvedHost.herdr;
   return spec;
 }
 
@@ -147,12 +161,16 @@ async function main(): Promise<void> {
     : LEGACY_WATCH_ENABLED_REL_PATH;
   const launchSpec = await readLaunchSpec(repoDir, launchSpecRel, log);
 
-  // Pane-liveness cache: a background poll marks each active/pending tmux target
-  // live or dead so injection defers (rather than fails) when a pane is briefly
-  // gone. The sinks read this synchronously.
-  const liveTargets = new Set<string>();
-  const isPaneLive = (target: string): boolean => liveTargets.has(target);
-  const hasSession = async (target: string): Promise<boolean> => {
+  let sidecarSessionHost = launchSpec.sessionHost === 'herdr' ? 'herdr' : 'tmux';
+  const liveTmuxTargets = new Set<string>();
+  const liveHerdrPanes = new Set<string>();
+  const herdrPrompt = new Map<string, { blocked: boolean; target: HerdrPromptTarget | null }>();
+
+  // Pane-liveness cache: a background poll marks active/pending targets live or
+  // dead so injection defers (rather than fails) when a pane is briefly gone.
+  const isTmuxPaneLive = (target: string): boolean => liveTmuxTargets.has(target);
+  const isHerdrPaneLive = (paneId: string): boolean => liveHerdrPanes.has(paneId);
+  const hasTmuxSession = async (target: string): Promise<boolean> => {
     try {
       await execFileAsync('tmux', ['has-session', '-t', exactTmuxTarget(target)]);
       return true;
@@ -160,19 +178,31 @@ async function main(): Promise<void> {
       return false;
     }
   };
-  // Every live agent session pane on this host, whether or not its agent
-  // joined a Switch room. Lets `/sessions` surface bare sessions so another
-  // client can discover and attach to them (CHOO-1181), not just room-attending
-  // ones. tmux only lists live sessions, so this never reports a dead pane.
-  const listAgentSessionIds = async (): Promise<string[]> => {
+  const hasHerdrPane = async (paneId: string): Promise<boolean> => {
     try {
-      const { stdout } = await execFileAsync('tmux', ['list-sessions', '-F', '#{session_name}']);
-      return stdout
-        .split('\n')
-        .map((name) => parseAgentTmuxSessionName(name.trim()))
-        .filter((id): id is string => id !== null);
+      await execFileAsync('herdr', ['pane', 'get', '--pane', paneId, '--json']);
+      return true;
     } catch {
-      return []; // no tmux server / no sessions
+      return false;
+    }
+  };
+  const refreshHerdrPrompt = async (paneId: string): Promise<void> => {
+    if (!isHerdrPaneLive(paneId)) {
+      herdrPrompt.delete(paneId);
+      return;
+    }
+    try {
+      const status = await readHerdrPromptStatus((command, args) => execFileAsync(command, args), paneId);
+      if (!status || !status.recognizedKind) {
+        herdrPrompt.set(paneId, { blocked: false, target: null });
+        return;
+      }
+      herdrPrompt.set(paneId, {
+        blocked: status.blocked,
+        target: { agentId: status.agentId },
+      });
+    } catch {
+      herdrPrompt.set(paneId, { blocked: false, target: null });
     }
   };
 
@@ -182,9 +212,31 @@ async function main(): Promise<void> {
   const store = await SidecarStateStore.open({
     repoDir,
     slug: stateSlug,
-    isPaneAlive: hasSession,
+    isTargetAlive: (target) =>
+      target.kind === 'tmux' ? hasTmuxSession(target.tmuxTarget) : hasHerdrPane(target.paneId),
     log,
   });
+
+  // Every live agent session pane on this host, whether or not its agent joined
+  // a Switch room. tmux can enumerate all panes; herdr sessions are reported
+  // from this sidecar's durable registry and live-target filter.
+  const listAgentSessionIds = async (): Promise<string[]> => {
+    if (sidecarSessionHost === 'herdr') {
+      return store
+        .entries()
+        .filter((entry) => entry.target.kind === 'herdr' && isHerdrPaneLive(entry.target.paneId))
+        .map((entry) => entry.sessionId);
+    }
+    try {
+      const { stdout } = await execFileAsync('tmux', ['list-sessions', '-F', '#{session_name}']);
+      return stdout
+        .split('\n')
+        .map((name) => parseAgentTmuxSessionName(name.trim()))
+        .filter((id): id is string => id !== null);
+    } catch {
+      return [];
+    }
+  };
 
   // Owned here and shared with both halves: the spawner arms it for a session
   // it starts, the runtime clears it when that session's first hook arrives and
@@ -195,7 +247,12 @@ async function main(): Promise<void> {
     creds,
     deeplinkScheme,
     tmuxRun: createTmuxRun(log),
-    isPaneLive,
+    herdrRun: createHerdrRun(log),
+    isTmuxPaneLive,
+    isHerdrPaneLive,
+    herdrPromptTarget: (paneId) => herdrPrompt.get(paneId)?.target ?? null,
+    isHerdrPaneBlocked: (paneId) => herdrPrompt.get(paneId)?.blocked ?? false,
+    preferHerdrAgentPrompt: launchSpec.herdr?.preferAgentPrompt ?? true,
     log,
     createConnection: defaultRoomConnectionFactory,
     registry: store,
@@ -233,11 +290,13 @@ async function main(): Promise<void> {
   // would never post the hook that would otherwise rebuild it.
   for (const entry of store.entries()) {
     if (!entry.roomId) continue;
-    liveTargets.add(entry.tmuxTarget); // seed, so injection is not deferred pre-poll
+    if (entry.target.kind === 'tmux') liveTmuxTargets.add(entry.target.tmuxTarget);
+    else liveHerdrPanes.add(entry.target.paneId);
     runtime.restoreSession({
       sessionId: entry.sessionId,
       roomId: entry.roomId,
       providerId: entry.providerId,
+      target: entry.target,
     });
   }
 
@@ -268,7 +327,13 @@ async function main(): Promise<void> {
       // into its UI. Connected sessions win — they carry the room the agent
       // actually attends after connect_to_room.
       sessionsProvider: async () => {
-        const byId = new Map<string, string | null>();
+        const targetsBySession = new Map(
+          store.entries().map((entry) => [entry.sessionId, entry.target] as const)
+        );
+        const byId = new Map<
+          string,
+          { roomId: string | null; target?: SessionHostTarget }
+        >();
         // Every live agent pane THIS sidecar owns, room or not — so bare sessions
         // are discoverable. Scope by hasSeen: tmux names carry no repo/agent, so
         // the VM-wide enumeration must be filtered to this sidecar's sessions.
@@ -277,13 +342,27 @@ async function main(): Promise<void> {
         // otherwise clients read the gap as "deleted" and prune a live session.
         for (const sessionId of await listAgentSessionIds()) {
           if (runtime.hasSeen(sessionId) && !byId.has(sessionId)) {
-            byId.set(sessionId, store.roomIdFor(sessionId));
+            byId.set(sessionId, {
+              roomId: store.roomIdFor(sessionId),
+              target: targetsBySession.get(sessionId),
+            });
           }
         }
         // Room-attending / watcher-spawned sessions overwrite with their room id.
-        for (const s of spawner?.spawnedSessions() ?? []) byId.set(s.sessionId, s.roomId);
-        for (const s of runtime.connectedSessions()) byId.set(s.sessionId, s.roomId);
-        return [...byId].map(([sessionId, roomId]) => ({ sessionId, roomId }));
+        for (const s of spawner?.spawnedSessions() ?? []) {
+          byId.set(s.sessionId, { roomId: s.roomId, target: s.target });
+        }
+        for (const s of runtime.connectedSessions()) {
+          byId.set(s.sessionId, {
+            roomId: s.roomId,
+            target: byId.get(s.sessionId)?.target ?? targetsBySession.get(s.sessionId),
+          });
+        }
+        return [...byId].map(([sessionId, value]) => ({
+          sessionId,
+          roomId: value.roomId,
+          ...(value.target ? { target: value.target } : {}),
+        }));
       },
       // Switch Console is about to start a session over SSH: open its room
       // connection here first and hand back the id, so the session's tool calls
@@ -291,8 +370,14 @@ async function main(): Promise<void> {
       // the session holds a connection nobody on the VM is listening to, and
       // never learns which room it is in. No room yet — the agent's
       // connect_to_room claims one and the server reports it back.
-      connectionHandler: (sessionId, providerId) =>
-        runtime.ensureForSession(sessionId, providerId, null),
+      connectionHandler: (sessionId, providerId, target) =>
+        runtime.ensureForSession(
+          sessionId,
+          providerId,
+          null,
+          undefined,
+          (target as SessionHostTarget | null) ?? undefined
+        ),
       // Switch Console deleted a session: stop its room connection (ends the renew
       // heartbeat keeping the agent live) and forget any watcher-launched entry.
       // A deliberate delete/kill (terminated) is also broadcast to every attached
@@ -330,18 +415,27 @@ async function main(): Promise<void> {
 
   spawner = new InProcessSessionSpawner({
     spec: launchSpec,
+    agentSlug: credsSlug ?? 'default',
     hookPort: server.getPort(),
     hookToken: server.getToken(),
     endpointFile,
     runtime,
     openConnectionFor: (sessionId, providerId, roomId, startCursor) =>
-      runtime.ensureForSession(sessionId, providerId, roomId, startCursor),
+      runtime.ensureForSession(
+        sessionId,
+        providerId,
+        roomId,
+        startCursor,
+        sidecarSessionHost === 'herdr' ? null : undefined
+      ),
     switchEnv: {
       SWITCH_API_ENDPOINT: creds.apiEndpoint,
       SWITCH_API_TOKEN: creds.token,
       SWITCH_AGENT_ID: creds.agentId,
     },
-    isPaneLive,
+    isPaneLive: isTmuxPaneLive,
+    isHerdrPaneLive,
+    onTargetCreated: (sessionId, target) => runtime.setSessionTarget(sessionId, target),
     log,
     startupWatch,
   });
@@ -379,6 +473,7 @@ async function main(): Promise<void> {
     const json = JSON.stringify(spec);
     if (json === lastSpecJson) return;
     lastSpecJson = json;
+    sidecarSessionHost = spec.sessionHost === 'herdr' ? 'herdr' : 'tmux';
     spawner?.setSpec(spec);
     log.info('sidecar: launch spec changed — applied to spawner');
   };
@@ -402,17 +497,33 @@ async function main(): Promise<void> {
   watcher.start();
 
   const refreshLiveness = async (): Promise<void> => {
-    const targets = new Set([
+    const tmuxTargets = new Set([
       ...runtime.activeTmuxTargets(),
       ...(spawner?.pendingTmuxTargets() ?? []),
     ]);
+    const herdrPaneIds = new Set([
+      ...runtime.activeHerdrPaneIds(),
+      ...(spawner?.pendingHerdrPaneIds() ?? []),
+    ]);
     await Promise.all(
-      [...targets].map(async (t) => {
-        if (await hasSession(t)) liveTargets.add(t);
-        else liveTargets.delete(t);
+      [...tmuxTargets].map(async (target) => {
+        if (await hasTmuxSession(target)) liveTmuxTargets.add(target);
+        else liveTmuxTargets.delete(target);
       })
     );
-    for (const t of [...liveTargets]) if (!targets.has(t)) liveTargets.delete(t);
+    await Promise.all(
+      [...herdrPaneIds].map(async (paneId) => {
+        if (await hasHerdrPane(paneId)) liveHerdrPanes.add(paneId);
+        else liveHerdrPanes.delete(paneId);
+      })
+    );
+    for (const target of [...liveTmuxTargets]) {
+      if (!tmuxTargets.has(target)) liveTmuxTargets.delete(target);
+    }
+    for (const paneId of [...liveHerdrPanes]) {
+      if (!herdrPaneIds.has(paneId)) liveHerdrPanes.delete(paneId);
+    }
+    await Promise.all([...liveHerdrPanes].map((paneId) => refreshHerdrPrompt(paneId)));
 
     // A dead pane is terminal for the runtime connection. Reap it now rather
     // than leaving RoomConnection's no-target retry loop and the durable
@@ -421,7 +532,7 @@ async function main(): Promise<void> {
     for (const { sessionId, roomId } of runtime.reapDeadSessions()) {
       spawner?.drop(sessionId);
       if (roomId) watcher?.clearRoom(roomId);
-      log.error('sidecar: reaped session after its tmux target died', {
+      log.error('sidecar: reaped session after its host target died', {
         event: 'switch_session_reaped_dead_target',
         sessionId,
         roomId,

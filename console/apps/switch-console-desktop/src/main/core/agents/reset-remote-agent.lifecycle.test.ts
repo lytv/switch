@@ -20,6 +20,7 @@ const { h } = vi.hoisted(() => ({
     remoteLocation: { id: 'loc' } as { id: string } | null,
     connect: null as null | (() => never),
     killFails: false,
+    execCalls: [] as Array<{ command: string; args: string[] }>,
   },
 }));
 
@@ -67,14 +68,15 @@ vi.mock('./connect-remote-agent', () => ({
     if (h.connect) h.connect();
     return {
       host: {
-        exec: vi.fn(async () => {
+        exec: vi.fn(async (command: string, args: string[]) => {
+          h.execCalls.push({ command, args });
           if (h.killFails) throw new Error('tmux: kill-session failed');
         }),
       },
       remoteRepoDir: '/srv/repo',
       ctx: {},
       connectionId: 'c-1',
-      proxy: { forwardOut: vi.fn() },
+      proxy: { forwardOut: vi.fn(async () => ({ destroy: vi.fn() })) },
     };
   }),
 }));
@@ -95,6 +97,8 @@ vi.mock('@main/core/agent-runtime/impl/sidecar-http', () => ({ httpGetJsonOverCh
 vi.mock('@main/app/deeplinks', () => ({ DEEPLINK_SCHEME: 'switch' }));
 
 const { resetRemoteAgent } = await import('./reset-remote-agent');
+const { probeAgentSidecar } = await import('@main/core/agent-runtime/impl/ensure-agent-sidecar');
+const { httpGetJsonOverChannel } = await import('@main/core/agent-runtime/impl/sidecar-http');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -103,6 +107,7 @@ beforeEach(() => {
   h.remoteLocation = { id: 'loc' };
   h.connect = null;
   h.killFails = false;
+  h.execCalls = [];
 });
 
 describe('resetting a remote agent', () => {
@@ -197,5 +202,29 @@ describe('what a reset reports', () => {
       'agent_reset',
       expect.objectContaining({ outcome: 'failure', failure_reason: 'error' })
     );
+  });
+
+  it('closes exact herdr pane ids reported by the sidecar', async () => {
+    vi.mocked(probeAgentSidecar).mockResolvedValue({
+      port: 4321,
+      token: 'sidecar-tok',
+      endpointFile: '/srv/repo/.switchdash/agents/a/endpoint',
+    } as never);
+    vi.mocked(httpGetJsonOverChannel).mockResolvedValue({
+      sessions: [
+        {
+          sessionId: 's-herdr',
+          roomId: null,
+          target: { kind: 'herdr', paneId: 'pane-777', tabId: 'tab-9', workspaceId: 'ws-2' },
+        },
+      ],
+    } as never);
+
+    await resetRemoteAgent('agent-1');
+
+    expect(h.execCalls).toContainEqual({
+      command: 'herdr',
+      args: ['pane', 'close', '--pane', 'pane-777'],
+    });
   });
 });

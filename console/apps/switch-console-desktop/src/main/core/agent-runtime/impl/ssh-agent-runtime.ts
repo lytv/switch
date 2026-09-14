@@ -41,13 +41,22 @@ import { readAgentSwitchEnvFromFs } from '@main/core/switch-rooms/switch-credent
 import { events } from '@main/lib/events';
 import { runWithLogContext } from '@main/lib/log-context';
 import { log } from '@main/lib/logger';
+import { quoteShellArg } from '@main/utils/shellEscape';
 import type { AgentSessionConfig } from '@shared/core/providers/agent-session';
 import { agentSessionExitedChannel } from '@shared/core/providers/agentEvents';
 import { buildAgentHookEnv } from '@shared/core/pty/hookEnv';
 import { makePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentPtySessionId } from '@shared/core/pty/ptySessionId';
 import type { Session } from '@shared/core/sessions/sessions';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
+import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
 import { SIDECAR_VERSION } from '../../../../sidecar/sidecar-version';
+import type { SessionHostTarget } from '../../../../sidecar/session-host-backend';
+import {
+  closeHerdrPane,
+  createHerdrPane,
+  runHerdrPaneCommand,
+} from './herdr-session-host';
 import { ensureAgentSidecar, probeAgentSidecar } from './ensure-agent-sidecar';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { createRemoteHomePluginFs } from './remote-home-plugin-fs';
@@ -126,6 +135,9 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
   private readonly sessionId: string;
   private readonly sessionEnvVars: Record<string, string>;
   private readonly tmux: boolean;
+  private readonly sessionHost: SessionHost;
+  private readonly herdr: ResolvedHerdrSettings;
+  private herdrTarget: Extract<SessionHostTarget, { kind: 'herdr' }> | null = null;
   private readonly shellSetup?: string;
   private readonly ctx: IExecutionContext;
   private readonly fs: FileSystemProvider;
@@ -138,6 +150,13 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     sessionId,
     sessionEnvVars = {},
     tmux = false,
+    sessionHost = tmux ? 'tmux' : 'pty',
+    herdr = {
+      sessionName: 'switchdash',
+      protocolMin: 14,
+      preferAgentPrompt: true,
+      workspaceMode: 'flat',
+    },
     shellSetup,
     ctx,
     fs,
@@ -149,6 +168,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     sessionId: string;
     sessionEnvVars?: Record<string, string>;
     tmux?: boolean;
+    sessionHost?: SessionHost;
+    herdr?: ResolvedHerdrSettings;
     shellSetup?: string;
     ctx: IExecutionContext;
     fs: FileSystemProvider;
@@ -160,6 +181,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     this.sessionId = sessionId;
     this.sessionEnvVars = sessionEnvVars;
     this.tmux = tmux;
+    this.sessionHost = sessionHost;
+    this.herdr = herdr;
     this.shellSetup = shellSetup;
     this.ctx = ctx;
     this.fs = fs;
@@ -429,6 +452,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
           credsSlug,
           agentName: agent?.name ?? session.agentName ?? null,
           specialization,
+          sessionHost: this.sessionHost,
+          herdr: this.herdr,
           ctx: this.ctx,
           connectionId: this.connectionId,
           host,
@@ -488,7 +513,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
    */
   private async openSidecarConnection(
     endpoint: SidecarEndpoint,
-    providerId: string
+    providerId: string,
+    target?: SessionHostTarget
   ): Promise<string> {
     const channel = await this.proxy.forwardOut(endpoint.port);
     let response: { connectionId?: unknown };
@@ -497,7 +523,11 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         port: endpoint.port,
         token: endpoint.token,
         path: '/connection',
-        body: { sessionId: this.sessionId, providerId },
+        body: {
+          sessionId: this.sessionId,
+          providerId,
+          ...(target ? { target } : {}),
+        },
         timeoutMs: SIDECAR_CONNECTION_TIMEOUT_MS,
       });
     } catch (error) {
@@ -586,6 +616,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
           credsSlug,
           agentName: agent?.name ?? session.agentName ?? null,
           specialization: await agentLaunchSpecialization(session.agentId),
+          sessionHost: this.sessionHost,
+          herdr: this.herdr,
           ctx: this.ctx,
           connectionId: this.connectionId,
           host: this.createSidecarHost(),
@@ -760,7 +792,8 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         ...customEnv,
       };
 
-      const tmuxSessionName = this.tmux ? makeAgentTmuxSessionName(this.sessionId) : undefined;
+      const tmuxSessionName =
+        this.sessionHost === 'tmux' ? makeAgentTmuxSessionName(this.sessionId) : undefined;
 
       const cfg: AgentSessionConfig = {
         sessionId: this.sessionId,
@@ -791,17 +824,17 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
       // the two steps that must happen once per pane rather than once per
       // attach — opening this session's sidecar connection, and resolving the
       // npm auth env.
-      const reattaching = Boolean(tmuxSessionName && this.launched);
+      const reattaching = this.tmux && this.launched;
+      const colorEnv = await getTerminalColorEnv();
 
       let hookEnv: Record<string, string> = {};
-      if (tmuxSessionName) {
+      if (this.tmux) {
         await this.ensureAttachable(session);
         hookEnv = this.hookEnv;
         if (reattaching) {
-          // The agent is still running in its tmux pane and its sidecar
-          // connection is still open, so re-opening the PTY is all that is left.
-          log.info('SshAgentRuntime: re-attaching to running tmux session + sidecar', {
+          log.info('SshAgentRuntime: re-attaching to running remote session + sidecar', {
             sessionId: this.sessionId,
+            sessionHost: this.sessionHost,
           });
         } else {
           const endpoint = this.sidecarEndpoint;
@@ -810,9 +843,46 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
               'SshAgentRuntime: sidecar reported ready with no endpoint — refusing to launch an agent that cannot reach Switch'
             );
           }
+          if (this.sessionHost === 'herdr') {
+            const created = await createHerdrPane(this.ctx.exec.bind(this.ctx), this.herdr, {
+              cwd: this.sessionPath,
+              tabLabel: `switchdash-${this.sessionId}`,
+              agentSlug: agentCredsSlug(session),
+              roomId: null,
+            });
+            this.herdrTarget = {
+              kind: 'herdr',
+              paneId: created.paneId,
+              tabId: created.tabId,
+              workspaceId: created.workspaceId,
+            };
+          }
           switchEnv = {
-            SWITCH_CONNECTION_ID: await this.openSidecarConnection(endpoint, session.providerId),
+            SWITCH_CONNECTION_ID: await this.openSidecarConnection(
+              endpoint,
+              session.providerId,
+              this.sessionHost === 'herdr' ? (this.herdrTarget ?? undefined) : undefined
+            ),
           };
+          if (this.sessionHost === 'herdr') {
+            if (!this.herdrTarget) {
+              throw new Error('SshAgentRuntime: herdr launch target was not created');
+            }
+            await runHerdrPaneCommand(
+              this.ctx.exec.bind(this.ctx),
+              this.herdrTarget.paneId,
+              {
+                ...providerEnv,
+                ...colorEnv,
+                ...this.sessionEnvVars,
+                ...hookEnv,
+                ...identityVars,
+                ...switchEnv,
+              },
+              agentCommand.command,
+              agentCommand.args
+            );
+          }
         }
       } else {
         log.warn(
@@ -821,23 +891,24 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         );
       }
 
-      const [profile, colorEnv] = await Promise.all([
-        this.proxy.getRemoteShellProfile(),
-        getTerminalColorEnv(),
-      ]);
-      const sshCommand = resolveSshCommand(
-        'agent',
-        cfg,
-        {
-          ...providerEnv,
-          ...colorEnv,
-          ...this.sessionEnvVars,
-          ...hookEnv,
-          ...identityVars,
-          ...switchEnv,
-        },
-        profile
-      );
+      const paneEnv = {
+        ...providerEnv,
+        ...colorEnv,
+        ...this.sessionEnvVars,
+        ...hookEnv,
+        ...identityVars,
+        ...switchEnv,
+      };
+      let sshCommand: string;
+      if (this.sessionHost === 'herdr') {
+        if (!this.herdrTarget) {
+          throw new Error('SshAgentRuntime: cannot attach herdr session without a pane id');
+        }
+        sshCommand = `herdr pane attach --pane ${quoteShellArg(this.herdrTarget.paneId)}`;
+      } else {
+        const profile = await this.proxy.getRemoteShellProfile();
+        sshCommand = resolveSshCommand('agent', cfg, paneEnv, profile);
+      }
 
       const result = await openSsh2Pty(this.proxy, {
         id: ptySessionId,
@@ -936,6 +1007,10 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
       if (switchEnv.SWITCH_CONNECTION_ID) {
         await this.disconnectSidecarSession(this.sessionId, false);
       }
+      if (this.sessionHost === 'herdr' && !this.launched && this.herdrTarget) {
+        await closeHerdrPane(this.ctx.exec.bind(this.ctx), this.herdrTarget.paneId).catch(() => {});
+        this.herdrTarget = null;
+      }
       throw error;
     }
   }
@@ -998,7 +1073,9 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     this.stopSidecar();
     this.detachPty();
     if (this.tmux && opts.killTmux) {
-      await killTmuxSession(this.ctx, makeAgentTmuxSessionName(this.sessionId));
+      await this.killHostedSession();
+    } else if (this.sessionHost === 'herdr') {
+      this.herdrTarget = null;
     }
     this.supervisor.forget();
   }
@@ -1049,10 +1126,21 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     this.stopSidecar();
     this.session = null;
     if (this.tmux && wasKnown) {
-      await killTmuxSession(this.ctx, makeAgentTmuxSessionName(this.sessionId));
+      await this.killHostedSession();
     }
     this.supervisor.forget();
     this.known = false;
+  }
+
+  private async killHostedSession(): Promise<void> {
+    if (this.sessionHost === 'tmux') {
+      await killTmuxSession(this.ctx, makeAgentTmuxSessionName(this.sessionId));
+      return;
+    }
+    if (this.sessionHost === 'herdr' && this.herdrTarget) {
+      await closeHerdrPane(this.ctx.exec.bind(this.ctx), this.herdrTarget.paneId);
+      this.herdrTarget = null;
+    }
   }
 
   async detach(): Promise<void> {

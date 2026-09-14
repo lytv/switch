@@ -79,7 +79,12 @@ function makeRuntime() {
     creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
     deeplinkScheme: 'switchdash',
     tmuxRun: vi.fn(),
-    isPaneLive: () => true,
+    herdrRun: vi.fn(),
+    isTmuxPaneLive: () => true,
+    isHerdrPaneLive: () => true,
+    herdrPromptTarget: () => null,
+    isHerdrPaneBlocked: () => false,
+    preferHerdrAgentPrompt: true,
     log: silentLog,
     createConnection: factory,
     registry,
@@ -314,7 +319,12 @@ describe('SidecarRuntime (multi-session)', () => {
       creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
       deeplinkScheme: 'switchdash',
       tmuxRun: vi.fn(),
-      isPaneLive: () => paneLive,
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: () => paneLive,
+      isHerdrPaneLive: () => true,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
       log: silentLog,
       createConnection: factory,
       registry: fakeRegistry(),
@@ -418,7 +428,12 @@ describe('SidecarRuntime (multi-session)', () => {
       creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
       deeplinkScheme: 'switchdash',
       tmuxRun: vi.fn(),
-      isPaneLive: () => paneLive,
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: () => paneLive,
+      isHerdrPaneLive: () => true,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
       log: silentLog,
       createConnection: factory,
       registry,
@@ -450,8 +465,13 @@ describe('SidecarRuntime (multi-session)', () => {
       creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
       deeplinkScheme: 'switchdash',
       tmuxRun: vi.fn(),
-      isPaneLive: (target) =>
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: (target) =>
         [...live].some((sessionId) => target === makeAgentTmuxSessionName(sessionId)),
+      isHerdrPaneLive: () => true,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
       log: silentLog,
       createConnection: factory,
       registry: fakeRegistry(),
@@ -467,6 +487,45 @@ describe('SidecarRuntime (multi-session)', () => {
     expect(created[1].conn.stop).not.toHaveBeenCalled();
     expect(runtime.connectedSessions()).toEqual([{ sessionId: 'session-b', roomId: 'room-2' }]);
   });
+
+  it('tracks and reaps herdr-backed sessions by exact pane id', async () => {
+    let herdrPaneLive = true;
+    const created: Array<{ deps: RoomConnectionDeps; conn: ManagedConnection }> = [];
+    const runtime = new SidecarRuntime({
+      creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
+      deeplinkScheme: 'switchdash',
+      tmuxRun: vi.fn(),
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: () => false,
+      isHerdrPaneLive: () => herdrPaneLive,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
+      log: silentLog,
+      createConnection: (deps) => {
+        const conn = fakeConnection();
+        created.push({ deps, conn });
+        return conn;
+      },
+      registry: fakeRegistry(),
+      startupWatch: makeStartupWatch(),
+    });
+
+    runtime.ensureForSession('session-a', 'codex', 'room-1', undefined, null);
+    runtime.setSessionTarget('session-a', {
+      kind: 'herdr',
+      paneId: 'pane-777',
+      tabId: 'tab-9',
+      workspaceId: 'ws-2',
+    });
+
+    expect(runtime.activeHerdrPaneIds()).toEqual(['pane-777']);
+    expect(runtime.connectedSessions()).toEqual([{ sessionId: 'session-a', roomId: 'room-1' }]);
+
+    herdrPaneLive = false;
+    expect(runtime.reapDeadSessions()).toEqual([{ sessionId: 'session-a', roomId: 'room-1' }]);
+    expect(created[0].conn.stop).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('SidecarRuntime startup gate', () => {
@@ -478,7 +537,12 @@ describe('SidecarRuntime startup gate', () => {
       creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
       deeplinkScheme: 'switchdash',
       tmuxRun: vi.fn(),
-      isPaneLive: () => true,
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: () => true,
+      isHerdrPaneLive: () => true,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
       log: silentLog,
       createConnection: (deps) => {
         const conn = fakeConnection();
@@ -516,7 +580,12 @@ describe('SidecarRuntime startup gate', () => {
       creds: { agentId: 'agent-1', apiEndpoint: 'https://switch.test', token: 'tok' },
       deeplinkScheme: 'switchdash',
       tmuxRun: vi.fn(),
-      isPaneLive: () => true,
+      herdrRun: vi.fn(),
+      isTmuxPaneLive: () => true,
+      isHerdrPaneLive: () => true,
+      herdrPromptTarget: () => null,
+      isHerdrPaneBlocked: () => false,
+      preferHerdrAgentPrompt: true,
       log: silentLog,
       createConnection: (deps) => {
         const conn = fakeConnection();

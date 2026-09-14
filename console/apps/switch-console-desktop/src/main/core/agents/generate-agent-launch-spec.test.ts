@@ -57,6 +57,7 @@ const baseParams = {
   autoTrustWorktrees: true,
   agentName: null,
   credsSlug: 'hoot',
+  sessionHost: 'tmux' as const,
   ctx: {} as never,
   connectionId: 'conn-1',
 };

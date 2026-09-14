@@ -1,3 +1,5 @@
+import type { HerdrWorkspaceMode, SessionHost } from '@shared/core/location-settings/location-settings';
+
 /**
  * A config file the sidecar must write on the VM before spawning, path relative
  * to the agent's home directory. Baked into the spec because the watcher is
@@ -56,6 +58,15 @@ export interface AgentLaunchSpec {
    * sidecar cannot read the desktop's settings.
    */
   autoTrustWorktrees: boolean;
+  /** Where remote sessions are spawned: pty (legacy local), tmux, or herdr. */
+  sessionHost?: SessionHost;
+  /** Herdr-specific launch controls used when `sessionHost=herdr`. */
+  herdr?: {
+    sessionName: string;
+    protocolMin: number;
+    preferAgentPrompt: boolean;
+    workspaceMode: HerdrWorkspaceMode;
+  };
 }
 
 /** Argv token Switch Console emits in place of the fresh session's session id. */

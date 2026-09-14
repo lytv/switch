@@ -33,9 +33,27 @@ export const shareableLocationSettingsWithDefaultsSchema = shareableLocationSett
 
 export type ShareableLocationSettings = z.infer<typeof shareableLocationSettingsSchema>;
 
+export const sessionHostSchema = z.enum(['pty', 'tmux', 'herdr']);
+export type SessionHost = z.infer<typeof sessionHostSchema>;
+
+export const herdrWorkspaceModeSchema = z.enum(['flat', 'per-agent', 'per-room']);
+export type HerdrWorkspaceMode = z.infer<typeof herdrWorkspaceModeSchema>;
+
+export const DEFAULT_HERDR_PROTOCOL_MIN = 14;
+
+export const herdrLocationSettingsSchema = z.object({
+  sessionName: z.string().trim().min(1).optional(),
+  protocolMin: z.number().int().min(DEFAULT_HERDR_PROTOCOL_MIN).optional(),
+  preferAgentPrompt: z.boolean().optional(),
+  workspaceMode: herdrWorkspaceModeSchema.optional(),
+});
+export type HerdrLocationSettings = z.infer<typeof herdrLocationSettingsSchema>;
+
 export const baseLocationSettingsSchema = z.object({
   worktreeDirectory: z.string().trim().optional(),
   githubAccountId: z.string().trim().min(1).nullable().optional(),
+  sessionHost: sessionHostSchema.optional(),
+  herdr: herdrLocationSettingsSchema.optional(),
   tmux: z.boolean().optional(),
   autoRunSetupScriptOnSessionCreation: z.boolean().optional(),
   autoRunRunScriptOnSessionCreation: z.boolean().optional(),

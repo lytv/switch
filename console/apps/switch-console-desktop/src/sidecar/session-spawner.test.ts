@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseTOML } from 'smol-toml';
@@ -63,6 +63,7 @@ function makeSpawner(over: Partial<InProcessSessionSpawnerDeps> = {}) {
   const runtime = { hasLiveRoom: vi.fn(() => false) };
   const spawner = new InProcessSessionSpawner({
     spec: SPEC,
+    agentSlug: 'agent-1',
     hookPort: 4321,
     hookToken: 'hooktok',
     endpointFile: `${CWD}/.switchdash/sidecar-endpoint.json`,
@@ -73,6 +74,7 @@ function makeSpawner(over: Partial<InProcessSessionSpawnerDeps> = {}) {
       SWITCH_AGENT_ID: 'agent-1',
     },
     isPaneLive: () => true,
+    isHerdrPaneLive: () => true,
     startupWatch: new SessionStartupWatch(45_000, { warn: vi.fn(), error: vi.fn() }),
     log: silentLog,
     exec,
@@ -99,6 +101,48 @@ describe('InProcessSessionSpawner.launch', () => {
     expect(inner).toContain('connect to switch room room-x');
     expect(inner).not.toContain(SESSION_ID_PLACEHOLDER);
     expect(inner).not.toContain(INITIAL_PROMPT_PLACEHOLDER);
+  });
+
+  it('launches into a herdr pane when sessionHost=herdr', async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      calls.push({ command, args });
+      if (command === 'herdr' && args[0] === 'status') {
+        return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
+      }
+      if (command === 'herdr' && args[0] === 'workspace' && args[1] === 'create') {
+        return { stdout: JSON.stringify({ workspace_id: 'ws-1' }), stderr: '' };
+      }
+      if (command === 'herdr' && args[0] === 'tab' && args[1] === 'create') {
+        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const { spawner } = makeSpawner({
+      exec,
+      spec: {
+        ...SPEC,
+        sessionHost: 'herdr',
+        herdr: {
+          sessionName: 'switchdash',
+          protocolMin: 14,
+          preferAgentPrompt: true,
+          workspaceMode: 'flat',
+        },
+      },
+    });
+
+    await spawner.launch('room-x', null);
+
+    expect(
+      calls.some(
+        (call) =>
+          call.command === 'herdr' &&
+          call.args[0] === 'pane' &&
+          call.args[1] === 'run' &&
+          call.args.includes('pane-1')
+      )
+    ).toBe(true);
   });
 
   it('gives the pane every credential the baked Codex profile forwards', async () => {
@@ -329,7 +373,9 @@ describe('InProcessSessionSpawner startup prompts', () => {
 
     // The desktop cannot do this: the file belongs to the machine the session
     // runs on, and that is this one.
-    expect(((await claudeConfig()).projects as Record<string, unknown>)[cwd]).toEqual({
+    const projects = ((await claudeConfig()).projects ?? {}) as Record<string, unknown>;
+    const trusted = projects[cwd] ?? projects[await realpath(cwd)];
+    expect(trusted).toEqual({
       hasTrustDialogAccepted: true,
       hasCompletedProjectOnboarding: true,
     });

@@ -34,7 +34,13 @@ const OPTS = {
   locationId: 'loc-1',
   sessionId: 'session-1',
   sessionPath: '/home/dev/r',
-  tmuxEnabled: false, // location setting is off; remote must still force tmux on
+  sessionHost: 'tmux' as const,
+  herdr: {
+    sessionName: 'switchdash',
+    protocolMin: 14,
+    preferAgentPrompt: true,
+    workspaceMode: 'flat' as const,
+  },
   sessionEnvVars: {},
   credsRelPaths: ['.switch/agents/agent-1.json', '.claude/settings.local.json'],
 };

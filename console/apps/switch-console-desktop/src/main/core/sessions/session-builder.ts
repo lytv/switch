@@ -103,9 +103,10 @@ export async function buildSessionFromRuntime(
   transport: LocationTransport,
   settings: LocationSettingsProvider
 ): Promise<AgentRuntimeProvider> {
-  const { sessionEnvVars, tmuxEnabled, shellSetup } = await resolveSessionEnv(
+  const { sessionEnvVars, sessionHost, herdr, shellSetup } = await resolveSessionEnv(
     session,
     runtime,
+    transport,
     settings
   );
 
@@ -125,7 +126,8 @@ export async function buildSessionFromRuntime(
     locationId: runtime.id,
     sessionId: session.id,
     sessionPath: runtime.path,
-    tmuxEnabled,
+    sessionHost,
+    herdr,
     shellSetup,
     sessionEnvVars,
     credsRelPaths,
