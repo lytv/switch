@@ -65,6 +65,7 @@ import { createRemotePluginFs } from './remote-plugin-fs';
 import type { SidecarEndpoint, SidecarHost } from './remote-sidecar-launcher';
 import { resolveAgentExecutable } from './resolve-agent-executable';
 import {
+  httpGetJsonOverChannel,
   httpPostForJsonOverChannel,
   httpPostJsonOverChannel,
   SidecarHttpStatusError,
@@ -77,6 +78,25 @@ const RESPAWN_DELAY_MS = 500;
 const SHELL_NOT_FOUND_EXIT_CODE = 127;
 const SIDECAR_DISCONNECT_TIMEOUT_MS = 5_000;
 const SIDECAR_CONNECTION_TIMEOUT_MS = 10_000;
+
+function asHerdrTarget(value: unknown): Extract<SessionHostTarget, { kind: 'herdr' }> | null {
+  if (!value || typeof value !== 'object') return null;
+  const target = value as Record<string, unknown>;
+  if (
+    target.kind !== 'herdr' ||
+    typeof target.paneId !== 'string' ||
+    typeof target.tabId !== 'string' ||
+    typeof target.workspaceId !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    kind: 'herdr',
+    paneId: target.paneId,
+    tabId: target.tabId,
+    workspaceId: target.workspaceId,
+  };
+}
 
 function parseExtraArgs(value: string | undefined): string[] {
   if (!value?.trim()) return [];
@@ -229,6 +249,9 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     // ensureHooksInstalled).
     await this.installRemoteHooks(session.providerId);
     const endpoint = await this.launchSidecar(session);
+    if (this.sessionHost === 'herdr' && !this.herdrTarget) {
+      this.herdrTarget = await this.findHerdrTarget(endpoint);
+    }
     this.hookEnv = buildAgentHookEnv({
       port: endpoint.port,
       ptyId: makePtyId(session.providerId, this.sessionId),
@@ -553,6 +576,25 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     return connectionId;
   }
 
+  private async findHerdrTarget(
+    endpoint: SidecarEndpoint
+  ): Promise<Extract<SessionHostTarget, { kind: 'herdr' }> | null> {
+    const channel = await this.proxy.forwardOut(endpoint.port);
+    try {
+      const response = await httpGetJsonOverChannel<{
+        sessions?: Array<{ sessionId?: unknown; target?: unknown }>;
+      }>(channel, {
+        port: endpoint.port,
+        token: endpoint.token,
+        path: '/sessions',
+        timeoutMs: SIDECAR_CONNECTION_TIMEOUT_MS,
+      });
+      return asHerdrTarget(response.sessions?.find((s) => s.sessionId === this.sessionId)?.target);
+    } finally {
+      channel.destroy();
+    }
+  }
+
   private async postDisconnect(
     endpoint: { port: number; token: string },
     sessionId: string,
@@ -824,13 +866,13 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
       // the two steps that must happen once per pane rather than once per
       // attach — opening this session's sidecar connection, and resolving the
       // npm auth env.
-      const reattaching = this.tmux && this.launched;
       const colorEnv = await getTerminalColorEnv();
 
       let hookEnv: Record<string, string> = {};
       if (this.tmux) {
         await this.ensureAttachable(session);
         hookEnv = this.hookEnv;
+        const reattaching = this.launched || this.herdrTarget !== null;
         if (reattaching) {
           log.info('SshAgentRuntime: re-attaching to running remote session + sidecar', {
             sessionId: this.sessionId,

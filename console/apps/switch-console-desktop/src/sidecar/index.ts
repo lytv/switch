@@ -221,21 +221,23 @@ async function main(): Promise<void> {
   // a Switch room. tmux can enumerate all panes; herdr sessions are reported
   // from this sidecar's durable registry and live-target filter.
   const listAgentSessionIds = async (): Promise<string[]> => {
-    if (sidecarSessionHost === 'herdr') {
-      return store
+    const ids = new Set(
+      store
         .entries()
         .filter((entry) => entry.target.kind === 'herdr' && isHerdrPaneLive(entry.target.paneId))
-        .map((entry) => entry.sessionId);
-    }
+        .map((entry) => entry.sessionId)
+    );
     try {
       const { stdout } = await execFileAsync('tmux', ['list-sessions', '-F', '#{session_name}']);
-      return stdout
+      for (const sessionId of stdout
         .split('\n')
         .map((name) => parseAgentTmuxSessionName(name.trim()))
-        .filter((id): id is string => id !== null);
+        .filter((id): id is string => id !== null)) {
+        ids.add(sessionId);
+      }
     } catch {
-      return [];
     }
+    return [...ids];
   };
 
   // Owned here and shared with both halves: the spawner arms it for a session

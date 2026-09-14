@@ -54,6 +54,7 @@ const httpPostJsonOverChannel = vi.hoisted(() => vi.fn(async () => {}));
 const httpPostForJsonOverChannel = vi.hoisted(() =>
   vi.fn(async () => ({ connectionId: 'conn-remote-1' }))
 );
+const httpGetJsonOverChannel = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
 
 // POST is spied so disconnect and the connection hand-off can be asserted; GET
 // is parked so the hook-event relay's poll loop doesn't spin in tests that
@@ -63,7 +64,7 @@ vi.mock('./sidecar-http', async () => ({
   ...(await vi.importActual<Record<string, unknown>>('./sidecar-http')),
   httpPostJsonOverChannel,
   httpPostForJsonOverChannel,
-  httpGetJsonOverChannel: vi.fn(() => new Promise(() => {})),
+  httpGetJsonOverChannel,
 }));
 
 vi.mock('@main/core/pty/ssh2-pty', () => ({ openSsh2Pty }));
@@ -201,11 +202,13 @@ function makeRemoteFs(files: Record<string, string> = {}) {
 function sshProvider({
   proxy = makeProxy(),
   tmux = false,
+  sessionHost,
   ctx = makeCtx(),
   fs = makeRemoteFs(),
 }: {
   proxy?: SshClientProxy;
   tmux?: boolean;
+  sessionHost?: 'pty' | 'tmux' | 'herdr';
   ctx?: ConstructorParameters<typeof SshAgentRuntime>[0]['ctx'];
   fs?: ConstructorParameters<typeof SshAgentRuntime>[0]['fs'];
 } = {}) {
@@ -214,6 +217,7 @@ function sshProvider({
     sessionId: 'session-1',
     sessionPath: '/repo',
     tmux,
+    sessionHost,
     ctx,
     fs,
     proxy,
@@ -272,6 +276,8 @@ describe('SshAgentRuntime', () => {
     httpPostJsonOverChannel.mockClear();
     httpPostForJsonOverChannel.mockReset();
     httpPostForJsonOverChannel.mockResolvedValue({ connectionId: 'conn-remote-1' });
+    httpGetJsonOverChannel.mockReset();
+    httpGetJsonOverChannel.mockImplementation(() => new Promise(() => {}));
     vi.mocked(events.emit).mockClear();
     connectionListeners.length = 0;
     // The relay registry is a module singleton keyed by host+dir+agent, so a
@@ -297,6 +303,39 @@ describe('SshAgentRuntime', () => {
       expect.anything()
     );
     expect(ptySessionRegistry.get(sessionId)).toBeDefined();
+  });
+
+  it('attaches and closes the recovered Herdr pane', async () => {
+    const ctx = makeCtx();
+    httpGetJsonOverChannel.mockImplementation(
+      async (_channel: unknown, opts: { path: string }) =>
+        opts.path === '/sessions'
+          ? {
+              sessions: [
+                {
+                  sessionId: 'session-1',
+                  target: {
+                    kind: 'herdr',
+                    paneId: 'pane-recovered',
+                    tabId: 'tab-1',
+                    workspaceId: 'workspace-1',
+                  },
+                },
+              ],
+            }
+          : new Promise(() => {})
+    );
+    mockSpawn([]);
+    const provider = sshProvider({ ctx, tmux: true, sessionHost: 'herdr' });
+
+    await provider.start(session());
+    await provider.stop();
+
+    expect(openSsh2Pty).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ command: "herdr pane attach --pane 'pane-recovered'" })
+    );
+    expect(ctx.exec).toHaveBeenCalledWith('herdr', ['pane', 'close', '--pane', 'pane-recovered']);
   });
 
   it('injects the agent identity from its neutral creds file for a provider without repo-agents', async () => {
