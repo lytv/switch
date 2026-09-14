@@ -43,7 +43,9 @@ const MIN_NODE_MAJOR = 18;
 // not open) — not a missing tool.
 function requiredBinaries(sessionHost: SessionHost): readonly string[] {
   if (sessionHost === 'tmux') return ['tmux', 'node', 'git'] as const;
-  if (sessionHost === 'herdr') return ['herdr', 'node', 'git'] as const;
+  // Herdr-hosted agent panes are supported, but the remote sidecar itself is
+  // still launched/probed through tmux in P0.
+  if (sessionHost === 'herdr') return ['herdr', 'tmux', 'node', 'git'] as const;
   return ['node', 'git'] as const;
 }
 

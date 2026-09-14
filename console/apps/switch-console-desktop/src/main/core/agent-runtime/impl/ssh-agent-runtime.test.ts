@@ -54,7 +54,9 @@ const httpPostJsonOverChannel = vi.hoisted(() => vi.fn(async () => {}));
 const httpPostForJsonOverChannel = vi.hoisted(() =>
   vi.fn(async () => ({ connectionId: 'conn-remote-1' }))
 );
-const httpGetJsonOverChannel = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
+const httpGetJsonOverChannel = vi.hoisted(() =>
+  vi.fn((..._args: unknown[]) => new Promise(() => {}))
+);
 
 // POST is spied so disconnect and the connection hand-off can be asserted; GET
 // is parked so the hook-event relay's poll loop doesn't spin in tests that
@@ -307,24 +309,23 @@ describe('SshAgentRuntime', () => {
 
   it('attaches and closes the recovered Herdr pane', async () => {
     const ctx = makeCtx();
-    httpGetJsonOverChannel.mockImplementation(
-      async (_channel: unknown, opts: { path: string }) =>
-        opts.path === '/sessions'
-          ? {
-              sessions: [
-                {
-                  sessionId: 'session-1',
-                  target: {
-                    kind: 'herdr',
-                    paneId: 'pane-recovered',
-                    tabId: 'tab-1',
-                    workspaceId: 'workspace-1',
-                  },
-                },
-              ],
-            }
-          : new Promise(() => {})
-    );
+    httpGetJsonOverChannel.mockImplementation(async (...args: unknown[]) => {
+      const opts = args[1] as { path?: string } | undefined;
+      if (opts?.path !== '/sessions') return new Promise(() => {});
+      return {
+        sessions: [
+          {
+            sessionId: 'session-1',
+            target: {
+              kind: 'herdr',
+              paneId: 'pane-recovered',
+              tabId: 'tab-1',
+              workspaceId: 'workspace-1',
+            },
+          },
+        ],
+      };
+    });
     mockSpawn([]);
     const provider = sshProvider({ ctx, tmux: true, sessionHost: 'herdr' });
 

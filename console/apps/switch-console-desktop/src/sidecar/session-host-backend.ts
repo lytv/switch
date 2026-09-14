@@ -113,7 +113,12 @@ export class HerdrSessionHostBackend implements SessionHostBackend {
       agentSlug: input.agentSlug,
       roomId: input.roomId,
     });
-    await runHerdrPaneCommand(this.exec, ref.paneId, input.env, input.command, input.args);
+    try {
+      await runHerdrPaneCommand(this.exec, ref.paneId, input.env, input.command, input.args);
+    } catch (error) {
+      await closeHerdrPane(this.exec, ref.paneId).catch(() => {});
+      throw error;
+    }
     return { kind: 'herdr', paneId: ref.paneId, tabId: ref.tabId, workspaceId: ref.workspaceId };
   }
 

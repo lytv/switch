@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const ensureAgentSidecar = vi.fn(async () => ({}));
-const writeWatchEnabled = vi.fn(async () => {});
+const ensureAgentSidecar = vi.hoisted(() => vi.fn(async () => ({})));
+const writeWatchEnabled = vi.hoisted(() => vi.fn(async () => {}));
 const listAutoSessionAgentIds = vi.fn(async () => ['agent-1']);
 const getAgentById = vi.fn();
 const getRemoteAgentLocation = vi.fn();
@@ -9,10 +9,10 @@ const connectRemoteAgent = vi.fn();
 const getSettings = vi.fn();
 
 vi.mock('@main/core/agent-runtime/impl/ensure-agent-sidecar', () => ({
-  ensureAgentSidecar: (...args: unknown[]) => ensureAgentSidecar(...args),
+  ensureAgentSidecar,
 }));
 vi.mock('@main/core/agent-runtime/impl/remote-sidecar-launcher', () => ({
-  writeWatchEnabled: (...args: unknown[]) => writeWatchEnabled(...args),
+  writeWatchEnabled,
 }));
 vi.mock('@main/core/fs/impl/ssh-fs', () => ({ SshFileSystem: vi.fn() }));
 vi.mock('@main/core/locations/settings/providers/remote-location-settings-provider', () => ({

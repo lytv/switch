@@ -43,6 +43,7 @@ import { defaultRoomConnectionFactory, SidecarRuntime } from './sidecar-runtime'
 import { SidecarStateStore } from './sidecar-state';
 import { SIDECAR_CONTROL, SIDECAR_VERSION } from './sidecar-version';
 import { exactTmuxTarget, parseAgentTmuxSessionName } from './vm-tmux';
+import { collectHerdrPaneIdsForLiveness } from './liveness-targets';
 import type { SessionHostTarget } from './session-host-backend';
 
 /**
@@ -503,10 +504,13 @@ async function main(): Promise<void> {
       ...runtime.activeTmuxTargets(),
       ...(spawner?.pendingTmuxTargets() ?? []),
     ]);
-    const herdrPaneIds = new Set([
-      ...runtime.activeHerdrPaneIds(),
-      ...(spawner?.pendingHerdrPaneIds() ?? []),
-    ]);
+    const herdrPaneIds = new Set(
+      collectHerdrPaneIdsForLiveness({
+        runtimePaneIds: runtime.activeHerdrPaneIds(),
+        pendingPaneIds: spawner?.pendingHerdrPaneIds() ?? [],
+        knownTargets: store.entries().map((entry) => entry.target),
+      })
+    );
     await Promise.all(
       [...tmuxTargets].map(async (target) => {
         if (await hasTmuxSession(target)) liveTmuxTargets.add(target);

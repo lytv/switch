@@ -141,6 +141,15 @@ describe('preflightRemoteSession', () => {
     await expect(preflightRemoteSession(deps)).rejects.toThrow(/missing required tools: herdr/);
   });
 
+  it('requires tmux when sessionHost=herdr because the sidecar still runs in tmux', async () => {
+    const deps = makeDeps({
+      sessionHost: 'herdr',
+      missingBinaries: ['tmux'],
+      credsFile: CREDS_FILE,
+    });
+    await expect(preflightRemoteSession(deps)).rejects.toThrow(/missing required tools: tmux/);
+  });
+
   it('rejects herdr protocol below the configured floor', async () => {
     const deps = makeDeps({
       sessionHost: 'herdr',

@@ -145,6 +145,45 @@ describe('InProcessSessionSpawner.launch', () => {
     ).toBe(true);
   });
 
+  it('closes a created herdr pane when command launch in that pane fails', async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      calls.push({ command, args });
+      if (command === 'herdr' && args[0] === 'status') {
+        return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
+      }
+      if (command === 'herdr' && args[0] === 'workspace' && args[1] === 'create') {
+        return { stdout: JSON.stringify({ workspace_id: 'ws-1' }), stderr: '' };
+      }
+      if (command === 'herdr' && args[0] === 'tab' && args[1] === 'create') {
+        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+      }
+      if (command === 'herdr' && args[0] === 'pane' && args[1] === 'run') {
+        throw new Error('herdr pane run failed');
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const { spawner } = makeSpawner({
+      exec,
+      spec: {
+        ...SPEC,
+        sessionHost: 'herdr',
+        herdr: {
+          sessionName: 'switchdash',
+          protocolMin: 14,
+          preferAgentPrompt: true,
+          workspaceMode: 'flat',
+        },
+      },
+    });
+
+    await expect(spawner.launch('room-x', null)).rejects.toThrow(/pane run failed/);
+    expect(calls).toContainEqual({
+      command: 'herdr',
+      args: ['pane', 'close', '--pane', 'pane-1'],
+    });
+  });
+
   it('gives the pane every credential the baked Codex profile forwards', async () => {
     // The sidecar writes the profile but the pane supplies the values it names.
     // Codex reads them from its own environment and forwards them onward, so a
