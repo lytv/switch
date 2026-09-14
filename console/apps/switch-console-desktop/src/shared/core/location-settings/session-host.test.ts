@@ -17,12 +17,8 @@ describe('resolveSessionHostForTransport', () => {
     expect(resolved.host).toBe('tmux');
   });
 
-  it('throws when herdr is selected for a local transport', () => {
-    expect(() =>
-      resolveSessionHostForTransport('local', {
-        sessionHost: 'herdr',
-      })
-    ).toThrow(/only for SSH locations/i);
+  it('allows herdr for a local transport', () => {
+    expect(resolveSessionHostForTransport('local', { sessionHost: 'herdr' }).host).toBe('herdr');
   });
 
   it('resolves herdr settings defaults when host is herdr', () => {

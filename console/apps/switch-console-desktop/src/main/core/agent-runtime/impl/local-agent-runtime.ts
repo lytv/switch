@@ -30,11 +30,20 @@ import type { ResolvedShellProfile } from '@main/core/terminal-shell/types';
 import { events } from '@main/lib/events';
 import { runWithLogContext } from '@main/lib/log-context';
 import { log } from '@main/lib/logger';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
+import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
 import { agentSessionExitedChannel } from '@shared/core/providers/agentEvents';
 import { makePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentPtySessionId } from '@shared/core/pty/ptySessionId';
 import type { Session } from '@shared/core/sessions/sessions';
 import { sessionStartupWatch } from '../desktop-session-startup-watch';
+import {
+  closeHerdrPane,
+  createHerdrPane,
+  ensureHerdrProtocol,
+  runHerdrPaneCommand,
+  type HerdrPaneRef,
+} from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { resolveAgentExecutable } from './resolve-agent-executable';
 
@@ -55,6 +64,9 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
   private readonly sessionPath: string;
   private readonly sessionId: string;
   private readonly tmux: boolean;
+  private readonly sessionHost: SessionHost;
+  private readonly herdr: ResolvedHerdrSettings;
+  private herdrTarget: HerdrPaneRef | null = null;
   private readonly shellSetup?: string;
   private readonly shellProfile: ResolvedShellProfile;
   private readonly ctx: IExecutionContext;
@@ -64,6 +76,13 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     sessionPath,
     sessionId,
     tmux = false,
+    sessionHost = tmux ? 'tmux' : 'pty',
+    herdr = {
+      sessionName: 'switchdash',
+      protocolMin: 14,
+      preferAgentPrompt: true,
+      workspaceMode: 'flat',
+    },
     shellSetup,
     shellProfile,
     ctx,
@@ -73,6 +92,8 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     sessionPath: string;
     sessionId: string;
     tmux?: boolean;
+    sessionHost?: SessionHost;
+    herdr?: ResolvedHerdrSettings;
     shellSetup?: string;
     shellProfile: ResolvedShellProfile;
     ctx: IExecutionContext;
@@ -82,6 +103,8 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     this.sessionPath = sessionPath;
     this.sessionId = sessionId;
     this.tmux = tmux;
+    this.sessionHost = sessionHost;
+    this.herdr = herdr;
     this.shellSetup = shellSetup;
     this.shellProfile = shellProfile;
     this.ctx = ctx;
@@ -256,13 +279,36 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
         ...(switchConnectionId ? { SWITCH_CONNECTION_ID: switchConnectionId } : {}),
       };
 
+      if (this.sessionHost === 'herdr' && !this.herdrTarget) {
+        await ensureHerdrProtocol(this.ctx.exec.bind(this.ctx), this.herdr.protocolMin);
+        this.herdrTarget = await createHerdrPane(this.ctx.exec.bind(this.ctx), this.herdr, {
+          cwd: this.sessionPath,
+          tabLabel: `switchdash-${this.sessionId}`,
+          agentSlug: agentCredsSlug(session),
+          roomId: null,
+        });
+        await runHerdrPaneCommand(
+          this.ctx.exec.bind(this.ctx),
+          this.herdrTarget.paneId,
+          sessionEnv,
+          agentCommand.command,
+          agentCommand.args
+        );
+      }
+
+      if (this.sessionHost === 'herdr' && !this.herdrTarget) {
+        throw new Error('LocalAgentRuntime: herdr launch target was not created');
+      }
+      const command = this.herdrTarget
+        ? { command: 'herdr', args: ['pane', 'attach', '--pane', this.herdrTarget.paneId] }
+        : { command: agentCommand.command, args: agentCommand.args };
       const resolved = resolveLocalPtySpawn({
         platform: process.platform,
         env: process.env,
         intent: {
           kind: 'run-command',
           cwd: this.sessionPath,
-          command: { kind: 'argv', command: agentCommand.command, args: agentCommand.args },
+          command: { kind: 'argv', ...command },
           shellProfile: this.shellProfile,
           shellSetup: this.shellSetup,
           tmuxSessionName,
@@ -312,7 +358,7 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
           decision: decision.kind,
         });
 
-        if (this.tmux) {
+        if (this.tmux || this.sessionHost === 'herdr') {
           return;
         }
 
@@ -380,7 +426,9 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
   private detachPty(): void {
     const pty = this.supervisor.stop() ?? this.pty;
     this.pty = null;
-    ptySessionRegistry.unregister(this.ptySessionId);
+    ptySessionRegistry.unregister(this.ptySessionId, {
+      preserveSize: this.tmux || this.sessionHost === 'herdr',
+    });
     if (pty) {
       try {
         pty.kill();
@@ -397,7 +445,7 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     this.detachPty();
     switchNotificationPoller.disconnect(this.sessionId);
     switchRoomService.clearSession(this.sessionId);
-    if (!this.tmux) {
+    if (!this.tmux && this.sessionHost !== 'herdr') {
       this.known = false;
       this.supervisor.forget();
     }
@@ -411,6 +459,10 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     if (this.tmux) {
       await killTmuxSession(this.ctx, makeAgentTmuxSessionName(this.sessionId));
     }
+    if (this.sessionHost === 'herdr' && this.herdrTarget) {
+      await closeHerdrPane(this.ctx.exec.bind(this.ctx), this.herdrTarget.paneId);
+      this.herdrTarget = null;
+    }
     this.supervisor.forget();
   }
 
@@ -419,6 +471,10 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     await this.detach();
     if (this.tmux && wasKnown) {
       await killTmuxSession(this.ctx, makeAgentTmuxSessionName(this.sessionId));
+    }
+    if (this.sessionHost === 'herdr' && wasKnown && this.herdrTarget) {
+      await closeHerdrPane(this.ctx.exec.bind(this.ctx), this.herdrTarget.paneId);
+      this.herdrTarget = null;
     }
     this.supervisor.forget();
     this.known = false;

@@ -288,6 +288,8 @@ export async function buildAgentRuntime(
     sessionPath: opts.sessionPath,
     sessionId: opts.sessionId,
     tmux: opts.sessionHost === 'tmux',
+    sessionHost: opts.sessionHost,
+    herdr: opts.herdr,
     shellSetup: opts.shellSetup,
     shellProfile: agentShellProfile,
     ctx,

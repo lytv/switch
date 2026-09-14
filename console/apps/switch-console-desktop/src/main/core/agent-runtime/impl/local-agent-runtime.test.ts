@@ -192,6 +192,8 @@ type RespawnState = {
 
 function localProvider({
   tmux = false,
+  sessionHost,
+  herdr,
   shellProfile = {
     id: 'sh',
     resolvedShellId: 'sh',
@@ -205,6 +207,8 @@ function localProvider({
   ctx = {} as never,
 }: {
   tmux?: boolean;
+  sessionHost?: 'pty' | 'tmux' | 'herdr';
+  herdr?: ConstructorParameters<typeof LocalAgentRuntime>[0]['herdr'];
   shellProfile?: ConstructorParameters<typeof LocalAgentRuntime>[0]['shellProfile'];
   ctx?: ConstructorParameters<typeof LocalAgentRuntime>[0]['ctx'];
 } = {}) {
@@ -213,6 +217,8 @@ function localProvider({
     sessionId: 'session-1',
     sessionPath: '/tmp/session-1',
     tmux,
+    sessionHost,
+    herdr,
     shellProfile,
     ctx,
   });
@@ -481,6 +487,45 @@ describe('local agent runtime respawn state', () => {
       kind: 'workspace',
       path: '/tmp/session-1',
     });
+  });
+
+  it('runs and reattaches a local Herdr pane', async () => {
+    const exitHandlers: Array<(info: PtyExitInfo) => void> = [];
+    spawnLocalPty.mockReturnValue(fakePty(exitHandlers));
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] === 'status') {
+        return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
+      }
+      if (args[0] === 'workspace') {
+        return { stdout: JSON.stringify({ workspace_id: 'workspace-1' }), stderr: '' };
+      }
+      if (args[0] === 'tab') {
+        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const provider = localProvider({ sessionHost: 'herdr', ctx: { exec } as never });
+
+    await provider.start(session());
+
+    expect(exec).toHaveBeenCalledWith('herdr', [
+      'pane',
+      'run',
+      '--pane',
+      'pane-1',
+      '--',
+      expect.stringContaining("exec 'agent'"),
+    ]);
+    expect(spawnLocalPty).toHaveBeenLastCalledWith(
+      expect.objectContaining({ command: 'sh', args: ['-c', 'herdr pane attach --pane pane-1'] })
+    );
+
+    await provider.dehydrate();
+    await provider.start(session());
+
+    expect(exec).toHaveBeenCalledTimes(4);
+    await provider.stop();
+    expect(exec).toHaveBeenLastCalledWith('herdr', ['pane', 'close', '--pane', 'pane-1']);
   });
 
   it('starts a local agent fresh after a resumed session exits', async () => {

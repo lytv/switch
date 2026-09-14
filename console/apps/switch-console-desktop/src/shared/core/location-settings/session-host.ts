@@ -27,9 +27,6 @@ export function resolveSessionHostForTransport(
   const configured = settings.sessionHost;
   const host: SessionHost =
     configured ?? (transportKind === 'ssh' ? 'tmux' : (settings.tmux ?? false) ? 'tmux' : 'pty');
-  if (host === 'herdr' && transportKind !== 'ssh') {
-    throw new Error("sessionHost 'herdr' is supported only for SSH locations in P0");
-  }
   return {
     host,
     herdr: {
