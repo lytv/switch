@@ -21,8 +21,8 @@ import { sessionConnectionId } from '@main/core/switch-rooms/session-connection-
 import { resolveSessionControl } from '@main/core/switch-rooms/session-control';
 import { type TmuxRun, TmuxInjectionSink } from '@main/core/switch-rooms/tmux-injection-sink';
 import { asPtyProviderId, makePtyId, parsePtyId } from '@shared/core/pty/ptyId';
-import { makeAgentTmuxSessionName } from './vm-tmux';
 import type { SessionHostTarget } from './session-host-backend';
+import { makeAgentTmuxSessionName } from './vm-tmux';
 
 /** A live per-room connection — the slice of RoomConnection the runtime drives. */
 export interface ManagedConnection {
@@ -122,6 +122,10 @@ interface SessionConnection {
 export class SidecarRuntime {
   /** sessionId → its live room connection. */
   private readonly sessions = new Map<string, SessionConnection>();
+  private readonly herdrStatuses = new Map<
+    string,
+    { status: Parameters<ManagedConnection['onAgentStatusChange']>[0]; detail?: string }
+  >();
   private readonly resolveContext: ContextResolver;
   /** Notified when a session connects to a room, so the notification watcher can
    * hand its per-room in-flight guard off to the live-room check (mirrors the
@@ -169,11 +173,10 @@ export class SidecarRuntime {
     // would report other agents' sessions on the same host.
     const pid = parsePtyId(raw.ptyId);
     if (pid) {
-      const target =
-        this.sessions.get(pid.sessionId)?.target ?? {
-          kind: 'tmux',
-          tmuxTarget: makeAgentTmuxSessionName(pid.sessionId),
-        };
+      const target = this.sessions.get(pid.sessionId)?.target ?? {
+        kind: 'tmux',
+        tmuxTarget: makeAgentTmuxSessionName(pid.sessionId),
+      };
       this.deps.registry.record({
         sessionId: pid.sessionId,
         roomId: null,
@@ -383,10 +386,7 @@ export class SidecarRuntime {
     return connectionId;
   }
 
-  private sinkForSession(
-    sessionId: string,
-    ptyId: string | null
-  ): RoomConnectionDeps['sink'] {
+  private sinkForSession(sessionId: string, ptyId: string | null): RoomConnectionDeps['sink'] {
     return {
       acquire: () => {
         const current = this.sessions.get(sessionId);
@@ -400,12 +400,21 @@ export class SidecarRuntime {
             () => this.deps.isTmuxPaneLive(target.tmuxTarget) && canType
           ).acquire();
         }
-        return new HerdrInjectionSink(target.paneId, this.deps.herdrRun, () => {
-          return this.deps.isHerdrPaneLive(target.paneId) && canType && !this.deps.isHerdrPaneBlocked(target.paneId);
-        }, {
-          preferAgentPrompt: this.deps.preferHerdrAgentPrompt,
-          promptTarget: () => this.deps.herdrPromptTarget(target.paneId),
-        }).acquire();
+        return new HerdrInjectionSink(
+          target.paneId,
+          this.deps.herdrRun,
+          () => {
+            return (
+              this.deps.isHerdrPaneLive(target.paneId) &&
+              canType &&
+              !this.deps.isHerdrPaneBlocked(target.paneId)
+            );
+          },
+          {
+            preferAgentPrompt: this.deps.preferHerdrAgentPrompt,
+            promptTarget: () => this.deps.herdrPromptTarget(target.paneId),
+          }
+        ).acquire();
       },
     };
   }
@@ -434,14 +443,36 @@ export class SidecarRuntime {
     providerId: string;
     target: SessionHostTarget;
   }): void {
-    this.openConnection(entry.sessionId, entry.providerId, entry.roomId, null, undefined, entry.target);
+    this.openConnection(
+      entry.sessionId,
+      entry.providerId,
+      entry.roomId,
+      null,
+      undefined,
+      entry.target
+    );
   }
 
   setSessionTarget(sessionId: string, target: SessionHostTarget): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.target = target;
+    this.herdrStatuses.delete(sessionId);
     this.recordSessionTarget(sessionId, session.providerId, target, session.roomId);
+  }
+
+  onHerdrStatusChange(
+    paneId: string,
+    status: Parameters<ManagedConnection['onAgentStatusChange']>[0],
+    detail?: string
+  ): void {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.target?.kind !== 'herdr' || session.target.paneId !== paneId) continue;
+      const previous = this.herdrStatuses.get(sessionId);
+      if (previous?.status === status && previous.detail === detail) continue;
+      this.herdrStatuses.set(sessionId, { status, detail });
+      session.connection.onAgentStatusChange(status, undefined, detail);
+    }
   }
 
   /** The room a session is currently attending, or null if it has none. */
@@ -476,6 +507,7 @@ export class SidecarRuntime {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.connection.stop();
+    this.herdrStatuses.delete(sessionId);
     if (session.ptyId) this.deps.startupWatch.end(session.ptyId);
     this.sessions.delete(sessionId);
     this.deps.registry.forget(sessionId);

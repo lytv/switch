@@ -6,7 +6,9 @@ describe('collectHerdrPaneIdsForLiveness', () => {
     const paneIds = collectHerdrPaneIdsForLiveness({
       runtimePaneIds: [],
       pendingPaneIds: [],
-      knownTargets: [{ kind: 'herdr', paneId: 'pane-restored', tabId: 'tab-1', workspaceId: 'ws-1' }],
+      knownTargets: [
+        { kind: 'herdr', paneId: 'pane-restored', tabId: 'tab-1', workspaceId: 'ws-1' },
+      ],
     });
     expect(paneIds).toEqual(['pane-restored']);
   });

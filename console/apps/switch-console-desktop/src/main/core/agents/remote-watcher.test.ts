@@ -24,7 +24,9 @@ vi.mock('@main/core/switch-rooms/auto-session-store', () => ({
   listAutoSessionAgentIds: () => listAutoSessionAgentIds(),
 }));
 vi.mock('@main/lib/logger', () => ({ log: { info: vi.fn(), warn: vi.fn() } }));
-vi.mock('./agent-launch-config', () => ({ agentLaunchSpecialization: vi.fn(async () => undefined) }));
+vi.mock('./agent-launch-config', () => ({
+  agentLaunchSpecialization: vi.fn(async () => undefined),
+}));
 vi.mock('./agent-location', () => ({
   getRemoteAgentLocation: () => getRemoteAgentLocation(),
 }));

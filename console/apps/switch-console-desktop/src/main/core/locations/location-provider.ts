@@ -1,8 +1,8 @@
 import type { IDisposable } from '@switch-console/shared';
 import type { IExecutionContext } from '@main/core/execution-context/types';
 import type { FileSystemProvider } from '@main/core/fs/types';
-import type { Location } from '@shared/core/locations/locations';
 import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
+import type { Location } from '@shared/core/locations/locations';
 import type { AgentRuntimeProvider } from '../agent-runtime/types';
 import { sessionRuntimeManager } from '../sessions/session-runtime-manager';
 import { locationRuntimeRegistry } from './location-runtime-registry';

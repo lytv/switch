@@ -21,11 +21,11 @@ import { LocalTerminalProvider } from '@main/core/terminals/impl/local-terminal-
 import { SshTerminalProvider } from '@main/core/terminals/impl/ssh-terminal-provider';
 import { runLifecycleScriptWithPolicy } from '@main/core/terminals/lifecycle-script-coordinator';
 import { log } from '@main/lib/logger';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
 import {
   type ResolvedHerdrSettings,
   resolveSessionHostForTransport,
 } from '@shared/core/location-settings/session-host';
-import type { SessionHost } from '@shared/core/location-settings/location-settings';
 import type { Session } from '@shared/core/sessions/sessions';
 import { getEffectiveSessionSettings } from '../locations/settings/effective-session-settings';
 import type { LocationSettingsProvider } from '../locations/settings/provider';

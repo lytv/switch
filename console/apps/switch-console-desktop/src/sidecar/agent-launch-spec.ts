@@ -1,4 +1,7 @@
-import type { HerdrWorkspaceMode, SessionHost } from '@shared/core/location-settings/location-settings';
+import type {
+  HerdrWorkspaceMode,
+  SessionHost,
+} from '@shared/core/location-settings/location-settings';
 
 /**
  * A config file the sidecar must write on the VM before spawning, path relative

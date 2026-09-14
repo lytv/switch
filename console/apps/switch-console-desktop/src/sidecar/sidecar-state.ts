@@ -4,8 +4,8 @@ import z from 'zod';
 import { defineVersionedSchema } from '@shared/lib/versioned-schema/versioned-schema';
 import { atomicWriteFile } from './atomic-file';
 import type { WatcherLogger } from './notification-watcher';
-import { sidecarStateRelPath } from './sidecar-paths';
 import type { SessionHostTarget } from './session-host-backend';
+import { sidecarStateRelPath } from './sidecar-paths';
 
 /**
  * The sidecar's durable state.

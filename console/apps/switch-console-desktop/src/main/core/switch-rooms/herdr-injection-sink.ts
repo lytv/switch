@@ -19,7 +19,7 @@ const BRACKET_PASTE_END = '\u001b[201~';
 
 function asPromptText(payload: string): string | null {
   if (payload.startsWith(BRACKET_PASTE_START) && payload.endsWith(`${BRACKET_PASTE_END}\r`)) {
-    return payload.slice(BRACKET_PASTE_START.length, -(`${BRACKET_PASTE_END}\r`.length));
+    return payload.slice(BRACKET_PASTE_START.length, -`${BRACKET_PASTE_END}\r`.length);
   }
   return null;
 }
@@ -29,6 +29,8 @@ export interface HerdrPromptTarget {
 }
 
 export class HerdrInjectionSink implements InjectionSink, InjectionTarget {
+  private skipNextSubmit = false;
+
   constructor(
     private readonly paneId: string,
     private readonly run: HerdrRun,
@@ -44,13 +46,18 @@ export class HerdrInjectionSink implements InjectionSink, InjectionTarget {
   }
 
   write(data: string): void {
+    if (this.skipNextSubmit && data === '\r') {
+      this.skipNextSubmit = false;
+      return;
+    }
     const asPrompt = asPromptText(data);
     const target =
       this.options.preferAgentPrompt && asPrompt !== null ? this.options.promptTarget() : null;
     if (target && asPrompt !== null) {
-      this.run(['agent', 'prompt', '--agent', target.agentId, '--text', asPrompt]);
+      this.run(['agent', 'prompt', target.agentId, asPrompt, '--wait']);
+      this.skipNextSubmit = true;
       return;
     }
-    this.run(['pane', 'send-text', '--pane', this.paneId, '--text', data]);
+    this.run(['pane', 'send-text', this.paneId, data]);
   }
 }

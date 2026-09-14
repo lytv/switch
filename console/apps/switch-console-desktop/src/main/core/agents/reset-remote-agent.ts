@@ -1,5 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { DEEPLINK_SCHEME } from '@main/app/deeplinks';
+import type { SidecarSessionTargetInfo } from '@main/core/agent-hooks/hook-server';
 import { probeAgentSidecar } from '@main/core/agent-runtime/impl/ensure-agent-sidecar';
 import {
   type SidecarEndpoint,
@@ -20,7 +21,6 @@ import { events } from '@main/lib/events';
 import { log } from '@main/lib/logger';
 import type { Agent } from '@shared/core/agents/agents';
 import { sessionDeletedChannel } from '@shared/core/sessions/sessionEvents';
-import type { SidecarSessionTargetInfo } from '@main/core/agent-hooks/hook-server';
 import { agentLaunchSpecialization } from './agent-launch-config';
 import { getRemoteAgentLocation } from './agent-location';
 import { connectRemoteAgent } from './connect-remote-agent';

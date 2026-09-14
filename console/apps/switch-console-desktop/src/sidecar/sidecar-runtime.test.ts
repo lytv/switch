@@ -292,7 +292,7 @@ describe('SidecarRuntime (multi-session)', () => {
     // registry restored for a pane that outlived a supervisor restart.
     const { runtime } = makeRuntime();
 
-    await runtime.ensureForSession('session-a', 'claude-code', null);
+    runtime.ensureForSession('session-a', 'claude-code', null);
 
     expect(runtime.connectedSessions()).toEqual([]);
   });
@@ -525,6 +525,30 @@ describe('SidecarRuntime (multi-session)', () => {
     herdrPaneLive = false;
     expect(runtime.reapDeadSessions()).toEqual([{ sessionId: 'session-a', roomId: 'room-1' }]);
     expect(created[0].conn.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards changed Herdr state only to the matching Herdr pane', () => {
+    const { runtime, created } = makeRuntime();
+    runtime.ensureForSession('session-a', 'codex', 'room-1', undefined, null);
+    runtime.onHerdrStatusChange('pane-1', 'working');
+    expect(created[0].conn.onAgentStatusChange).not.toHaveBeenCalled();
+    runtime.setSessionTarget('session-a', {
+      kind: 'herdr',
+      paneId: 'pane-1',
+      tabId: 'tab-1',
+      workspaceId: 'workspace-1',
+    });
+
+    runtime.onHerdrStatusChange('pane-1', 'working');
+    runtime.onHerdrStatusChange('pane-1', 'working');
+    runtime.onHerdrStatusChange('pane-2', 'idle');
+
+    expect(created[0].conn.onAgentStatusChange).toHaveBeenCalledTimes(1);
+    expect(created[0].conn.onAgentStatusChange).toHaveBeenCalledWith(
+      'working',
+      undefined,
+      undefined
+    );
   });
 });
 

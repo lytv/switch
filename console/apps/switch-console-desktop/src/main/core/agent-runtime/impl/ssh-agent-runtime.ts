@@ -42,22 +42,18 @@ import { events } from '@main/lib/events';
 import { runWithLogContext } from '@main/lib/log-context';
 import { log } from '@main/lib/logger';
 import { quoteShellArg } from '@main/utils/shellEscape';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
+import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
 import type { AgentSessionConfig } from '@shared/core/providers/agent-session';
 import { agentSessionExitedChannel } from '@shared/core/providers/agentEvents';
 import { buildAgentHookEnv } from '@shared/core/pty/hookEnv';
 import { makePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentPtySessionId } from '@shared/core/pty/ptySessionId';
 import type { Session } from '@shared/core/sessions/sessions';
-import type { SessionHost } from '@shared/core/location-settings/location-settings';
-import type { ResolvedHerdrSettings } from '@shared/core/location-settings/session-host';
-import { SIDECAR_VERSION } from '../../../../sidecar/sidecar-version';
 import type { SessionHostTarget } from '../../../../sidecar/session-host-backend';
-import {
-  closeHerdrPane,
-  createHerdrPane,
-  runHerdrPaneCommand,
-} from './herdr-session-host';
+import { SIDECAR_VERSION } from '../../../../sidecar/sidecar-version';
 import { ensureAgentSidecar, probeAgentSidecar } from './ensure-agent-sidecar';
+import { closeHerdrPane, createHerdrPane, runHerdrPaneCommand } from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { createRemoteHomePluginFs } from './remote-home-plugin-fs';
 import { remoteNodePlatform } from './remote-node-platform';

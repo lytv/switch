@@ -5,30 +5,33 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { HookEventLog, HookServer } from '@main/core/agent-hooks/hook-server';
+import { readHerdrPromptStatus } from '@main/core/agent-runtime/impl/herdr-session-host';
 import {
   SessionStartupWatch,
   STARTUP_SIGNAL_TIMEOUT_MS,
 } from '@main/core/agent-runtime/session-startup-watch';
 import { agentSettingsPath } from '@main/core/agents/switch-settings-paths';
 import {
-  readSwitchAgentCredentials,
-  readSwitchAgentCredentialsFromSettings,
-} from '@main/core/switch-rooms/switch-credentials';
-import {
   createHerdrRun,
   type HerdrPromptTarget,
 } from '@main/core/switch-rooms/herdr-injection-sink';
+import {
+  readSwitchAgentCredentials,
+  readSwitchAgentCredentialsFromSettings,
+} from '@main/core/switch-rooms/switch-credentials';
 import { createTmuxRun } from '@main/core/switch-rooms/tmux-injection-sink';
-import { readHerdrPromptStatus } from '@main/core/agent-runtime/impl/herdr-session-host';
 import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
+import type { AgentStatus } from '@shared/core/providers/agentEvents';
 import { type AgentLaunchSpec } from './agent-launch-spec';
 import { atomicWriteFile } from './atomic-file';
+import { collectHerdrPaneIdsForLiveness } from './liveness-targets';
 import {
   NotificationWatcher,
   postRoomMessage,
   STARTUP_STALL_NOTICE,
   type WatcherLogger,
 } from './notification-watcher';
+import type { SessionHostTarget } from './session-host-backend';
 import { clearStartupPromptsFor, InProcessSessionSpawner } from './session-spawner';
 import { createSidecarLogger, requireEnv } from './sidecar-logger';
 import {
@@ -43,8 +46,6 @@ import { defaultRoomConnectionFactory, SidecarRuntime } from './sidecar-runtime'
 import { SidecarStateStore } from './sidecar-state';
 import { SIDECAR_CONTROL, SIDECAR_VERSION } from './sidecar-version';
 import { exactTmuxTarget, parseAgentTmuxSessionName } from './vm-tmux';
-import { collectHerdrPaneIdsForLiveness } from './liveness-targets';
-import type { SessionHostTarget } from './session-host-backend';
 
 /**
  * Switch Console remote runtime sidecar (CHOO-1059 → CHOO-1085).
@@ -165,7 +166,10 @@ async function main(): Promise<void> {
   let sidecarSessionHost = launchSpec.sessionHost === 'herdr' ? 'herdr' : 'tmux';
   const liveTmuxTargets = new Set<string>();
   const liveHerdrPanes = new Set<string>();
-  const herdrPrompt = new Map<string, { blocked: boolean; target: HerdrPromptTarget | null }>();
+  const herdrPrompt = new Map<
+    string,
+    { blocked: boolean; target: HerdrPromptTarget | null; status: AgentStatus; detail?: string }
+  >();
 
   // Pane-liveness cache: a background poll marks active/pending targets live or
   // dead so injection defers (rather than fails) when a pane is briefly gone.
@@ -181,7 +185,7 @@ async function main(): Promise<void> {
   };
   const hasHerdrPane = async (paneId: string): Promise<boolean> => {
     try {
-      await execFileAsync('herdr', ['pane', 'get', '--pane', paneId, '--json']);
+      await execFileAsync('herdr', ['pane', 'get', paneId]);
       return true;
     } catch {
       return false;
@@ -193,17 +197,33 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      const status = await readHerdrPromptStatus((command, args) => execFileAsync(command, args), paneId);
-      if (!status || !status.recognizedKind) {
-        herdrPrompt.set(paneId, { blocked: false, target: null });
+      const status = await readHerdrPromptStatus(
+        (command, args) => execFileAsync(command, args),
+        paneId
+      );
+      if (!status) {
+        herdrPrompt.set(paneId, {
+          blocked: true,
+          target: null,
+          status: 'error',
+          detail: 'Herdr did not report an agent for this pane',
+        });
         return;
       }
       herdrPrompt.set(paneId, {
         blocked: status.blocked,
-        target: { agentId: status.agentId },
+        target: status.recognizedKind ? { agentId: status.agentId } : null,
+        status: status.runtimeStatus,
+        detail: status.detail,
       });
-    } catch {
-      herdrPrompt.set(paneId, { blocked: false, target: null });
+    } catch (error) {
+      log.warn('sidecar: could not read Herdr agent status', { paneId, error: String(error) });
+      herdrPrompt.set(paneId, {
+        blocked: true,
+        target: null,
+        status: 'error',
+        detail: 'Herdr agent status is unavailable',
+      });
     }
   };
 
@@ -236,8 +256,7 @@ async function main(): Promise<void> {
         .filter((id): id is string => id !== null)) {
         ids.add(sessionId);
       }
-    } catch {
-    }
+    } catch {}
     return [...ids];
   };
 
@@ -254,7 +273,7 @@ async function main(): Promise<void> {
     isTmuxPaneLive,
     isHerdrPaneLive,
     herdrPromptTarget: (paneId) => herdrPrompt.get(paneId)?.target ?? null,
-    isHerdrPaneBlocked: (paneId) => herdrPrompt.get(paneId)?.blocked ?? false,
+    isHerdrPaneBlocked: (paneId) => herdrPrompt.get(paneId)?.blocked ?? true,
     preferHerdrAgentPrompt: launchSpec.herdr?.preferAgentPrompt ?? true,
     log,
     createConnection: defaultRoomConnectionFactory,
@@ -333,10 +352,7 @@ async function main(): Promise<void> {
         const targetsBySession = new Map(
           store.entries().map((entry) => [entry.sessionId, entry.target] as const)
         );
-        const byId = new Map<
-          string,
-          { roomId: string | null; target?: SessionHostTarget }
-        >();
+        const byId = new Map<string, { roomId: string | null; target?: SessionHostTarget }>();
         // Every live agent pane THIS sidecar owns, room or not — so bare sessions
         // are discoverable. Scope by hasSeen: tmux names carry no repo/agent, so
         // the VM-wide enumeration must be filtered to this sidecar's sessions.
@@ -530,6 +546,9 @@ async function main(): Promise<void> {
       if (!herdrPaneIds.has(paneId)) liveHerdrPanes.delete(paneId);
     }
     await Promise.all([...liveHerdrPanes].map((paneId) => refreshHerdrPrompt(paneId)));
+    for (const [paneId, prompt] of herdrPrompt) {
+      runtime.onHerdrStatusChange(paneId, prompt.status, prompt.detail);
+    }
 
     // A dead pane is terminal for the runtime connection. Reap it now rather
     // than leaving RoomConnection's no-target retry loop and the durable

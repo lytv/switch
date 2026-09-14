@@ -1,4 +1,3 @@
-import { exactTmuxTarget, makeAgentTmuxSessionName } from './vm-tmux';
 import {
   closeHerdrPane,
   createHerdrPane,
@@ -9,6 +8,7 @@ import {
   type HerdrSessionHostConfig,
 } from '@main/core/agent-runtime/impl/herdr-session-host';
 import { quoteShellArg } from '@main/utils/shellEscape';
+import { exactTmuxTarget, makeAgentTmuxSessionName } from './vm-tmux';
 
 export type SessionHostTarget =
   | { kind: 'tmux'; tmuxTarget: string }

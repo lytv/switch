@@ -1,5 +1,6 @@
 import { quoteShellArg } from '@main/utils/shellEscape';
 import type { HerdrWorkspaceMode } from '@shared/core/location-settings/location-settings';
+import type { AgentStatus } from '@shared/core/providers/agentEvents';
 
 export type HerdrExec = (
   command: string,
@@ -101,9 +102,7 @@ export async function createHerdrPane(
 ): Promise<HerdrPaneRef> {
   const wsLabel = workspaceLabel(config, opts);
   const ws = parseJson(
-    (
-      await exec('herdr', ['workspace', 'create', '--name', wsLabel, '--json'])
-    ).stdout,
+    (await exec('herdr', ['workspace', 'create', '--name', wsLabel, '--json'])).stdout,
     'herdr workspace create'
   );
   const workspaceId = readId(ws, ['workspace_id', 'id']);
@@ -153,9 +152,17 @@ export async function runHerdrPaneCommand(
 
 export async function isHerdrPaneLive(exec: HerdrExec, paneId: string): Promise<boolean> {
   try {
-    const { stdout } = await exec('herdr', ['pane', 'get', '--pane', paneId, '--json']);
+    const { stdout } = await exec('herdr', ['pane', 'get', paneId]);
     const parsed = parseJson(stdout, 'herdr pane get');
-    const found = readId(parsed, ['pane_id', 'id']);
+    const result =
+      parsed.result && typeof parsed.result === 'object'
+        ? (parsed.result as Record<string, unknown>)
+        : parsed;
+    const pane =
+      result.pane && typeof result.pane === 'object'
+        ? (result.pane as Record<string, unknown>)
+        : result;
+    const found = readId(pane, ['pane_id', 'id']);
     if (!found) return false;
     return found === paneId;
   } catch (error) {
@@ -179,33 +186,73 @@ export type HerdrPromptStatus = {
   agentId: string;
   recognizedKind: boolean;
   blocked: boolean;
+  runtimeStatus: AgentStatus;
+  detail?: string;
 };
+
+export function mapHerdrAgentStatus(status: unknown): AgentStatus {
+  switch (typeof status === 'string' ? status.toLowerCase() : 'unknown') {
+    case 'idle':
+      return 'idle';
+    case 'working':
+      return 'working';
+    case 'blocked':
+    case 'awaiting_input':
+    case 'awaiting-input':
+    case 'stalled':
+    case 'waiting_for_input':
+    case 'waiting-for-input':
+      return 'awaiting-input';
+    case 'done':
+      return 'completed';
+    default:
+      return 'error';
+  }
+}
 
 export async function readHerdrPromptStatus(
   exec: HerdrExec,
   paneId: string
 ): Promise<HerdrPromptStatus | null> {
   try {
-    const { stdout } = await exec('herdr', ['agent', 'get', '--pane', paneId, '--json']);
+    const { stdout } = await exec('herdr', ['agent', 'get', paneId]);
     const parsed = parseJson(stdout, 'herdr agent get');
-    const agentId = readId(parsed, ['agent_id', 'id']);
+    const result =
+      parsed.result && typeof parsed.result === 'object'
+        ? (parsed.result as Record<string, unknown>)
+        : parsed;
+    const agent =
+      result.agent && typeof result.agent === 'object'
+        ? (result.agent as Record<string, unknown>)
+        : parsed.result
+          ? null
+          : result;
+    if (!agent) return null;
+    const agentId = readId(agent, ['pane_id', 'agent_id', 'id']) ?? paneId;
     if (!agentId) return null;
     const kindRaw =
-      typeof parsed.kind === 'string'
-        ? parsed.kind
-        : typeof parsed.agent_kind === 'string'
-          ? parsed.agent_kind
-          : '';
+      typeof agent.kind === 'string'
+        ? agent.kind
+        : typeof agent.agent_kind === 'string'
+          ? agent.agent_kind
+          : typeof agent.agent === 'string'
+            ? agent.agent
+            : '';
     const stateRaw =
-      typeof parsed.state === 'string'
-        ? parsed.state
-        : typeof parsed.status === 'string'
-          ? parsed.status
-          : '';
+      typeof agent.state === 'string'
+        ? agent.state
+        : typeof agent.status === 'string'
+          ? agent.status
+          : typeof agent.agent_status === 'string'
+            ? agent.agent_status
+            : 'unknown';
+    const runtimeStatus = mapHerdrAgentStatus(stateRaw);
     return {
       agentId,
       recognizedKind: RECOGNIZED_AGENT_KINDS.has(kindRaw.toLowerCase()),
-      blocked: BLOCKED_AGENT_STATES.has(stateRaw.toLowerCase()),
+      blocked: runtimeStatus === 'error' || BLOCKED_AGENT_STATES.has(stateRaw.toLowerCase()),
+      runtimeStatus,
+      ...(runtimeStatus === 'error' ? { detail: `Herdr reported agent status '${stateRaw}'` } : {}),
     };
   } catch (error) {
     const detail = String(error);
