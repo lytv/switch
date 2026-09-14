@@ -286,6 +286,7 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
           tabLabel: `switchdash-${this.sessionId}`,
           agentSlug: agentCredsSlug(session),
           roomId: null,
+          sessionId: this.sessionId,
         });
         await runHerdrPaneCommand(
           this.ctx.exec.bind(this.ctx),

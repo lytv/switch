@@ -61,12 +61,13 @@ function hasNotFound(detail: string, kind: 'pane' | 'agent'): boolean {
 
 function workspaceLabel(
   config: HerdrSessionHostConfig,
-  opts: { agentSlug: string; roomId: string | null }
+  opts: { agentSlug: string; roomId: string | null; sessionId: string }
 ): string {
   if (config.workspaceMode === 'per-agent') return `${config.sessionName}-${opts.agentSlug}`;
   if (config.workspaceMode === 'per-room' && opts.roomId) {
     return `${config.sessionName}-${opts.roomId}`;
   }
+  if (config.workspaceMode === 'per-task') return `${config.sessionName}-${opts.sessionId}`;
   return config.sessionName;
 }
 
@@ -98,7 +99,13 @@ export async function ensureHerdrProtocol(exec: HerdrExec, minProtocol: number):
 export async function createHerdrPane(
   exec: HerdrExec,
   config: HerdrSessionHostConfig,
-  opts: { cwd: string; tabLabel: string; agentSlug: string; roomId: string | null }
+  opts: {
+    cwd: string;
+    tabLabel: string;
+    agentSlug: string;
+    roomId: string | null;
+    sessionId: string;
+  }
 ): Promise<HerdrPaneRef> {
   const wsLabel = workspaceLabel(config, opts);
   const ws = parseJson(

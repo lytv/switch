@@ -887,6 +887,7 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
               tabLabel: `switchdash-${this.sessionId}`,
               agentSlug: agentCredsSlug(session),
               roomId: null,
+              sessionId: this.sessionId,
             });
             this.herdrTarget = {
               kind: 'herdr',

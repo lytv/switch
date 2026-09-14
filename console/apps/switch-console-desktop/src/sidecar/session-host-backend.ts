@@ -112,6 +112,7 @@ export class HerdrSessionHostBackend implements SessionHostBackend {
       tabLabel: `switchdash-${input.sessionId}`,
       agentSlug: input.agentSlug,
       roomId: input.roomId,
+      sessionId: input.sessionId,
     });
     try {
       await runHerdrPaneCommand(this.exec, ref.paneId, input.env, input.command, input.args);

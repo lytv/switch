@@ -36,7 +36,7 @@ export type ShareableLocationSettings = z.infer<typeof shareableLocationSettings
 export const sessionHostSchema = z.enum(['pty', 'tmux', 'herdr']);
 export type SessionHost = z.infer<typeof sessionHostSchema>;
 
-export const herdrWorkspaceModeSchema = z.enum(['flat', 'per-agent', 'per-room']);
+export const herdrWorkspaceModeSchema = z.enum(['flat', 'per-agent', 'per-room', 'per-task']);
 export type HerdrWorkspaceMode = z.infer<typeof herdrWorkspaceModeSchema>;
 
 export const DEFAULT_HERDR_PROTOCOL_MIN = 14;

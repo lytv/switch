@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isHerdrPaneLive, mapHerdrAgentStatus, readHerdrPromptStatus } from './herdr-session-host';
+import {
+  createHerdrPane,
+  isHerdrPaneLive,
+  mapHerdrAgentStatus,
+  readHerdrPromptStatus,
+} from './herdr-session-host';
 
 describe('mapHerdrAgentStatus', () => {
   it.each([
@@ -53,5 +58,45 @@ describe('readHerdrPromptStatus', () => {
       blocked: true,
       runtimeStatus: 'error',
     });
+  });
+});
+
+describe('createHerdrPane', () => {
+  it.each([
+    ['flat', 'switchdash'],
+    ['per-agent', 'switchdash-agent-1'],
+    ['per-room', 'switchdash-room-1'],
+    ['per-task', 'switchdash-session-1'],
+  ] as const)('uses %s workspace isolation', async (workspaceMode, expectedWorkspace) => {
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] === 'workspace')
+        return { stdout: JSON.stringify({ workspace_id: 'ws-1' }), stderr: '' };
+      return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+    });
+
+    await createHerdrPane(
+      exec,
+      {
+        sessionName: 'switchdash',
+        protocolMin: 14,
+        preferAgentPrompt: true,
+        workspaceMode,
+      },
+      {
+        cwd: '/repo',
+        tabLabel: 'switchdash-session-1',
+        agentSlug: 'agent-1',
+        roomId: 'room-1',
+        sessionId: 'session-1',
+      }
+    );
+
+    expect(exec).toHaveBeenCalledWith('herdr', [
+      'workspace',
+      'create',
+      '--name',
+      expectedWorkspace,
+      '--json',
+    ]);
   });
 });

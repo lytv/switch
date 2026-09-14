@@ -5,7 +5,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { HookEventLog, HookServer } from '@main/core/agent-hooks/hook-server';
-import { readHerdrPromptStatus } from '@main/core/agent-runtime/impl/herdr-session-host';
+import {
+  createHerdrAgentStatusSubscription,
+  type HerdrAgentStatusSubscription,
+} from '@main/core/agent-runtime/impl/herdr-event-subscription';
+import {
+  mapHerdrAgentStatus,
+  readHerdrPromptStatus,
+} from '@main/core/agent-runtime/impl/herdr-session-host';
 import {
   SessionStartupWatch,
   STARTUP_SIGNAL_TIMEOUT_MS,
@@ -280,6 +287,36 @@ async function main(): Promise<void> {
     registry: store,
     startupWatch,
   });
+  let herdrStatusSubscription: HerdrAgentStatusSubscription | null = null;
+  if (sidecarSessionHost === 'herdr') {
+    try {
+      herdrStatusSubscription = await createHerdrAgentStatusSubscription(
+        (command, args) => execFileAsync(command, args),
+        {
+          onStatus: ({ paneId, status }) => {
+            const runtimeStatus = mapHerdrAgentStatus(status);
+            const current = herdrPrompt.get(paneId);
+            const detail =
+              runtimeStatus === 'error' ? `Herdr reported agent status '${status}'` : undefined;
+            herdrPrompt.set(paneId, {
+              blocked: runtimeStatus === 'awaiting-input' || runtimeStatus === 'error',
+              target: current?.target ?? null,
+              status: runtimeStatus,
+              ...(detail ? { detail } : {}),
+            });
+            runtime.onHerdrStatusChange(paneId, runtimeStatus, detail);
+          },
+          onAvailabilityChange: (available) => {
+            log.info('sidecar: Herdr agent-status event subscription changed', { available });
+          },
+        }
+      );
+    } catch (error) {
+      log.warn('sidecar: Herdr event subscription is unavailable; polling agent status', {
+        error: String(error),
+      });
+    }
+  }
 
   // A session that never reported itself up is stopped on something only a
   // human can answer, and on a VM nobody is looking at that terminal. Say so in
@@ -545,7 +582,14 @@ async function main(): Promise<void> {
     for (const paneId of [...liveHerdrPanes]) {
       if (!herdrPaneIds.has(paneId)) liveHerdrPanes.delete(paneId);
     }
-    await Promise.all([...liveHerdrPanes].map((paneId) => refreshHerdrPrompt(paneId)));
+    herdrStatusSubscription?.update([...liveHerdrPanes]);
+    await Promise.all(
+      [...liveHerdrPanes]
+        .filter(
+          (paneId) => !herdrStatusSubscription?.isActiveFor(paneId) || !herdrPrompt.has(paneId)
+        )
+        .map((paneId) => refreshHerdrPrompt(paneId))
+    );
     for (const [paneId, prompt] of herdrPrompt) {
       runtime.onHerdrStatusChange(paneId, prompt.status, prompt.detail);
     }
