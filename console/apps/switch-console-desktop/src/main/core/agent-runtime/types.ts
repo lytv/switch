@@ -1,3 +1,4 @@
+import type { SessionHerdrTarget } from '@shared/core/sessions/herdr-target';
 import { type Session } from '@shared/core/sessions/sessions';
 
 /**
@@ -27,4 +28,11 @@ export interface AgentRuntimeProvider {
   stop(): Promise<void>;
   /** Terminate teardown: stop everything and release agent-scoped listeners. */
   destroy(): Promise<void>;
+  /**
+   * The exact Herdr workspace/tab/pane this session is running in, or `null`
+   * when the session is not on the Herdr host, or the pane has not been
+   * created yet. A read of already-known state — never creates a pane or
+   * shells out as a side effect.
+   */
+  getHerdrTarget(): SessionHerdrTarget | null;
 }

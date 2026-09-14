@@ -674,8 +674,15 @@ pnpm run test
 - Per-location runtime settings can be supplied through `.switchdash.json`:
   `preservePatterns`, `scripts.setup`, `scripts.run`, `scripts.teardown`, and
   `shellSetup`.
-- Location settings such as `tmux` and `locationProvider` are DB-backed, not
-  `.switchdash.json`.
+- Location settings such as `tmux`, `locationProvider`, `sessionHost` and
+  `herdr` are DB-backed, not `.switchdash.json`. `sessionHost` (`pty` / `tmux`
+  / `herdr`) and the Herdr-specific settings are edited from the location's
+  Settings tab (`SessionHostSettingsSection`) and resolved per-session by
+  `resolveSessionHostForTransport` in
+  `src/shared/core/location-settings/session-host.ts`. See `docs/HERDR.md` for
+  the operator-facing walkthrough (enabling it, the protocol floor, workspace
+  modes) and `agents/architecture/remote-execution.md` for how a Herdr pane is
+  launched and attached.
 - Optional environment variables:
   `SWITCHDASH_DB_FILE`, `SWITCHDASH_DISABLE_NATIVE_DB`,
   `SWITCHDASH_DISABLE_PTY`, `SWITCHDASH_REGISTER_DEEPLINK`,

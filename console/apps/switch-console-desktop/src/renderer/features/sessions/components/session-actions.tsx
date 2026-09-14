@@ -1,6 +1,7 @@
 import { Archive, Copy, MessageSquare, Pencil, Pin, PinOff, RotateCcw, Trash2 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { toast } from '@renderer/lib/hooks/use-toast';
+import type { SessionHerdrTarget } from '@shared/core/sessions/herdr-target';
 
 /**
  * What can be done to a session, as one list.
@@ -17,6 +18,8 @@ export interface SessionActionsProps {
   canPin: boolean;
   isArchived: boolean;
   branchName?: string;
+  /** The session's exact Herdr pane, when its host is Herdr and the pane exists. */
+  herdrTarget?: SessionHerdrTarget | null;
   onPin: () => void;
   onUnpin: () => void;
   onRename: () => void;
@@ -50,11 +53,30 @@ async function copyBranchName(branchName: string): Promise<void> {
   }
 }
 
+/**
+ * The exact command to reattach this session's Herdr pane from an external
+ * terminal — the same subcommand Switch Console itself runs, on the pane's
+ * literal id rather than a name that could match more than one pane.
+ */
+async function copyHerdrAttachCommand(paneId: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(`herdr pane attach --pane ${paneId}`);
+    toast({ title: 'Herdr attach command copied' });
+  } catch {
+    toast({
+      title: 'Copy failed',
+      description: 'The Herdr attach command could not be copied to the clipboard.',
+      variant: 'destructive',
+    });
+  }
+}
+
 export function sessionActions({
   isPinned,
   canPin,
   isArchived,
   branchName,
+  herdrTarget,
   onPin,
   onUnpin,
   onRename,
@@ -122,6 +144,14 @@ export function sessionActions({
       icon: <Copy className="size-4" />,
       label: 'Copy branch name',
       run: () => void copyBranchName(branchName),
+    });
+  }
+  if (herdrTarget) {
+    actions.push({
+      key: 'copy-herdr-attach',
+      icon: <Copy className="size-4" />,
+      label: 'Copy Herdr attach command',
+      run: () => void copyHerdrAttachCommand(herdrTarget.paneId),
     });
   }
   actions.push({

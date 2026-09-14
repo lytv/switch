@@ -1,7 +1,11 @@
 import { Loader2 } from 'lucide-react';
 import { observer } from 'mobx-react-lite';
 import { useEffect, useRef } from 'react';
-import { getLocationManagerStore } from '@renderer/features/locations/stores/location-selectors';
+import {
+  asMounted,
+  getLocationManagerStore,
+  getLocationStore,
+} from '@renderer/features/locations/stores/location-selectors';
 import { useIsActiveSession } from '@renderer/features/sessions/hooks/use-is-active-session';
 import {
   useSessionAgent,
@@ -13,6 +17,7 @@ import { PaneSizingProvider } from '@renderer/lib/pty/pane-sizing-context';
 import { PtyPane } from '@renderer/lib/pty/pty-pane';
 import { TerminalSearchOverlay } from '@renderer/lib/pty/terminal-search-overlay';
 import { useTerminalSearch } from '@renderer/lib/pty/use-terminal-search';
+import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
 import { SessionAttachmentState } from './session-attachment-state';
 
 /**
@@ -35,6 +40,10 @@ export const SessionTerminal = observer(function SessionTerminal() {
 
   const sshHost = getLocationManagerStore().locations.get(locationId)?.data?.sshHost ?? null;
   const isRemote = sshHost !== null;
+  const locationSettings = asMounted(getLocationStore(locationId))?.settings.settings ?? null;
+  const sessionHost = locationSettings
+    ? resolveSessionHostForTransport('ssh', locationSettings).host
+    : null;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalContainerRef = useRef<HTMLDivElement>(null);
@@ -119,6 +128,7 @@ export const SessionTerminal = observer(function SessionTerminal() {
             state={agentStore.attachment === 'attached' ? 'attaching' : agentStore.attachment}
             sessionId={sessionId}
             host={sshHost}
+            sessionHost={sessionHost}
           />
         ) : (
           <div className="flex h-full w-full items-center justify-center">

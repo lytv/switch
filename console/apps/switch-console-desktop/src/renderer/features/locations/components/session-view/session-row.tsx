@@ -3,6 +3,7 @@ import { observer } from 'mobx-react-lite';
 import { useRef } from 'react';
 import { AgentStatusIndicator } from '@renderer/features/sessions/components/agent-status-indicator';
 import { SessionContextMenu } from '@renderer/features/sessions/components/session-context-menu';
+import { useHerdrTarget } from '@renderer/features/sessions/hooks/use-herdr-target';
 import {
   getSessionManagerStore,
   sessionAgentStatus,
@@ -50,6 +51,7 @@ export const SessionRow = observer(function SessionRow({
     });
   const isArchived = Boolean(session.data.archivedAt);
   const canPin = session.state !== 'unregistered';
+  const { data: herdrTarget } = useHerdrTarget(session.data.id);
   // Only working still draws something, so only working may take the row's
   // trailing slot from the timestamp.
   const isWorking = sessionAgentStatus(session) === 'working';
@@ -59,6 +61,7 @@ export const SessionRow = observer(function SessionRow({
       isPinned={session.data.isPinned}
       canPin={canPin}
       isArchived={isArchived}
+      herdrTarget={herdrTarget}
       onPin={() => void session.setPinned(true)}
       onUnpin={() => void session.setPinned(false)}
       onRename={handleRename}

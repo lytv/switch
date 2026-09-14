@@ -329,14 +329,25 @@ describe('SshAgentRuntime', () => {
     mockSpawn([]);
     const provider = sshProvider({ ctx, tmux: true, sessionHost: 'herdr' });
 
+    expect(provider.getHerdrTarget()).toBeNull();
+
     await provider.start(session());
-    await provider.stop();
+
+    expect(provider.getHerdrTarget()).toEqual({
+      workspaceId: 'workspace-1',
+      tabId: 'tab-1',
+      paneId: 'pane-recovered',
+    });
 
     expect(openSsh2Pty).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ command: "herdr pane attach --pane 'pane-recovered'" })
     );
+
+    await provider.stop();
+
     expect(ctx.exec).toHaveBeenCalledWith('herdr', ['pane', 'close', '--pane', 'pane-recovered']);
+    expect(provider.getHerdrTarget()).toBeNull();
   });
 
   it('injects the agent identity from its neutral creds file for a provider without repo-agents', async () => {

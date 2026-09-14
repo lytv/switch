@@ -3,6 +3,7 @@ import type { AttachState } from '@main/core/agent-runtime/attachment/types';
 import { agentTypeOf } from '@main/core/telemetry/agent-type';
 import { provisionTriggerOf } from '@main/core/telemetry/narrow';
 import { trackEvent } from '@main/core/telemetry/telemetry-service';
+import type { SessionHerdrTarget } from '@shared/core/sessions/herdr-target';
 import type { CreateSessionParams, SessionLifecycleStatus } from '@shared/core/sessions/sessions';
 import type { SessionProvisionTrigger } from '@shared/core/telemetry/reporting';
 import { createRPCController } from '@shared/lib/ipc/rpc';
@@ -12,6 +13,7 @@ import { getSession } from './operations/getSession';
 import { hydrateSession } from './operations/hydrateSession';
 import { markSessionSeen } from './operations/markSessionSeen';
 import { restartSessionAgent } from './operations/restartSessionAgent';
+import { sessionRuntimeManager } from './session-runtime-manager';
 import { sessionService } from './session-service';
 
 /**
@@ -61,6 +63,15 @@ export const sessionController = createRPCController({
   /** Close a session's terminal, leaving its agent running on the VM. */
   async detachSession(sessionId: string) {
     await remoteAttachmentPool.requestDetach(sessionId);
+  },
+  /**
+   * The exact Herdr workspace/tab/pane this session is running in, for an
+   * operator who wants to reach it directly (`herdr pane attach --pane
+   * <paneId>`) rather than through this session's own terminal. `null` when
+   * the session isn't running, isn't on the Herdr host, or has no pane yet.
+   */
+  async getHerdrTarget(sessionId: string): Promise<SessionHerdrTarget | null> {
+    return sessionRuntimeManager.getAgent(sessionId)?.getHerdrTarget() ?? null;
   },
   async createSession(params: CreateSessionParams) {
     return sessionService.createSession(params);

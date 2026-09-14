@@ -14,7 +14,7 @@ and how a room's conversation is shown in the app.
 | Room connection, credentials, event stream | `src/main/core/switch-rooms/` |
 | Room/session binding | table `session_room_connections`, `session-room-store.ts` |
 | Auto-start a session from room activity | `switch-rooms/auto-session-watcher.ts` |
-| Prompt injection into a live TUI | `switch-rooms/injection-sink.ts`, `tmux-injection-sink.ts` |
+| Prompt injection into a live TUI | `switch-rooms/injection-sink.ts`, `tmux-injection-sink.ts`, `herdr-injection-sink.ts` |
 | Switch servers (managed or external) | `src/main/core/switch-servers/`, `managed-switch-server/` |
 | Renderer | `src/renderer/features/switch-rooms/`, `features/switch-servers/` |
 | Shared types | `src/shared/core/switch-rooms/` |
@@ -46,7 +46,10 @@ Some providers cannot be handed a new prompt through an API once their TUI is ru
 Switch Console types it in. `InjectionSink` abstracts the transport:
 
 - **Local** — write straight to the agent's PTY via node-pty.
-- **Remote** — the sidecar performs `tmux send-keys` into the agent's tmux pane.
+- **Remote (tmux)** — the sidecar performs `tmux send-keys` into the agent's tmux pane.
+- **Remote (Herdr)** — `HerdrInjectionSink` prefers `herdr agent prompt` (routes through
+  Herdr's own agent recognition) and falls back to `herdr pane send-text` on the pane's
+  exact id when that is unavailable or the location's `preferAgentPrompt` setting is off.
 
 `acquire` returns null when the target is not ready to receive input (e.g. the PTY is not
 live yet); callers defer and retry rather than dropping the injection.

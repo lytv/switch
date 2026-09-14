@@ -3,6 +3,7 @@ import { observer } from 'mobx-react-lite';
 import { useState } from 'react';
 import { SessionActionsMenu } from '@renderer/features/sessions/components/session-actions-menu';
 import { SessionContextMenu } from '@renderer/features/sessions/components/session-context-menu';
+import { useHerdrTarget } from '@renderer/features/sessions/hooks/use-herdr-target';
 import {
   getSessionManagerStore,
   getSessionStore,
@@ -74,11 +75,13 @@ export const SidebarSessionItem = observer(function SidebarSessionItem({
     });
 
   const canPin = session.state !== 'unregistered';
+  const { data: herdrTarget } = useHerdrTarget(sessionId);
 
   const actions = {
     isPinned: session.data.isPinned,
     canPin,
     isArchived: false,
+    herdrTarget,
     onPin: () => void session.setPinned(true),
     onUnpin: () => void session.setPinned(false),
     onRename: handleRename,

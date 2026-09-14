@@ -49,6 +49,7 @@ import { agentSessionExitedChannel } from '@shared/core/providers/agentEvents';
 import { buildAgentHookEnv } from '@shared/core/pty/hookEnv';
 import { makePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentPtySessionId } from '@shared/core/pty/ptySessionId';
+import type { SessionHerdrTarget } from '@shared/core/sessions/herdr-target';
 import type { Session } from '@shared/core/sessions/sessions';
 import type { SessionHostTarget } from '../../../../sidecar/session-host-backend';
 import { SIDECAR_VERSION } from '../../../../sidecar/sidecar-version';
@@ -1169,6 +1170,12 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
     }
     this.supervisor.forget();
     this.known = false;
+  }
+
+  getHerdrTarget(): SessionHerdrTarget | null {
+    if (this.sessionHost !== 'herdr' || !this.herdrTarget) return null;
+    const { workspaceId, tabId, paneId } = this.herdrTarget;
+    return { workspaceId, tabId, paneId };
   }
 
   private async killHostedSession(): Promise<void> {

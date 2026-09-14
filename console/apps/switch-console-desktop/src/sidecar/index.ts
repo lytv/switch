@@ -31,7 +31,7 @@ import { resolveSessionHostForTransport } from '@shared/core/location-settings/s
 import type { AgentStatus } from '@shared/core/providers/agentEvents';
 import { type AgentLaunchSpec } from './agent-launch-spec';
 import { atomicWriteFile } from './atomic-file';
-import { collectHerdrPaneIdsForLiveness } from './liveness-targets';
+import { collectHerdrPaneIdsForLiveness, pruneDeadHerdrPrompts } from './liveness-targets';
 import {
   NotificationWatcher,
   postRoomMessage,
@@ -288,7 +288,13 @@ async function main(): Promise<void> {
     startupWatch,
   });
   let herdrStatusSubscription: HerdrAgentStatusSubscription | null = null;
-  if (sidecarSessionHost === 'herdr') {
+  // Callable again later, not just here: a location's session host can flip
+  // to Herdr after this sidecar already started (e.g. from the new Location
+  // Settings UI), and without this the subscription would stay null — and
+  // agent status silently downgraded to polling only — for the rest of this
+  // sidecar's life. `refreshLaunchSpec` calls this too, once the flip lands.
+  const ensureHerdrStatusSubscription = async (): Promise<void> => {
+    if (herdrStatusSubscription || sidecarSessionHost !== 'herdr') return;
     try {
       herdrStatusSubscription = await createHerdrAgentStatusSubscription(
         (command, args) => execFileAsync(command, args),
@@ -316,7 +322,8 @@ async function main(): Promise<void> {
         error: String(error),
       });
     }
-  }
+  };
+  await ensureHerdrStatusSubscription();
 
   // A session that never reported itself up is stopped on something only a
   // human can answer, and on a VM nobody is looking at that terminal. Say so in
@@ -530,6 +537,7 @@ async function main(): Promise<void> {
     if (json === lastSpecJson) return;
     lastSpecJson = json;
     sidecarSessionHost = spec.sessionHost === 'herdr' ? 'herdr' : 'tmux';
+    await ensureHerdrStatusSubscription();
     spawner?.setSpec(spec);
     log.info('sidecar: launch spec changed — applied to spawner');
   };
@@ -582,6 +590,7 @@ async function main(): Promise<void> {
     for (const paneId of [...liveHerdrPanes]) {
       if (!herdrPaneIds.has(paneId)) liveHerdrPanes.delete(paneId);
     }
+    pruneDeadHerdrPrompts(herdrPrompt, liveHerdrPanes);
     herdrStatusSubscription?.update([...liveHerdrPanes]);
     await Promise.all(
       [...liveHerdrPanes]
@@ -656,6 +665,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     clearInterval(paneTimer);
     watcher?.stop();
+    herdrStatusSubscription?.close();
     runtime.stop();
     server.stop();
     // Flush any debounced state change before exiting, so a clean restart (the

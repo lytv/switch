@@ -6,6 +6,7 @@ import { AddressingPolicySettingsSection } from '@renderer/features/locations/co
 import { AgentAdvancedSettingsSection } from '@renderer/features/locations/components/settings-view/sections/agent-advanced-settings-section';
 import { AutoApproveSettingsSection } from '@renderer/features/locations/components/settings-view/sections/auto-approve-settings-section';
 import { AutoSessionSettingsSection } from '@renderer/features/locations/components/settings-view/sections/auto-session-settings-section';
+import { SessionHostSettingsSection } from '@renderer/features/locations/components/settings-view/sections/session-host-settings-section';
 import {
   asMounted,
   getLocationStore,
@@ -47,6 +48,10 @@ export const SettingsPanel = observer(function SettingsPanel() {
         <AutoSessionSettingsSection locationId={locationId} agentId={agentId} />
         <AutoApproveSettingsSection locationId={locationId} agentId={agentId} />
         <AddressingPolicySettingsSection locationId={locationId} agentId={agentId} />
+      </section>
+      <section className="flex flex-col gap-6">
+        <SectionLabel>Session host</SectionLabel>
+        <SessionHostSettingsSection locationId={locationId} />
       </section>
       <AgentAdvancedSettingsSection locationId={locationId} agentId={agentId} />
     </div>

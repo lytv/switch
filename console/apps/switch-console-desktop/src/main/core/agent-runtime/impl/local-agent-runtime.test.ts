@@ -528,6 +528,37 @@ describe('local agent runtime respawn state', () => {
     expect(exec).toHaveBeenLastCalledWith('herdr', ['pane', 'close', '--pane', 'pane-1']);
   });
 
+  it('exposes the exact pane ids once a local Herdr pane exists, and null before/without one', async () => {
+    const exitHandlers: Array<(info: PtyExitInfo) => void> = [];
+    spawnLocalPty.mockReturnValue(fakePty(exitHandlers));
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      if (args[0] === 'status') {
+        return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
+      }
+      if (args[0] === 'workspace') {
+        return { stdout: JSON.stringify({ workspace_id: 'workspace-1' }), stderr: '' };
+      }
+      if (args[0] === 'tab') {
+        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const provider = localProvider({ sessionHost: 'herdr', ctx: { exec } as never });
+
+    expect(provider.getHerdrTarget()).toBeNull();
+
+    await provider.start(session());
+
+    expect(provider.getHerdrTarget()).toEqual({
+      workspaceId: 'workspace-1',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+    });
+
+    const ptyProvider = localProvider();
+    expect(ptyProvider.getHerdrTarget()).toBeNull();
+  });
+
   it('starts a local agent fresh after a resumed session exits', async () => {
     vi.useFakeTimers();
     try {

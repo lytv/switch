@@ -35,6 +35,7 @@ import type { ResolvedHerdrSettings } from '@shared/core/location-settings/sessi
 import { agentSessionExitedChannel } from '@shared/core/providers/agentEvents';
 import { makePtyId } from '@shared/core/pty/ptyId';
 import { makeAgentPtySessionId } from '@shared/core/pty/ptySessionId';
+import type { SessionHerdrTarget } from '@shared/core/sessions/herdr-target';
 import type { Session } from '@shared/core/sessions/sessions';
 import { sessionStartupWatch } from '../desktop-session-startup-watch';
 import {
@@ -479,6 +480,12 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
     }
     this.supervisor.forget();
     this.known = false;
+  }
+
+  getHerdrTarget(): SessionHerdrTarget | null {
+    if (this.sessionHost !== 'herdr' || !this.herdrTarget) return null;
+    const { workspaceId, tabId, paneId } = this.herdrTarget;
+    return { workspaceId, tabId, paneId };
   }
 
   async detach(): Promise<void> {

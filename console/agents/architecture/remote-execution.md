@@ -83,6 +83,24 @@ Two properties worth preserving:
   you nothing about whether `dockerd` is up, and running an installer over a stopped
   service would misreport the cause.
 
+## Session host: pty, tmux, or Herdr
+
+A session's terminal runs directly in a PTY by default; `tmux` and `herdr` are
+both opt-in alternatives that keep the pane alive independently of Switch
+Console's own PTY. All three are handled by the same runtimes above —
+`local-agent-runtime.ts` / `ssh-agent-runtime.ts` — which resolve which one to
+use via `resolveSessionHostForTransport` (`src/shared/core/location-settings/session-host.ts`)
+and, for Herdr, create the workspace/tab/pane through `herdr-session-host.ts`
+before attaching to it exactly as they would a tmux pane.
+
+The sidecar mirrors this for the SSH+tmux case: it also owns an optional
+protocol-16 event subscription (`herdr-event-subscription.ts`) so agent-status
+changes arrive as events instead of only from the sidecar's own poll — kept in
+step with the poll fallback rather than replacing it, since not every Herdr
+build speaks that protocol. `docs/HERDR.md` is the operator-facing note (how
+to enable it, the protocol floor, workspace modes); this page is the
+implementation.
+
 ## The sidecar
 
 A remote agent runs inside tmux next to a Switch Console-deployed **sidecar**, so it keeps

@@ -2,6 +2,7 @@ import { Loader2, RefreshCw, TriangleAlert } from 'lucide-react';
 import { useCallback, useEffect } from 'react';
 import { rpc } from '@renderer/lib/ipc';
 import { log } from '@renderer/utils/logger';
+import type { SessionHost } from '@shared/core/location-settings/location-settings';
 import type { AttachState } from './stores/session-agent-store';
 
 /**
@@ -22,10 +23,15 @@ export function SessionAttachmentState({
   state,
   sessionId,
   host,
+  sessionHost,
 }: {
   state: Exclude<AttachState, 'attached'>;
   sessionId: string;
   host: string | null;
+  /** This location's resolved session host, when known — used only to add
+   * Herdr-specific guidance to a failed attach; a plain PTY or tmux failure
+   * still shows the generic message below. */
+  sessionHost?: SessionHost | null;
 }) {
   const attach = useCallback(() => {
     void rpc.sessions.attachSession(sessionId).catch((error: unknown) => {
@@ -62,6 +68,12 @@ export function SessionAttachmentState({
         <p className="font-mono text-xs text-foreground-muted">
           The agent is still running{host ? ` on ${host}` : ''}. Only this view failed.
         </p>
+        {sessionHost === 'herdr' && (
+          <p className="font-mono text-xs text-foreground-muted">
+            This session runs in a Herdr pane — check that the herdr daemon is up on {host} and
+            that the pane wasn&apos;t closed outside Switch Console.
+          </p>
+        )}
         <ActionButton onClick={attach} icon={<RefreshCw className="h-3 w-3" />} label="Try again" />
       </Centered>
     );
