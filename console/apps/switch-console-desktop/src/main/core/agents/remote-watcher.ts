@@ -1,8 +1,11 @@
 import { DEEPLINK_SCHEME } from '@main/app/deeplinks';
 import { ensureAgentSidecar } from '@main/core/agent-runtime/impl/ensure-agent-sidecar';
 import { writeWatchEnabled } from '@main/core/agent-runtime/impl/remote-sidecar-launcher';
+import { SshFileSystem } from '@main/core/fs/impl/ssh-fs';
+import { RemoteLocationSettingsProvider } from '@main/core/locations/settings/providers/remote-location-settings-provider';
 import { listAutoSessionAgentIds } from '@main/core/switch-rooms/auto-session-store';
 import { log } from '@main/lib/logger';
+import { resolveSessionHostForTransport } from '@shared/core/location-settings/session-host';
 import { agentLaunchSpecialization } from './agent-launch-config';
 import { getRemoteAgentLocation } from './agent-location';
 import { connectRemoteAgent } from './connect-remote-agent';
@@ -98,7 +101,8 @@ export async function startRemoteDiscovery(agentId: string): Promise<void> {
 export async function ensureRemoteWatcher(agentId: string): Promise<void> {
   const agent = await getAgentById(agentId);
   if (!agent) throw new Error(`No agent with id ${agentId}`);
-  if (!(await getRemoteAgentLocation(agent))) return;
+  const location = await getRemoteAgentLocation(agent);
+  if (!location) return;
   if (!agent.switchAgentId) {
     log.warn('ensureRemoteWatcher: agent has no Switch id; cannot watch', { agentId });
     return;
@@ -110,7 +114,13 @@ export async function ensureRemoteWatcher(agentId: string): Promise<void> {
     return;
   }
 
-  const { ctx, connectionId, remoteRepoDir, host } = await connectRemoteAgent(agent);
+  const { ctx, proxy, connectionId, remoteRepoDir, host } = await connectRemoteAgent(agent);
+  const settings = new RemoteLocationSettingsProvider(
+    location.id,
+    remoteRepoDir,
+    new SshFileSystem(proxy, remoteRepoDir)
+  );
+  const sessionHost = resolveSessionHostForTransport('ssh', await settings.get());
   await ensureAgentSidecar({
     providerId: agent.providerId,
     repoDir: remoteRepoDir,
@@ -119,6 +129,8 @@ export async function ensureRemoteWatcher(agentId: string): Promise<void> {
     credsSlug: agent.name ?? agent.id,
     agentName: agent.name ?? null,
     specialization: await agentLaunchSpecialization(agent.id),
+    sessionHost: sessionHost.host,
+    herdr: sessionHost.herdr,
     ctx,
     connectionId,
     host,
