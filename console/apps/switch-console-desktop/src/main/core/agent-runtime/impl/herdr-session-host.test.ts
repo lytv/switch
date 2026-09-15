@@ -70,8 +70,25 @@ describe('createHerdrPane', () => {
   ] as const)('uses %s workspace isolation', async (workspaceMode, expectedWorkspace) => {
     const exec = vi.fn(async (_command: string, args: string[]) => {
       if (args[0] === 'workspace')
-        return { stdout: JSON.stringify({ workspace_id: 'ws-1' }), stderr: '' };
-      return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+        return {
+          stdout: JSON.stringify({
+            result: {
+              workspace: { workspace_id: 'ws-1', label: expectedWorkspace },
+              tab: { tab_id: 'tab-1' },
+              root_pane: { pane_id: 'pane-1', tab_id: 'tab-1', workspace_id: 'ws-1' },
+            },
+          }),
+          stderr: '',
+        };
+      return {
+        stdout: JSON.stringify({
+          result: {
+            tab: { tab_id: 'tab-2' },
+            root_pane: { pane_id: 'pane-2', tab_id: 'tab-2', workspace_id: 'ws-1' },
+          },
+        }),
+        stderr: '',
+      };
     });
 
     await createHerdrPane(
@@ -94,9 +111,11 @@ describe('createHerdrPane', () => {
     expect(exec).toHaveBeenCalledWith('herdr', [
       'workspace',
       'create',
-      '--name',
+      '--label',
       expectedWorkspace,
-      '--json',
+      '--cwd',
+      '/repo',
+      '--no-focus',
     ]);
   });
 });

@@ -37,7 +37,12 @@ function parseJson(stdout: string, commandLabel: string): Record<string, unknown
     if (!parsed || typeof parsed !== 'object') {
       throw new Error(`${commandLabel} did not return an object`);
     }
-    return parsed as Record<string, unknown>;
+    const root = parsed as Record<string, unknown>;
+    // Herdr 0.9 CLI wraps payloads as { id, result }.
+    if (root.result && typeof root.result === 'object') {
+      return root.result as Record<string, unknown>;
+    }
+    return root;
   } catch (error) {
     throw new Error(`${commandLabel} returned invalid JSON: ${String(error)}`);
   }
@@ -108,36 +113,77 @@ export async function createHerdrPane(
   }
 ): Promise<HerdrPaneRef> {
   const wsLabel = workspaceLabel(config, opts);
-  const ws = parseJson(
-    (await exec('herdr', ['workspace', 'create', '--name', wsLabel, '--json'])).stdout,
-    'herdr workspace create'
-  );
-  const workspaceId = readId(ws, ['workspace_id', 'id']);
-  if (!workspaceId) throw new Error('herdr workspace create returned no workspace id');
-
-  const tab = parseJson(
+  // Herdr 0.9: workspace create takes --label (not --name) and always prints JSON
+  // (no --json flag). It also creates the first tab + root pane in one shot.
+  const created = parseJson(
     (
       await exec('herdr', [
-        'tab',
+        'workspace',
         'create',
-        '--workspace',
-        workspaceId,
-        '--name',
-        opts.tabLabel,
+        '--label',
+        wsLabel,
         '--cwd',
         opts.cwd,
-        '--json',
+        '--no-focus',
       ])
     ).stdout,
-    'herdr tab create'
+    'herdr workspace create'
   );
-  const tabId = readId(tab, ['tab_id', 'id']);
-  const paneId =
-    readId(tab, ['pane_id', 'root_pane_id']) ??
-    readId((tab.root_pane as Record<string, unknown>) ?? {}, ['pane_id', 'id']) ??
-    readId((tab.pane as Record<string, unknown>) ?? {}, ['pane_id', 'id']);
+  const workspaceObj =
+    created.workspace && typeof created.workspace === 'object'
+      ? (created.workspace as Record<string, unknown>)
+      : created;
+  const rootPane =
+    created.root_pane && typeof created.root_pane === 'object'
+      ? (created.root_pane as Record<string, unknown>)
+      : {};
+  const tabObj =
+    created.tab && typeof created.tab === 'object'
+      ? (created.tab as Record<string, unknown>)
+      : {};
+
+  let workspaceId = readId(workspaceObj, ['workspace_id', 'id']) ?? readId(rootPane, ['workspace_id']);
+  let tabId = readId(tabObj, ['tab_id', 'id']) ?? readId(rootPane, ['tab_id']);
+  let paneId =
+    readId(rootPane, ['pane_id', 'id']) ??
+    readId(tabObj, ['pane_id', 'root_pane_id']);
+
+  // Optional second tab when the session wants its own labeled tab inside an
+  // existing flat workspace. Herdr 0.9 uses --label (not --name).
+  if (workspaceId && opts.tabLabel && opts.tabLabel !== wsLabel) {
+    const tab = parseJson(
+      (
+        await exec('herdr', [
+          'tab',
+          'create',
+          '--workspace',
+          workspaceId,
+          '--label',
+          opts.tabLabel,
+          '--cwd',
+          opts.cwd,
+          '--no-focus',
+        ])
+      ).stdout,
+      'herdr tab create'
+    );
+    const tabRoot =
+      tab.root_pane && typeof tab.root_pane === 'object'
+        ? (tab.root_pane as Record<string, unknown>)
+        : {};
+    const tabBody =
+      tab.tab && typeof tab.tab === 'object' ? (tab.tab as Record<string, unknown>) : tab;
+    tabId = readId(tabBody, ['tab_id', 'id']) ?? readId(tabRoot, ['tab_id']) ?? tabId;
+    paneId =
+      readId(tabRoot, ['pane_id', 'id']) ??
+      readId(tabBody, ['pane_id', 'root_pane_id']) ??
+      readId(tab, ['pane_id', 'root_pane_id']) ??
+      paneId;
+  }
+
+  if (!workspaceId) throw new Error('herdr workspace create returned no workspace id');
   if (!tabId || !paneId) {
-    throw new Error('herdr tab create returned no tab/pane id');
+    throw new Error('herdr workspace/tab create returned no tab/pane id');
   }
   return { workspaceId, tabId, paneId };
 }
