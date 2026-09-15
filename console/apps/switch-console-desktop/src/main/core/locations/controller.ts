@@ -3,10 +3,12 @@ import { inspectLocationPath } from './operations/inspect-location-path';
 import { openLocation } from './operations/open-location';
 import { countLocationsUsingGithubAccount } from './settings/count-locations-using-github-account';
 import { locationSettingsService } from './settings/location-settings-service';
-import { getLocations } from './store';
+import { getLocations, updateLocationDir } from './store';
 
 export const locationsController = createRPCController({
   getLocations,
+  updateLocationDir: (params: { locationId: string; dir: string }) =>
+    updateLocationDir(params.locationId, params.dir),
   inspectLocationPath,
   openLocation,
   getLocationSettingsPage: (locationId: string) =>

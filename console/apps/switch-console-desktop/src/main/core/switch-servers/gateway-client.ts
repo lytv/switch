@@ -353,6 +353,7 @@ type AgentSummaryJson = {
   owner_id?: string | null;
   owner_name: string | null;
   known_agent_type: string | null;
+  known_agent_options?: Record<string, unknown> | null;
   addressing_policy?: AddressingPolicy | null;
   icon_url?: string | null;
   created_at: string;
@@ -361,6 +362,14 @@ type AgentSummaryJson = {
 /** Single place the agent wire shape becomes a `RemoteAgentSummary`. Every
  * endpoint returning an agent goes through here, so a new field cannot reach
  * one caller and silently miss another. */
+function repoDirFromOptions(options: Record<string, unknown> | null | undefined): string | null {
+  if (!options) return null;
+  const raw = options.repo_dir;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function toRemoteAgentSummary(json: AgentSummaryJson): RemoteAgentSummary {
   return {
     id: json.id,
@@ -374,6 +383,7 @@ function toRemoteAgentSummary(json: AgentSummaryJson): RemoteAgentSummary {
     addressingPolicy: json.addressing_policy ?? null,
     iconUrl: json.icon_url ?? null,
     createdAt: json.created_at,
+    repoDir: repoDirFromOptions(json.known_agent_options),
   };
 }
 

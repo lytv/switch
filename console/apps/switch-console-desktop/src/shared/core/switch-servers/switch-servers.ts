@@ -199,6 +199,8 @@ export type RemoteAgentSummary = {
    * rooms, sessions and lookups are routed by. */
   displayName: string | null;
   createdAt: string;
+  /** Working directory from the gateway known-agent option `repo_dir`, or null. */
+  repoDir: string | null;
 };
 
 /**

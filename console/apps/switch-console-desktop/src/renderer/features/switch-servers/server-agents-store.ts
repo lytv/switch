@@ -92,6 +92,30 @@ export class ServerAgentsStore {
         );
         await agentsStore.load();
       }
+      // Follow gateway Repo Dir into Console location.dir for linked agents so
+      // new sessions use the folder the captain set on the server agent page.
+      const local = agentsStore.agentsForServer(serverId);
+      const remoteById = new Map(remote.map((agent) => [agent.id, agent]));
+      let dirsChanged = false;
+      for (const agent of local) {
+        if (!agent.switchAgentId || !agent.locationId) continue;
+        const remoteAgent = remoteById.get(agent.switchAgentId);
+        const repoDir = remoteAgent?.repoDir?.trim();
+        if (!repoDir) continue;
+        const location = await rpc.locations.updateLocationDir({
+          locationId: agent.locationId,
+          dir: repoDir,
+        });
+        if (location) dirsChanged = true;
+      }
+      if (dirsChanged) {
+        // Location manager caches dir on mount; reload agents + locations.
+        await agentsStore.load();
+        const { getLocationManagerStore } = await import(
+          '@renderer/features/locations/stores/location-manager'
+        );
+        await getLocationManagerStore().reload();
+      }
       runInAction(() => {
         this.byServer.set(serverId, mergeServerAgents(this.byServer.get(serverId) ?? [], remote));
         this.errors.delete(serverId);

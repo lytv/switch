@@ -45,6 +45,7 @@ function agent(overrides: Partial<RemoteAgentSummary>): RemoteAgentSummary {
     addressingPolicy: null,
     iconUrl: null,
     createdAt: '2026-01-01T00:00:00Z',
+    repoDir: null,
     ...overrides,
   };
 }
