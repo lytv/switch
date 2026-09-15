@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('@renderer/lib/ipc', () => ({ rpc: {} }));
 
-import { mergeServerAgents, type SyncedServerAgent } from './server-agents-store';
+import type { Agent } from '@shared/core/agents/agents';
+import {
+  mergeServerAgents,
+  serverAgentAutoLinks,
+  type SyncedServerAgent,
+} from './server-agents-store';
 
 function agent(id: string, name: string, iconUrl: string | null = null): SyncedServerAgent {
   return {
@@ -21,6 +26,15 @@ function agent(id: string, name: string, iconUrl: string | null = null): SyncedS
   };
 }
 
+function localAgent(
+  id: string,
+  name: string,
+  switchAgentId: string | null = null,
+  locationId = 'location-1'
+): Agent {
+  return { id, name, switchAgentId, locationId } as Agent;
+}
+
 describe('mergeServerAgents', () => {
   it('matches by server agent id and updates server metadata', () => {
     const merged = mergeServerAgents(
@@ -37,5 +51,43 @@ describe('mergeServerAgents', () => {
     const merged = mergeServerAgents([agent('local-only', 'local')], []);
 
     expect(merged).toEqual([expect.objectContaining({ id: 'local-only', missing: true })]);
+  });
+});
+
+describe('serverAgentAutoLinks', () => {
+  it('links one unbound local agent with the exact same name', () => {
+    expect(
+      serverAgentAutoLinks([agent('switch-1', 'atlas')], [localAgent('local-1', 'atlas')])
+    ).toEqual([{ localAgentId: 'local-1', switchAgentId: 'switch-1' }]);
+  });
+
+  it('does not link an ambiguous local name', () => {
+    expect(
+      serverAgentAutoLinks(
+        [agent('switch-1', 'atlas')],
+        [localAgent('local-1', 'atlas'), localAgent('local-2', 'atlas')]
+      )
+    ).toEqual([]);
+  });
+
+  it('does not replace a different Switch identity', () => {
+    expect(
+      serverAgentAutoLinks(
+        [agent('switch-1', 'atlas')],
+        [localAgent('local-1', 'atlas', 'switch-2')]
+      )
+    ).toEqual([]);
+  });
+
+  it('does not link a local agent without a folder', () => {
+    expect(
+      serverAgentAutoLinks([agent('switch-1', 'atlas')], [localAgent('local-1', 'atlas', null, '')])
+    ).toEqual([]);
+  });
+
+  it('requires an exact, case-sensitive name match', () => {
+    expect(
+      serverAgentAutoLinks([agent('switch-1', 'Atlas')], [localAgent('local-1', 'atlas')])
+    ).toEqual([]);
   });
 });

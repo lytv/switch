@@ -1,6 +1,8 @@
 import { makeAutoObservable, runInAction } from 'mobx';
+import { agentsStore } from '@renderer/features/locations/stores/agents-store';
 import { failureText } from '@renderer/lib/errors/describe-failure';
 import { rpc } from '@renderer/lib/ipc';
+import type { Agent } from '@shared/core/agents/agents';
 import type { RemoteAgentSummary } from '@shared/core/switch-servers/switch-servers';
 
 export type SyncedServerAgent = RemoteAgentSummary & { missing: boolean };
@@ -21,6 +23,35 @@ export function mergeServerAgents(
     if (!present.has(agent.id)) merged.push({ ...agent, missing: true });
   }
   return merged.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export type ServerAgentAutoLink = { localAgentId: string; switchAgentId: string };
+
+/** Names match only when their exact, case-sensitive strings match. */
+export function serverAgentAutoLinks(
+  remoteAgents: RemoteAgentSummary[],
+  localAgents: Agent[]
+): ServerAgentAutoLink[] {
+  const localByName = new Map<string, Agent[]>();
+  const remoteNameCounts = new Map<string, number>();
+  for (const local of localAgents) {
+    const matches = localByName.get(local.name);
+    if (matches) matches.push(local);
+    else localByName.set(local.name, [local]);
+  }
+  for (const remote of remoteAgents) {
+    remoteNameCounts.set(remote.name, (remoteNameCounts.get(remote.name) ?? 0) + 1);
+  }
+
+  const links: ServerAgentAutoLink[] = [];
+  for (const remote of remoteAgents) {
+    const matches = localByName.get(remote.name) ?? [];
+    if (remoteNameCounts.get(remote.name) !== 1 || matches.length !== 1) continue;
+    const local = matches[0]!;
+    if (!local.locationId || local.switchAgentId !== null) continue;
+    links.push({ localAgentId: local.id, switchAgentId: remote.id });
+  }
+  return links;
 }
 
 /**
@@ -47,6 +78,20 @@ export class ServerAgentsStore {
     runInAction(() => this.refreshing.add(serverId));
     try {
       const remote = await rpc.switchServers.listRemoteAgents(serverId);
+      if (!agentsStore.loaded) await agentsStore.load();
+      const links = serverAgentAutoLinks(remote, agentsStore.agentsForServer(serverId));
+      if (links.length > 0) {
+        await Promise.all(
+          links.map(async (link) => {
+            const agent = await rpc.agents.updateAgent({
+              agentId: link.localAgentId,
+              switchAgentId: link.switchAgentId,
+            });
+            if (!agent) throw new Error(`Local agent ${link.localAgentId} was not found`);
+          })
+        );
+        await agentsStore.load();
+      }
       runInAction(() => {
         this.byServer.set(serverId, mergeServerAgents(this.byServer.get(serverId) ?? [], remote));
         this.errors.delete(serverId);

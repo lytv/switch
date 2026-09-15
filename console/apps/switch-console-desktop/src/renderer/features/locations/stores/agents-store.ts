@@ -88,13 +88,20 @@ export class AgentsStore {
    * promise something this app cannot deliver.
    */
   agentsOnServer(serverId: string): Agent[] {
+    return this.agentsForServer(serverId)
+      .filter((agent) => agent.switchAgentId)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** All local agents assigned to a server, including ones that still need a Switch identity. */
+  agentsForServer(serverId: string): Agent[] {
     const matching: Agent[] = [];
     for (const agents of this.byLocation.values()) {
       for (const agent of agents) {
-        if (agent.serverId === serverId && agent.switchAgentId) matching.push(agent);
+        if (agent.serverId === serverId) matching.push(agent);
       }
     }
-    return matching.sort((a, b) => a.name.localeCompare(b.name));
+    return matching;
   }
 
   /** A location's agents that belong to one server — what the sidebar renders
