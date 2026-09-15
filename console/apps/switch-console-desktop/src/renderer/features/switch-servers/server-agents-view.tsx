@@ -23,6 +23,7 @@ import {
 } from '@renderer/lib/ui/dropdown-menu';
 import type { Agent } from '@shared/core/agents/agents';
 import { providerDisplayName } from '@shared/core/providers/agent-provider-registry';
+import { serverAgentsStore, type SyncedServerAgent } from './server-agents-store';
 import { ServerPage } from './server-page';
 import { ServerSectionTitlebar } from './server-section-titlebar';
 import { switchRoomsStore } from './switch-rooms-store';
@@ -45,9 +46,18 @@ const ServerAgentsPanel = observer(function ServerAgentsPanel() {
   // when the sidebar happened to be open first.
   useEffect(() => {
     void refreshSidebarRoomState(false);
+    void serverAgentsStore.refresh(serverId);
   }, [serverId]);
 
-  const agents = agentsStore.agentsOnServer(serverId);
+  const localAgents = agentsStore.agentsOnServer(serverId);
+  const localBySwitchId = new Map(
+    localAgents.filter((agent) => agent.switchAgentId).map((agent) => [agent.switchAgentId!, agent])
+  );
+  const synced = serverAgentsStore.agentsOnServer(serverId);
+  const unbound = synced.filter((agent) => !localBySwitchId.has(agent.id));
+  const localOnly = localAgents.filter(
+    (agent) => !agent.switchAgentId || !synced.some((remote) => remote.id === agent.switchAgentId)
+  );
 
   return (
     <ServerPage
@@ -71,13 +81,73 @@ const ServerAgentsPanel = observer(function ServerAgentsPanel() {
         >
           <Plus className="size-5" />
         </button>
-        {agents.map((agent) => (
+        {localAgents
+          .filter(
+            (agent) =>
+              agent.switchAgentId && synced.some((remote) => remote.id === agent.switchAgentId)
+          )
+          .map((agent) => (
+            <AgentCard key={agent.id} agent={agent} serverId={serverId} />
+          ))}
+        {unbound.map((agent) => (
+          <SyncedAgentCard
+            key={agent.id}
+            agent={agent}
+            serverId={serverId}
+            onSetFolder={() => showAddAgentModal({ entryPoint: 'server_page' })}
+          />
+        ))}
+        {localOnly.map((agent) => (
           <AgentCard key={agent.id} agent={agent} serverId={serverId} />
         ))}
       </div>
     </ServerPage>
   );
 });
+
+function SyncedAgentCard({
+  agent,
+  serverId,
+  onSetFolder,
+}: {
+  agent: SyncedServerAgent;
+  serverId: string;
+  onSetFolder: () => void;
+}) {
+  const gatewayUrl = switchRoomsStore.gatewayAgentUrl(serverId, agent.id);
+  const label = agent.displayName || agent.name;
+
+  return (
+    <div className="flex min-h-[184px] flex-col rounded-[11px] bg-[var(--surface-2)] p-[14px]">
+      <div className="flex flex-1 items-center justify-center py-3">
+        <AgentAvatar name={label} iconUrl={agent.iconUrl} size={66} />
+      </div>
+      <div className="min-w-0">
+        <div className="truncate text-sm font-medium text-foreground">{label}</div>
+        <div className="truncate text-xs text-foreground-muted">
+          {agent.missing ? 'No longer on server' : 'Set a folder to run sessions'}
+        </div>
+      </div>
+      <div className="mt-3 flex gap-2">
+        {!agent.missing && (
+          <Button size="sm" variant="outline" className="flex-1" onClick={onSetFolder}>
+            Set folder
+          </Button>
+        )}
+        {gatewayUrl && (
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`Open ${label} in gateway`}
+            onClick={() => void rpc.switchServers.openGatewayPage({ serverId, url: gatewayUrl })}
+          >
+            <ExternalLink className="size-4" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 const AgentCard = observer(function AgentCard({
   agent,
