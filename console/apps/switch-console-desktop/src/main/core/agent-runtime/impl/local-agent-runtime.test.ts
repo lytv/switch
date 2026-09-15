@@ -514,14 +514,14 @@ describe('local agent runtime respawn state', () => {
 
     await provider.start(session());
 
-    expect(exec).toHaveBeenCalledWith('herdr', [
+    expect(exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), [
       'pane',
       'run',
       'pane-1',
       expect.stringContaining("exec 'agent'"),
     ]);
     expect(spawnLocalPty).toHaveBeenLastCalledWith(
-      expect.objectContaining({ command: 'sh', args: ['-c', 'herdr agent attach pane-1'] })
+      expect.objectContaining({ command: 'sh', args: [ '-c', expect.stringContaining('agent attach pane-1') ] })
     );
 
     await provider.dehydrate();
@@ -529,7 +529,7 @@ describe('local agent runtime respawn state', () => {
 
     expect(exec).toHaveBeenCalledTimes(3); // status + workspace create + pane run; reattach reuses target
     await provider.stop();
-    expect(exec).toHaveBeenLastCalledWith('herdr', ['pane', 'close', 'pane-1']);
+    expect(exec).toHaveBeenLastCalledWith(expect.stringMatching(/herdr$/), ['pane', 'close', 'pane-1']);
   });
 
   it('exposes the exact pane ids once a local Herdr pane exists, and null before/without one', async () => {

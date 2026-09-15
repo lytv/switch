@@ -54,7 +54,12 @@ import type { Session } from '@shared/core/sessions/sessions';
 import type { SessionHostTarget } from '../../../../sidecar/session-host-backend';
 import { SIDECAR_VERSION } from '../../../../sidecar/sidecar-version';
 import { ensureAgentSidecar, probeAgentSidecar } from './ensure-agent-sidecar';
-import { closeHerdrPane, createHerdrPane, runHerdrPaneCommand } from './herdr-session-host';
+import {
+  closeHerdrPane,
+  createHerdrPane,
+  resolveHerdrBin,
+  runHerdrPaneCommand,
+} from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { createRemoteHomePluginFs } from './remote-home-plugin-fs';
 import { remoteNodePlatform } from './remote-node-platform';
@@ -944,7 +949,7 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         if (!this.herdrTarget) {
           throw new Error('SshAgentRuntime: cannot attach herdr session without a pane id');
         }
-        sshCommand = `herdr agent attach ${quoteShellArg(this.herdrTarget.paneId)}`;
+        sshCommand = `${quoteShellArg(resolveHerdrBin())} agent attach ${quoteShellArg(this.herdrTarget.paneId)}`;
       } else {
         const profile = await this.proxy.getRemoteShellProfile();
         sshCommand = resolveSshCommand('agent', cfg, paneEnv, profile);

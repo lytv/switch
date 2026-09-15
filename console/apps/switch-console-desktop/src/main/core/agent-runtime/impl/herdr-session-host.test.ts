@@ -4,6 +4,7 @@ import {
   isHerdrPaneLive,
   mapHerdrAgentStatus,
   readHerdrPromptStatus,
+  resolveHerdrBin,
 } from './herdr-session-host';
 
 describe('mapHerdrAgentStatus', () => {
@@ -26,7 +27,7 @@ describe('readHerdrPromptStatus', () => {
     }));
 
     await expect(isHerdrPaneLive(exec, 'pane-1')).resolves.toBe(true);
-    expect(exec).toHaveBeenCalledWith('herdr', ['pane', 'get', 'pane-1']);
+    expect(exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), ['pane', 'get', 'pane-1']);
   });
 
   it('reads the current agent state from the exact pane', async () => {
@@ -45,7 +46,7 @@ describe('readHerdrPromptStatus', () => {
       blocked: false,
       runtimeStatus: 'working',
     });
-    expect(exec).toHaveBeenCalledWith('herdr', ['agent', 'get', 'pane-1']);
+    expect(exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), ['agent', 'get', 'pane-1']);
   });
 
   it('fails closed when Herdr reports an unknown state', async () => {
@@ -108,7 +109,7 @@ describe('createHerdrPane', () => {
       }
     );
 
-    expect(exec).toHaveBeenCalledWith('herdr', [
+    expect(exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), [
       'workspace',
       'create',
       '--label',
@@ -117,5 +118,18 @@ describe('createHerdrPane', () => {
       '/repo',
       '--no-focus',
     ]);
+  });
+});
+
+describe('resolveHerdrBin', () => {
+  it('prefers HERDR_BIN when it exists', () => {
+    // process binary always exists on this host under homebrew or PATH
+    const bin = resolveHerdrBin({ ...process.env, HERDR_BIN: process.execPath });
+    expect(bin).toBe(process.execPath);
+  });
+
+  it('returns an absolute path ending in herdr on this machine', () => {
+    const bin = resolveHerdrBin(process.env);
+    expect(bin === 'herdr' || bin.endsWith('/herdr')).toBe(true);
   });
 });

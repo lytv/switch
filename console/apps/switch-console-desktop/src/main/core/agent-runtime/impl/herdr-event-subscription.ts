@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createConnection, type Socket } from 'node:net';
-import type { HerdrExec } from './herdr-session-host';
+import { resolveHerdrBin, type HerdrExec } from './herdr-session-host';
 
 const EVENT_SUBSCRIPTION_PROTOCOL_MIN = 16;
 
@@ -34,7 +34,7 @@ export async function createHerdrAgentStatusSubscription(
     onAvailabilityChange: (available: boolean) => void;
   }
 ): Promise<HerdrAgentStatusSubscription | null> {
-  const { stdout } = await exec('herdr', ['status', '--json']);
+  const { stdout } = await exec(resolveHerdrBin(), ['status', '--json']);
   const endpoint = readEndpoint(stdout);
   if (endpoint.protocol < EVENT_SUBSCRIPTION_PROTOCOL_MIN || !endpoint.socketPath) return null;
   return new HerdrAgentStatusSubscription(endpoint.socketPath, handlers);

@@ -1,6 +1,42 @@
 import { quoteShellArg } from '@main/utils/shellEscape';
 import type { HerdrWorkspaceMode } from '@shared/core/location-settings/location-settings';
 import type { AgentStatus } from '@shared/core/providers/agentEvents';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
+
+/** Resolve the herdr binary to an absolute path.
+ *
+ * GUI-launched Electron often has a stripped PATH (no Homebrew). Bare `herdr`
+ * then fails inside `/bin/zsh -lc` attach PTYs with "command not found". Prefer
+ * well-known install locations, then PATH.
+ */
+export function resolveHerdrBin(env: NodeJS.ProcessEnv = process.env): string {
+  const candidates = [
+    env.HERDR_BIN,
+    '/opt/homebrew/bin/herdr',
+    '/usr/local/bin/herdr',
+    join(env.HOME ?? '', '.local/bin/herdr'),
+  ].filter((value): value is string => Boolean(value && value.trim()));
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  const pathEnv = env.PATH ?? '';
+  for (const dir of pathEnv.split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, 'herdr');
+    if (existsSync(candidate)) return candidate;
+  }
+
+  // Last resort: leave the bare name so the OS error stays readable.
+  return 'herdr';
+}
+
+function herdrArgs(args: string[], env?: NodeJS.ProcessEnv): { bin: string; args: string[] } {
+  return { bin: resolveHerdrBin(env), args };
+}
+
 
 export type HerdrExec = (
   command: string,
@@ -77,7 +113,7 @@ function workspaceLabel(
 }
 
 export async function readHerdrProtocol(exec: HerdrExec): Promise<number> {
-  const { stdout } = await exec('herdr', ['status', '--json']);
+  const { stdout } = await exec(resolveHerdrBin(), ['status', '--json']);
   const parsed = parseJson(stdout, 'herdr status --json');
   const client =
     parsed.client && typeof parsed.client === 'object'
@@ -117,7 +153,7 @@ export async function createHerdrPane(
   // (no --json flag). It also creates the first tab + root pane in one shot.
   const created = parseJson(
     (
-      await exec('herdr', [
+      await exec(resolveHerdrBin(), [
         'workspace',
         'create',
         '--label',
@@ -168,12 +204,12 @@ export async function runHerdrPaneCommand(
   const commandLine = [command, ...args].map(quoteShellArg).join(' ');
   const inner = envPrefix ? `${envPrefix} exec ${commandLine}` : `exec ${commandLine}`;
   // Herdr 0.9: positional pane id + command (no --pane / --).
-  await exec('herdr', ['pane', 'run', paneId, inner]);
+  await exec(resolveHerdrBin(), ['pane', 'run', paneId, inner]);
 }
 
 export async function isHerdrPaneLive(exec: HerdrExec, paneId: string): Promise<boolean> {
   try {
-    const { stdout } = await exec('herdr', ['pane', 'get', paneId]);
+    const { stdout } = await exec(resolveHerdrBin(), ['pane', 'get', paneId]);
     const parsed = parseJson(stdout, 'herdr pane get');
     const result =
       parsed.result && typeof parsed.result === 'object'
@@ -195,7 +231,7 @@ export async function isHerdrPaneLive(exec: HerdrExec, paneId: string): Promise<
 
 export async function closeHerdrPane(exec: HerdrExec, paneId: string): Promise<void> {
   try {
-    await exec('herdr', ['pane', 'close', paneId]);
+    await exec(resolveHerdrBin(), ['pane', 'close', paneId]);
   } catch (error) {
     const detail = String(error);
     if (hasNotFound(detail, 'pane')) return;
@@ -236,7 +272,7 @@ export async function readHerdrPromptStatus(
   paneId: string
 ): Promise<HerdrPromptStatus | null> {
   try {
-    const { stdout } = await exec('herdr', ['agent', 'get', paneId]);
+    const { stdout } = await exec(resolveHerdrBin(), ['agent', 'get', paneId]);
     const parsed = parseJson(stdout, 'herdr agent get');
     const result =
       parsed.result && typeof parsed.result === 'object'

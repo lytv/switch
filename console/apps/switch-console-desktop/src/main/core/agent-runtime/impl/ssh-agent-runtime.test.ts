@@ -341,12 +341,12 @@ describe('SshAgentRuntime', () => {
 
     expect(openSsh2Pty).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ command: "herdr agent attach 'pane-recovered'" })
+      expect.objectContaining({ command: expect.stringContaining("agent attach 'pane-recovered'") })
     );
 
     await provider.stop();
 
-    expect(ctx.exec).toHaveBeenCalledWith('herdr', ['pane', 'close', 'pane-recovered']);
+    expect(ctx.exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), ['pane', 'close', 'pane-recovered']);
     expect(provider.getHerdrTarget()).toBeNull();
   });
 

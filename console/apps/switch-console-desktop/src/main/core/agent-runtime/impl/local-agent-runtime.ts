@@ -44,6 +44,7 @@ import {
   ensureHerdrProtocol,
   runHerdrPaneCommand,
   type HerdrPaneRef,
+  resolveHerdrBin,
 } from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { resolveAgentExecutable } from './resolve-agent-executable';
@@ -302,7 +303,7 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
         throw new Error('LocalAgentRuntime: herdr launch target was not created');
       }
       const command = this.herdrTarget
-        ? { command: 'herdr', args: ['agent', 'attach', this.herdrTarget.paneId] }
+        ? { command: resolveHerdrBin(), args: ['agent', 'attach', this.herdrTarget.paneId] }
         : { command: agentCommand.command, args: agentCommand.args };
       const resolved = resolveLocalPtySpawn({
         platform: process.platform,
