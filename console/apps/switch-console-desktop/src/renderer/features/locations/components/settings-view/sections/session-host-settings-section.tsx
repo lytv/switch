@@ -58,6 +58,10 @@ export const SessionHostSettingsSection = observer(function SessionHostSettingsS
 }: {
   locationId: string;
 }) {
+  // Hooks must run unconditionally (React #310 if placed after the null return).
+  const [pendingHost, setPendingHost] = useState<SessionHost | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   const mounted = asMounted(getLocationStore(locationId));
   const store = mounted?.settings ?? null;
   const settings = store?.settings ?? null;
@@ -67,9 +71,6 @@ export const SessionHostSettingsSection = observer(function SessionHostSettingsS
   const transportKind = locationKind(mounted.data);
   const resolved = resolveSessionHostForTransport(transportKind, settings);
   const sessionHost = settings.sessionHost ?? resolved.host;
-
-  const [pendingHost, setPendingHost] = useState<SessionHost | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
   const displayedHost = pendingHost ?? sessionHost;
 
   const save = (patch: SessionHostSettingsPatch) => {
