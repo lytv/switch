@@ -508,20 +508,21 @@ describe('local agent runtime respawn state', () => {
           stderr: '',
         };
       }
+      if (args[0] === 'agent' && args[1] === 'start') {
+        return { stdout: JSON.stringify({ result: { type: 'ok' } }), stderr: '' };
+      }
       return { stdout: '', stderr: '' };
     });
     const provider = localProvider({ sessionHost: 'herdr', ctx: { exec } as never });
 
     await provider.start(session());
 
-    expect(exec).toHaveBeenCalledWith(expect.stringMatching(/herdr$/), [
-      'pane',
-      'run',
-      'pane-1',
-      expect.stringContaining("exec 'agent'"),
-    ]);
+    expect(exec).toHaveBeenCalledWith(
+      expect.stringMatching(/herdr$/),
+      expect.arrayContaining(['agent', 'start', expect.any(String), '--kind', 'codex', '--pane', 'pane-1'])
+    );
     expect(spawnLocalPty).toHaveBeenLastCalledWith(
-      expect.objectContaining({ command: 'sh', args: [ '-c', expect.stringContaining('agent attach pane-1') ] })
+      expect.objectContaining({ command: 'sh', args: [ '-c', expect.stringContaining('agent attach') ] })
     );
 
     await provider.dehydrate();
@@ -551,6 +552,9 @@ describe('local agent runtime respawn state', () => {
           stderr: '',
         };
       }
+      if (args[0] === 'agent' && args[1] === 'start') {
+        return { stdout: JSON.stringify({ result: { type: 'ok' } }), stderr: '' };
+      }
       return { stdout: '', stderr: '' };
     });
     const provider = localProvider({ sessionHost: 'herdr', ctx: { exec } as never });
@@ -563,6 +567,7 @@ describe('local agent runtime respawn state', () => {
       workspaceId: 'workspace-1',
       tabId: 'tab-1',
       paneId: 'pane-1',
+      agentName: expect.stringMatching(/^sw-/),
     });
 
     const ptyProvider = localProvider();

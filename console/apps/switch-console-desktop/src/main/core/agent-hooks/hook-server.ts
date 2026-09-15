@@ -111,7 +111,7 @@ export type HookHandler = (raw: RawHookRequest) => Promise<void>;
 
 export type SidecarSessionTargetInfo =
   | { kind: 'tmux'; tmuxTarget: string }
-  | { kind: 'herdr'; paneId: string; tabId: string; workspaceId: string };
+  | { kind: 'herdr'; paneId: string; tabId: string; workspaceId: string; agentName?: string };
 
 /** One VM-side session Switch Console can reconcile into its UI. */
 export interface SidecarSessionInfo {

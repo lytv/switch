@@ -57,8 +57,10 @@ import { ensureAgentSidecar, probeAgentSidecar } from './ensure-agent-sidecar';
 import {
   closeHerdrPane,
   createHerdrPane,
+  mapProviderToHerdrKind,
   resolveHerdrBin,
   runHerdrPaneCommand,
+  startHerdrAgent,
 } from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { createRemoteHomePluginFs } from './remote-home-plugin-fs';
@@ -888,18 +890,29 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
             );
           }
           if (this.sessionHost === 'herdr') {
+            const herdrAgentName = `sw-${agentCredsSlug(session)}-${this.sessionId.replace(/-/g, '').slice(0, 10)}`;
+            const sessionEnv = {
+              ...providerEnv,
+              ...colorEnv,
+              ...this.sessionEnvVars,
+              ...hookEnv,
+              ...identityVars,
+            };
             const created = await createHerdrPane(this.ctx.exec.bind(this.ctx), this.herdr, {
               cwd: this.sessionPath,
               tabLabel: `switchdash-${this.sessionId}`,
               agentSlug: agentCredsSlug(session),
+              agentName: herdrAgentName,
               roomId: null,
               sessionId: this.sessionId,
+              env: sessionEnv,
             });
             this.herdrTarget = {
               kind: 'herdr',
               paneId: created.paneId,
               tabId: created.tabId,
               workspaceId: created.workspaceId,
+              agentName: created.agentName,
             };
           }
           switchEnv = {
@@ -913,20 +926,30 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
             if (!this.herdrTarget) {
               throw new Error('SshAgentRuntime: herdr launch target was not created');
             }
-            await runHerdrPaneCommand(
-              this.ctx.exec.bind(this.ctx),
-              this.herdrTarget.paneId,
-              {
-                ...providerEnv,
-                ...colorEnv,
-                ...this.sessionEnvVars,
-                ...hookEnv,
-                ...identityVars,
-                ...switchEnv,
-              },
-              agentCommand.command,
-              agentCommand.args
-            );
+            const herdrKind = mapProviderToHerdrKind(session.providerId);
+            if (herdrKind && this.herdrTarget.agentName) {
+              await startHerdrAgent(this.ctx.exec.bind(this.ctx), {
+                paneId: this.herdrTarget.paneId,
+                name: this.herdrTarget.agentName,
+                kind: herdrKind,
+                args: agentCommand.args,
+              });
+            } else {
+              await runHerdrPaneCommand(
+                this.ctx.exec.bind(this.ctx),
+                this.herdrTarget.paneId,
+                {
+                  ...providerEnv,
+                  ...colorEnv,
+                  ...this.sessionEnvVars,
+                  ...hookEnv,
+                  ...identityVars,
+                  ...switchEnv,
+                },
+                agentCommand.command,
+                agentCommand.args
+              );
+            }
           }
         }
       } else {
@@ -949,7 +972,7 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         if (!this.herdrTarget) {
           throw new Error('SshAgentRuntime: cannot attach herdr session without a pane id');
         }
-        sshCommand = `${quoteShellArg(resolveHerdrBin())} agent attach ${quoteShellArg(this.herdrTarget.paneId)}`;
+        sshCommand = `${quoteShellArg(resolveHerdrBin())} agent attach ${quoteShellArg(this.herdrTarget.agentName ?? this.herdrTarget.paneId)}`;
       } else {
         const profile = await this.proxy.getRemoteShellProfile();
         sshCommand = resolveSshCommand('agent', cfg, paneEnv, profile);

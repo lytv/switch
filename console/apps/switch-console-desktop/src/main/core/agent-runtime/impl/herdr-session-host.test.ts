@@ -104,6 +104,7 @@ describe('createHerdrPane', () => {
         cwd: '/repo',
         tabLabel: 'switchdash-session-1',
         agentSlug: 'agent-1',
+        agentName: 'sw-agent-1',
         roomId: 'room-1',
         sessionId: 'session-1',
       }

@@ -54,6 +54,8 @@ export type HerdrPaneRef = {
   workspaceId: string;
   tabId: string;
   paneId: string;
+  /** Herdr agent name used for `agent attach` / `agent prompt` (not a pane id). */
+  agentName: string;
 };
 
 const BLOCKED_AGENT_STATES = new Set([
@@ -137,6 +139,32 @@ export async function ensureHerdrProtocol(exec: HerdrExec, minProtocol: number):
   return protocol;
 }
 
+export function mapProviderToHerdrKind(providerId: string): string | null {
+  switch (providerId) {
+    case 'claude':
+    case 'claude-code':
+      return 'claude';
+    case 'codex':
+      return 'codex';
+    case 'opencode':
+      return 'opencode';
+    case 'cursor':
+      return 'cursor';
+    case 'gemini':
+      return 'gemini';
+    case 'pi':
+      return 'pi';
+    case 'grok':
+      return 'grok';
+    case 'kimi':
+      return 'kimi';
+    case 'omp':
+      return 'omp';
+    default:
+      return null;
+  }
+}
+
 export async function createHerdrPane(
   exec: HerdrExec,
   config: HerdrSessionHostConfig,
@@ -144,25 +172,31 @@ export async function createHerdrPane(
     cwd: string;
     tabLabel: string;
     agentSlug: string;
+    agentName: string;
     roomId: string | null;
     sessionId: string;
+    env?: Record<string, string>;
   }
 ): Promise<HerdrPaneRef> {
   const wsLabel = workspaceLabel(config, opts);
   // Herdr 0.9: workspace create takes --label (not --name) and always prints JSON
   // (no --json flag). It also creates the first tab + root pane in one shot.
+  const createArgs = [
+    'workspace',
+    'create',
+    '--label',
+    wsLabel,
+    '--cwd',
+    opts.cwd,
+    '--no-focus',
+  ];
+  for (const [key, value] of Object.entries(opts.env ?? {})) {
+    // Skip empty values; herdr --env requires KEY=VALUE.
+    if (!key || value === undefined || value === null) continue;
+    createArgs.push('--env', `${key}=${value}`);
+  }
   const created = parseJson(
-    (
-      await exec(resolveHerdrBin(), [
-        'workspace',
-        'create',
-        '--label',
-        wsLabel,
-        '--cwd',
-        opts.cwd,
-        '--no-focus',
-      ])
-    ).stdout,
+    (await exec(resolveHerdrBin(), createArgs)).stdout,
     'herdr workspace create'
   );
   const workspaceObj =
@@ -178,9 +212,10 @@ export async function createHerdrPane(
       ? (created.tab as Record<string, unknown>)
       : {};
 
-  let workspaceId = readId(workspaceObj, ['workspace_id', 'id']) ?? readId(rootPane, ['workspace_id']);
-  let tabId = readId(tabObj, ['tab_id', 'id']) ?? readId(rootPane, ['tab_id']);
-  let paneId =
+  const workspaceId =
+    readId(workspaceObj, ['workspace_id', 'id']) ?? readId(rootPane, ['workspace_id']);
+  const tabId = readId(tabObj, ['tab_id', 'id']) ?? readId(rootPane, ['tab_id']);
+  const paneId =
     readId(rootPane, ['pane_id', 'id']) ??
     readId(tabObj, ['pane_id', 'root_pane_id']);
 
@@ -188,7 +223,33 @@ export async function createHerdrPane(
   if (!tabId || !paneId) {
     throw new Error('herdr workspace/tab create returned no tab/pane id');
   }
-  return { workspaceId, tabId, paneId };
+  return { workspaceId, tabId, paneId, agentName: opts.agentName };
+}
+
+/** Start a recognized agent in an existing shell pane (Herdr 0.9). */
+export async function startHerdrAgent(
+  exec: HerdrExec,
+  opts: {
+    paneId: string;
+    name: string;
+    kind: string;
+    args: string[];
+    timeoutMs?: number;
+  }
+): Promise<void> {
+  await exec(resolveHerdrBin(), [
+    'agent',
+    'start',
+    opts.name,
+    '--kind',
+    opts.kind,
+    '--pane',
+    opts.paneId,
+    '--timeout',
+    String(opts.timeoutMs ?? 90_000),
+    '--',
+    ...opts.args,
+  ]);
 }
 
 export async function runHerdrPaneCommand(

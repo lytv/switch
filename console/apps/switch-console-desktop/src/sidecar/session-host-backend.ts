@@ -12,7 +12,7 @@ import { exactTmuxTarget, makeAgentTmuxSessionName } from './vm-tmux';
 
 export type SessionHostTarget =
   | { kind: 'tmux'; tmuxTarget: string }
-  | { kind: 'herdr'; paneId: string; tabId: string; workspaceId: string };
+  | { kind: 'herdr'; paneId: string; tabId: string; workspaceId: string; agentName?: string };
 
 export interface SessionHostBackend {
   readonly host: SessionHostTarget['kind'];
@@ -120,7 +120,7 @@ export class HerdrSessionHostBackend implements SessionHostBackend {
       await closeHerdrPane(this.exec, ref.paneId).catch(() => {});
       throw error;
     }
-    return { kind: 'herdr', paneId: ref.paneId, tabId: ref.tabId, workspaceId: ref.workspaceId };
+    return { kind: 'herdr', paneId: ref.paneId, tabId: ref.tabId, workspaceId: ref.workspaceId, agentName: ref.agentName };
   }
 
   async stop(target: SessionHostTarget): Promise<void> {

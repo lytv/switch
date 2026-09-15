@@ -42,9 +42,11 @@ import {
   closeHerdrPane,
   createHerdrPane,
   ensureHerdrProtocol,
-  runHerdrPaneCommand,
-  type HerdrPaneRef,
+  mapProviderToHerdrKind,
   resolveHerdrBin,
+  runHerdrPaneCommand,
+  startHerdrAgent,
+  type HerdrPaneRef,
 } from './herdr-session-host';
 import { scheduleInitialPromptInjection } from './keystroke-injection';
 import { resolveAgentExecutable } from './resolve-agent-executable';
@@ -283,27 +285,46 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
 
       if (this.sessionHost === 'herdr' && !this.herdrTarget) {
         await ensureHerdrProtocol(this.ctx.exec.bind(this.ctx), this.herdr.protocolMin);
+        const herdrAgentName = `sw-${agentCredsSlug(session)}-${this.sessionId.replace(/-/g, '').slice(0, 10)}`;
         this.herdrTarget = await createHerdrPane(this.ctx.exec.bind(this.ctx), this.herdr, {
           cwd: this.sessionPath,
           tabLabel: `switchdash-${this.sessionId}`,
           agentSlug: agentCredsSlug(session),
+          agentName: herdrAgentName,
           roomId: null,
           sessionId: this.sessionId,
+          env: sessionEnv,
         });
-        await runHerdrPaneCommand(
-          this.ctx.exec.bind(this.ctx),
-          this.herdrTarget.paneId,
-          sessionEnv,
-          agentCommand.command,
-          agentCommand.args
-        );
+        const herdrKind = mapProviderToHerdrKind(session.providerId);
+        if (herdrKind) {
+          // Herdr 0.9 owns the binary via --kind; pass only agent args after --.
+          await startHerdrAgent(this.ctx.exec.bind(this.ctx), {
+            paneId: this.herdrTarget.paneId,
+            name: herdrAgentName,
+            kind: herdrKind,
+            args: agentCommand.args,
+          });
+        } else {
+          // Unknown kind: fall back to typing a full command into the pane shell.
+          await runHerdrPaneCommand(
+            this.ctx.exec.bind(this.ctx),
+            this.herdrTarget.paneId,
+            sessionEnv,
+            agentCommand.command,
+            agentCommand.args
+          );
+        }
       }
 
       if (this.sessionHost === 'herdr' && !this.herdrTarget) {
         throw new Error('LocalAgentRuntime: herdr launch target was not created');
       }
+      // Attach by agent *name* (Herdr 0.9). Pane ids are not valid attach targets.
       const command = this.herdrTarget
-        ? { command: resolveHerdrBin(), args: ['agent', 'attach', this.herdrTarget.paneId] }
+        ? {
+            command: resolveHerdrBin(),
+            args: ['agent', 'attach', this.herdrTarget.agentName],
+          }
         : { command: agentCommand.command, args: agentCommand.args };
       const resolved = resolveLocalPtySpawn({
         platform: process.platform,
@@ -485,8 +506,8 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
 
   getHerdrTarget(): SessionHerdrTarget | null {
     if (this.sessionHost !== 'herdr' || !this.herdrTarget) return null;
-    const { workspaceId, tabId, paneId } = this.herdrTarget;
-    return { workspaceId, tabId, paneId };
+    const { workspaceId, tabId, paneId, agentName } = this.herdrTarget;
+    return { workspaceId, tabId, paneId, agentName };
   }
 
   async detach(): Promise<void> {
