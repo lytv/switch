@@ -497,10 +497,16 @@ describe('local agent runtime respawn state', () => {
         return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
       }
       if (args[0] === 'workspace') {
-        return { stdout: JSON.stringify({ workspace_id: 'workspace-1' }), stderr: '' };
-      }
-      if (args[0] === 'tab') {
-        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+        return {
+          stdout: JSON.stringify({
+            result: {
+              workspace: { workspace_id: 'workspace-1' },
+              tab: { tab_id: 'tab-1' },
+              root_pane: { pane_id: 'pane-1', tab_id: 'tab-1', workspace_id: 'workspace-1' },
+            },
+          }),
+          stderr: '',
+        };
       }
       return { stdout: '', stderr: '' };
     });
@@ -511,21 +517,19 @@ describe('local agent runtime respawn state', () => {
     expect(exec).toHaveBeenCalledWith('herdr', [
       'pane',
       'run',
-      '--pane',
       'pane-1',
-      '--',
       expect.stringContaining("exec 'agent'"),
     ]);
     expect(spawnLocalPty).toHaveBeenLastCalledWith(
-      expect.objectContaining({ command: 'sh', args: ['-c', 'herdr pane attach --pane pane-1'] })
+      expect.objectContaining({ command: 'sh', args: ['-c', 'herdr agent attach pane-1'] })
     );
 
     await provider.dehydrate();
     await provider.start(session());
 
-    expect(exec).toHaveBeenCalledTimes(4);
+    expect(exec).toHaveBeenCalledTimes(3); // status + workspace create + pane run; reattach reuses target
     await provider.stop();
-    expect(exec).toHaveBeenLastCalledWith('herdr', ['pane', 'close', '--pane', 'pane-1']);
+    expect(exec).toHaveBeenLastCalledWith('herdr', ['pane', 'close', 'pane-1']);
   });
 
   it('exposes the exact pane ids once a local Herdr pane exists, and null before/without one', async () => {
@@ -536,10 +540,16 @@ describe('local agent runtime respawn state', () => {
         return { stdout: JSON.stringify({ client: { protocol: 14 } }), stderr: '' };
       }
       if (args[0] === 'workspace') {
-        return { stdout: JSON.stringify({ workspace_id: 'workspace-1' }), stderr: '' };
-      }
-      if (args[0] === 'tab') {
-        return { stdout: JSON.stringify({ tab_id: 'tab-1', pane_id: 'pane-1' }), stderr: '' };
+        return {
+          stdout: JSON.stringify({
+            result: {
+              workspace: { workspace_id: 'workspace-1' },
+              tab: { tab_id: 'tab-1' },
+              root_pane: { pane_id: 'pane-1', tab_id: 'tab-1', workspace_id: 'workspace-1' },
+            },
+          }),
+          stderr: '',
+        };
       }
       return { stdout: '', stderr: '' };
     });

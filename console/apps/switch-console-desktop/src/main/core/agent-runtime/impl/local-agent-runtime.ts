@@ -302,7 +302,7 @@ export class LocalAgentRuntime implements AgentRuntimeProvider {
         throw new Error('LocalAgentRuntime: herdr launch target was not created');
       }
       const command = this.herdrTarget
-        ? { command: 'herdr', args: ['pane', 'attach', '--pane', this.herdrTarget.paneId] }
+        ? { command: 'herdr', args: ['agent', 'attach', this.herdrTarget.paneId] }
         : { command: agentCommand.command, args: agentCommand.args };
       const resolved = resolveLocalPtySpawn({
         platform: process.platform,

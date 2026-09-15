@@ -944,7 +944,7 @@ export class SshAgentRuntime implements AgentRuntimeProvider, AttachableRuntime 
         if (!this.herdrTarget) {
           throw new Error('SshAgentRuntime: cannot attach herdr session without a pane id');
         }
-        sshCommand = `herdr pane attach --pane ${quoteShellArg(this.herdrTarget.paneId)}`;
+        sshCommand = `herdr agent attach ${quoteShellArg(this.herdrTarget.paneId)}`;
       } else {
         const profile = await this.proxy.getRemoteShellProfile();
         sshCommand = resolveSshCommand('agent', cfg, paneEnv, profile);

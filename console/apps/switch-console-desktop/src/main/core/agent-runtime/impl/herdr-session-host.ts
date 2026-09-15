@@ -148,39 +148,6 @@ export async function createHerdrPane(
     readId(rootPane, ['pane_id', 'id']) ??
     readId(tabObj, ['pane_id', 'root_pane_id']);
 
-  // Optional second tab when the session wants its own labeled tab inside an
-  // existing flat workspace. Herdr 0.9 uses --label (not --name).
-  if (workspaceId && opts.tabLabel && opts.tabLabel !== wsLabel) {
-    const tab = parseJson(
-      (
-        await exec('herdr', [
-          'tab',
-          'create',
-          '--workspace',
-          workspaceId,
-          '--label',
-          opts.tabLabel,
-          '--cwd',
-          opts.cwd,
-          '--no-focus',
-        ])
-      ).stdout,
-      'herdr tab create'
-    );
-    const tabRoot =
-      tab.root_pane && typeof tab.root_pane === 'object'
-        ? (tab.root_pane as Record<string, unknown>)
-        : {};
-    const tabBody =
-      tab.tab && typeof tab.tab === 'object' ? (tab.tab as Record<string, unknown>) : tab;
-    tabId = readId(tabBody, ['tab_id', 'id']) ?? readId(tabRoot, ['tab_id']) ?? tabId;
-    paneId =
-      readId(tabRoot, ['pane_id', 'id']) ??
-      readId(tabBody, ['pane_id', 'root_pane_id']) ??
-      readId(tab, ['pane_id', 'root_pane_id']) ??
-      paneId;
-  }
-
   if (!workspaceId) throw new Error('herdr workspace create returned no workspace id');
   if (!tabId || !paneId) {
     throw new Error('herdr workspace/tab create returned no tab/pane id');
@@ -200,7 +167,8 @@ export async function runHerdrPaneCommand(
     .join(' ');
   const commandLine = [command, ...args].map(quoteShellArg).join(' ');
   const inner = envPrefix ? `${envPrefix} exec ${commandLine}` : `exec ${commandLine}`;
-  await exec('herdr', ['pane', 'run', '--pane', paneId, '--', inner]);
+  // Herdr 0.9: positional pane id + command (no --pane / --).
+  await exec('herdr', ['pane', 'run', paneId, inner]);
 }
 
 export async function isHerdrPaneLive(exec: HerdrExec, paneId: string): Promise<boolean> {
@@ -227,7 +195,7 @@ export async function isHerdrPaneLive(exec: HerdrExec, paneId: string): Promise<
 
 export async function closeHerdrPane(exec: HerdrExec, paneId: string): Promise<void> {
   try {
-    await exec('herdr', ['pane', 'close', '--pane', paneId]);
+    await exec('herdr', ['pane', 'close', paneId]);
   } catch (error) {
     const detail = String(error);
     if (hasNotFound(detail, 'pane')) return;
