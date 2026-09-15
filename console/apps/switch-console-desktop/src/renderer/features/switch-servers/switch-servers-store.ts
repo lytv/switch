@@ -9,6 +9,7 @@ import type {
   SwitchServer,
   UpdateServerResult,
 } from '@shared/core/switch-servers/switch-servers';
+import { serverAgentsStore } from './server-agents-store';
 
 /**
  * Renderer store for the Switch-server integration. Holds the registered
@@ -234,6 +235,7 @@ export class SwitchServersStore {
         this.statuses.set(serverId, status);
         this.statusUnreachable.delete(serverId);
       });
+      if (status.connected) void serverAgentsStore.refresh(serverId);
     } catch (cause) {
       // An unreachable server is a real, displayable state — record it as
       // disconnected (the per-server status dot shows it) and flag the server
