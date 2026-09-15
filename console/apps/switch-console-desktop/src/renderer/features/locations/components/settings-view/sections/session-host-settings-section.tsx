@@ -1,4 +1,5 @@
 import { observer } from 'mobx-react-lite';
+import { useState } from 'react';
 import { InfoTooltip } from '@renderer/features/settings/components/InfoTooltip';
 import {
   asMounted,
@@ -67,11 +68,28 @@ export const SessionHostSettingsSection = observer(function SessionHostSettingsS
   const resolved = resolveSessionHostForTransport(transportKind, settings);
   const sessionHost = settings.sessionHost ?? resolved.host;
 
+  const [pendingHost, setPendingHost] = useState<SessionHost | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const displayedHost = pendingHost ?? sessionHost;
+
   const save = (patch: SessionHostSettingsPatch) => {
+    if (patch.sessionHost) setPendingHost(patch.sessionHost);
+    setSaveError(null);
     void store.save(withSessionHostPatch(settings, patch)).then((result) => {
       if (!result.success) {
+        setPendingHost(null);
+        const message =
+          result.error.type === 'invalid-settings'
+            ? 'Could not save session host (invalid settings).'
+            : result.error.type === 'location-not-found'
+              ? 'Location not found.'
+              : 'Could not save session host.';
+        setSaveError(message);
         log.error('Failed to save session host settings', { locationId, error: result.error });
+        return;
       }
+      setPendingHost(null);
+      setSaveError(null);
     });
   };
 
@@ -90,23 +108,37 @@ export const SessionHostSettingsSection = observer(function SessionHostSettingsS
         Effective right now: <span className="font-mono">{resolved.host}</span>
         {!settings.sessionHost && ` (this location's default for a ${sshHost ? 'remote' : 'local'} host)`}
       </FieldDescription>
-      <Select
-        value={sessionHost}
-        onValueChange={(next) => save({ sessionHost: next as SessionHost })}
-      >
-        <SelectTrigger className="w-[200px] shrink-0 gap-2">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {(Object.keys(SESSION_HOST_LABEL) as SessionHost[]).map((host) => (
-            <SelectItem key={host} value={host}>
+      {/* Buttons instead of Select: Base UI select was easy to mis-click / look
+          stuck on tmux when the popup aligned poorly. One click = one host. */}
+      <div className="flex flex-wrap gap-2" role="group" aria-label="Session host">
+        {(Object.keys(SESSION_HOST_LABEL) as SessionHost[]).map((host) => {
+          const selected = displayedHost === host;
+          return (
+            <button
+              key={host}
+              type="button"
+              aria-pressed={selected}
+              disabled={pendingHost !== null && pendingHost !== host}
+              onClick={() => {
+                if (host === sessionHost && pendingHost === null) return;
+                save({ sessionHost: host });
+              }}
+              className={
+                selected
+                  ? 'rounded-md border border-ring bg-background-1 px-3 py-1.5 text-sm font-medium text-foreground'
+                  : 'rounded-md border border-border bg-transparent px-3 py-1.5 text-sm text-foreground-muted hover:border-border-1 hover:bg-background-1 hover:text-foreground'
+              }
+            >
               {SESSION_HOST_LABEL[host]}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+            </button>
+          );
+        })}
+      </div>
+      {saveError && (
+        <FieldDescription className="text-destructive">{saveError}</FieldDescription>
+      )}
 
-      {sessionHost === 'herdr' && (
+      {displayedHost === 'herdr' && (
         <div className="flex flex-col gap-4 rounded-md border border-border p-3">
           <FieldDescription className="text-foreground-muted">
             Requires <span className="font-mono">herdr</span> on{' '}
