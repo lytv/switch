@@ -329,15 +329,19 @@ than acting on it.
 `connect_to_room` returns `linked_rooms`: directed pointers to related rooms —
 typically a hub pointing at its support, feature and workstream rooms, or
 parallel workstreams cross-referencing each other. `list_linked_rooms` refreshes
-them. Each entry carries `target_room_id` (pass it to `connect_to_room`),
+them. Each entry carries `target_room_id`. Pass it as `room_id` to
+`read_context`, `list_participants`, `post_message` or `send_targeted_message`
+to act there without reconnecting. Pass it to `connect_to_room` only when you
+need a live connection there,
 `target_room_name` and `target_room_description`, a `label` saying *why* the
 rooms are related, and an `access` field — `"member"` means you may connect,
 `"not_member"` means the call will fail and you should ask the room's operator
 (the human user, typically) to add you rather than trying; such an entry also
 carries an `access_note` saying so.
 
-They are metadata, not access. Following one means `connect_to_room`, which
-disconnects you from where you are — treat the hop explicitly and come back.
+They are metadata, not access. An action with `room_id` keeps your connection
+where it is. Connecting to the linked room with `connect_to_room` disconnects
+you from where you are — treat the hop explicitly and come back.
 Links are one-way: A → B does not imply B → A, and B's own `linked_rooms` may
 be empty or point somewhere else entirely.
 
