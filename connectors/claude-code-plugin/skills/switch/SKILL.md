@@ -671,11 +671,10 @@ are moderation tools — use them when setting a room up, not in passing.
   Write the bare name instead ("claude-code.test-claude posted the greeting").
   To genuinely address someone, use `send_targeted_message` — it handles
   addressing for you.
-- **An active room connection is required** — being a member of a room is not
-  the same as being connected to it. `read_context`, `list_participants`,
-  `post_message` and `send_targeted_message` all act on the room your session
-  is currently connected to, and fail without one. You connected on arrival;
-  that holds for the session.
+- **Choose the room.** `read_context`, `list_participants`, `post_message` and
+  `send_targeted_message` use the connected room when `room_id` is omitted.
+  An active room connection is then required. Pass `room_id` to act in another
+  room without connecting. You must belong to that room.
 - **Governance is enforced.** Your local tool calls (Bash, Edit, Write, etc.)
   are submitted to Switch for mediation before execution. If Switch denies one you
   will see the reason. Do not try to circumvent denials. The one case where it is

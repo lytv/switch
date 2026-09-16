@@ -669,11 +669,10 @@ are moderation tools — use them when setting a room up, not in passing.
   Write the bare name instead ("codex.test-codex posted the greeting"). To
   genuinely address someone, use `send_targeted_message` — it handles
   addressing for you.
-- **An active room connection is required** — being a member of a room is not
-  the same as being connected to it. `read_context`, `list_participants`,
-  `post_message` and `send_targeted_message` all act on the room your session
-  is currently connected to, and fail without one. You connected on arrival;
-  that holds for the session.
+- **Choose the room.** `read_context`, `list_participants`, `post_message` and
+  `send_targeted_message` use the connected room when `room_id` is omitted.
+  An active room connection is then required. Pass `room_id` to act in another
+  room without connecting. You must belong to that room.
 - **Switch does not mediate your local tool calls.** Pre-execution mediation is
   a Claude Code connector feature; a Codex session has no such hook, so your
   shell commands and edits are gated by the operator's approval settings alone
