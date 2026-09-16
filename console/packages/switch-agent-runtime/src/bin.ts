@@ -583,7 +583,7 @@ const mcp = new Server(
       'When you receive task_accept, task_update, or task_finalise events for tasks you delegated, review the progress/outcome and continue your work accordingly.',
       'When you receive a task_cancel event, the task is dead — do not finalise it.',
       '',
-      'read_context, list_participants, post_message and send_targeted_message use the connected room when room_id is omitted. Pass room_id to act in any room you are a member of without connecting to it. The task tools always use the connected room, so connect_to_room comes first for them. That connection then holds for the rest of the session: do not reconnect before each call. Call connect_to_room again only to switch rooms, to return after switching, or when a tool fails saying you are not connected.',
+      'read_context, list_participants, post_message and send_targeted_message use the connected room when room_id is omitted. Pass room_id to act in any room you are a member of without connecting to it. accept_task, update_task, finalise_task and cancel_task act on their task_id but need any active room connection. list_tasks uses the connected room. That connection then holds for the rest of the session: do not reconnect before each call. Call connect_to_room again only to switch rooms, to return after switching, or when a tool fails saying you are not connected.',
       "A room_id action does not move you, and read_context does not clear the other room's unread count. Acting in a room you are not a member of is refused.",
     ].join('\n'),
   }
