@@ -7,14 +7,21 @@ adds an operation and these fail, that is the point.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from switch_core.bridges.agent.api.operations import (
     BadArgumentsError,
     UnknownOperationError,
     call_operation,
     list_operations,
+    router,
 )
+from switch_core.bridges.agent.auth import get_agent_from_scope
+from switch_core.bridges.agent.dependencies import get_protocol
 from switch_core.bridges.agent.mcp import server as mcp_server
 from switch_core.bridges.agent.operations import context as op_context
 from switch_core.bridges.agent.operations import get_operation
@@ -26,6 +33,48 @@ from switch_core.bridges.agent.operations.callctx import (
 )
 
 AGENT = "agent-1"
+ROOM = "room-1"
+
+
+class _RoomProtocol:
+    def __init__(self, members: set[str]) -> None:
+        self.members = members
+        self.calls: list[tuple[str, str]] = []
+
+    async def require_room_member(self, agent_id: str, room_id: str) -> None:
+        if room_id not in self.members:
+            raise PermissionError("Agent is not a member of this room")
+        self.calls.append((agent_id, room_id))
+
+    async def list_participants(self, room_id: str) -> list[object]:
+        return []
+
+    async def send_message(
+        self, agent_id: str, room_id: str, body: str, **kwargs: object
+    ) -> str:
+        return "event-1"
+
+    async def send_targeted_message(
+        self,
+        agent_id: str,
+        room_id: str,
+        target_names: list[str],
+        body: str,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(event_id="event-1", target_statuses={})
+
+
+def _ops_client(
+    monkeypatch: pytest.MonkeyPatch, members: set[str]
+) -> tuple[TestClient, _RoomProtocol]:
+    protocol = _RoomProtocol(members)
+    monkeypatch.setattr(op_context, "_protocol", protocol)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_agent_from_scope] = lambda: SimpleNamespace(id=AGENT)
+    app.dependency_overrides[get_protocol] = lambda: protocol
+    return TestClient(app), protocol
 
 
 async def _tool_names() -> set[str]:
@@ -170,3 +219,81 @@ def test_the_registry_refuses_duplicate_operation_names() -> None:
     assert existing is not None
     with pytest.raises(RuntimeError):
         registry.operation(existing.fn)
+
+
+@pytest.mark.parametrize(
+    ("operation", "body", "expected"),
+    [
+        ("post_message", {"body": "hello", "room_id": ROOM}, {"event_id": "event-1"}),
+        (
+            "send_targeted_message",
+            {"body": "hello", "target_names": ["bob"], "room_id": ROOM},
+            {"event_id": "event-1", "target_statuses": {}},
+        ),
+        ("list_participants", {"room_id": ROOM}, []),
+    ],
+)
+def test_http_ops_accepts_an_explicit_member_room_without_a_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    body: dict[str, object],
+    expected: object,
+) -> None:
+    client, protocol = _ops_client(monkeypatch, {ROOM})
+
+    response = client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+
+    assert response.status_code == 200
+    assert response.json() == {"result": expected}
+    assert protocol.calls == [(AGENT, ROOM)]
+
+
+@pytest.mark.parametrize(
+    ("operation", "body"),
+    [
+        ("post_message", {"body": "hello", "room_id": ROOM}),
+        (
+            "send_targeted_message",
+            {"body": "hello", "target_names": ["bob"], "room_id": ROOM},
+        ),
+        ("list_participants", {"room_id": ROOM}),
+    ],
+)
+def test_http_ops_refuses_a_room_the_agent_does_not_belong_to(
+    monkeypatch: pytest.MonkeyPatch, operation: str, body: dict[str, object]
+) -> None:
+    client, protocol = _ops_client(monkeypatch, set())
+
+    response = client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+
+    assert response.status_code == 403
+    assert protocol.calls == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "body"),
+    [
+        ("post_message", {"body": "hello"}),
+        ("send_targeted_message", {"body": "hello", "target_names": ["bob"]}),
+        ("list_participants", {}),
+    ],
+)
+def test_http_ops_without_room_id_still_requires_a_connection(
+    monkeypatch: pytest.MonkeyPatch, operation: str, body: dict[str, object]
+) -> None:
+    client, protocol = _ops_client(monkeypatch, {ROOM})
+
+    response = client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+
+    assert response.status_code == 400
+    assert "Not connected to a room" in response.json()["detail"]
+    assert protocol.calls == []
+
+
+def test_messaging_operations_advertise_an_optional_room_id() -> None:
+    operations = list_operations()
+
+    for name in ("post_message", "send_targeted_message", "list_participants"):
+        schema = operations[name]["input_schema"]
+        assert {"type": "string"} in schema["properties"]["room_id"]["anyOf"]
+        assert "room_id" not in schema.get("required", [])

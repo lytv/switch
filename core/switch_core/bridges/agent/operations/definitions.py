@@ -584,21 +584,24 @@ async def read_context(
 
 
 @operation
-async def list_participants() -> list[dict[str, Any]]:
-    """List agents and users in the connected room.
+async def list_participants(room_id: str | None = None) -> list[dict[str, Any]]:
+    """List agents and users in a room.
 
     Args:
-        (none) — operates on the session's currently connected room. Call
-        connect_to_room first.
+        room_id: Which room to inspect. Omit it to inspect the session's
+            connected room. Pass a room id to inspect another room you belong
+            to without connecting to it.
 
     Returns:
         List of {id, name, type, status, alias} dicts for each participant.
         `status` and `alias` are null when unset.
     """
-    get_agent_id()
-    room_id = await require_connected_room()
+    agent_id = get_agent_id()
+    if room_id is None:
+        room_id = await require_connected_room()
 
     protocol = get_protocol()
+    await protocol.require_room_member(agent_id, room_id)
     participants = await protocol.list_participants(room_id)
 
     return [
@@ -614,28 +617,33 @@ async def list_participants() -> list[dict[str, Any]]:
 
 
 @operation
-async def post_message(body: str, thread_id: str | None = None) -> dict[str, str]:
-    """Send a message to the connected room (broadcast, no specific recipient).
+async def post_message(
+    body: str, thread_id: str | None = None, room_id: str | None = None
+) -> dict[str, str]:
+    """Send a message to a room (broadcast, no specific recipient).
 
     Args:
         body: The message text to send. Plain string — do not wrap in JSON or
             prefix with `@name` (use send_targeted_message for addressed
-            messages). The room is implicit: messages go to the room this
-            session is currently connected to via connect_to_room, so there
-            is no `room_id` parameter.
+            messages).
         thread_id: Optional. The `id` of a message to reply into, making this a
             threaded reply. Pass any message id from the thread (a root or a
             reply) — it is normalised to the thread root. Omit for a top-level
             message. Get ids from read_context or from a notification's
             thread_id.
+        room_id: Which room receives the message. Omit it to use the session's
+            connected room. Pass a room id to send without a connection. You
+            must belong to the room.
 
     Returns:
         {"event_id": "<matrix event id>"} for the posted message.
     """
     agent_id = get_agent_id()
-    room_id = await require_connected_room()
+    if room_id is None:
+        room_id = await require_connected_room()
 
     protocol = get_protocol()
+    await protocol.require_room_member(agent_id, room_id)
     event_id = await protocol.send_message(agent_id, room_id, body, thread_id=thread_id)
     return {"event_id": event_id}
 
@@ -646,6 +654,7 @@ async def send_targeted_message(
     target_names: list[str] | None = None,
     target_roles: list[str] | None = None,
     thread_id: str | None = None,
+    room_id: str | None = None,
 ) -> dict[str, Any]:
     """Send a message addressed to specific agents/users and/or roles.
 
@@ -668,6 +677,9 @@ async def send_targeted_message(
         thread_id: Optional. The `id` of a message to reply into, making this a
             threaded reply. Pass any message id from the thread — it is
             normalised to the thread root. Omit for a top-level message.
+        room_id: Which room receives the message. Omit it to use the session's
+            connected room. Pass a room id to send without a connection. You
+            must belong to the room.
 
     At least one of target_names / target_roles is required.
 
@@ -688,9 +700,11 @@ async def send_targeted_message(
         another way is a matter for whoever owns it, not for a retry.
     """
     agent_id = get_agent_id()
-    room_id = await require_connected_room()
+    if room_id is None:
+        room_id = await require_connected_room()
 
     protocol = get_protocol()
+    await protocol.require_room_member(agent_id, room_id)
     result = await protocol.send_targeted_message(
         agent_id,
         room_id,
