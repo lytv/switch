@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator
-from typing import Any
 
 import pytest
 
@@ -89,7 +88,9 @@ async def test_room_id_messaging_keeps_the_callers_connected_room(
         participants = await list_participants(room_id=other.room.id)
         broadcast = await post_message("cross-room broadcast", room_id=other.room.id)
         targeted = await send_targeted_message(
-            "cross-room targeted", target_names=["e2e-room-id-bob"], room_id=other.room.id
+            "cross-room targeted",
+            target_names=["e2e-room-id-bob"],
+            room_id=other.room.id,
         )
         rooms = await list_rooms()
 
@@ -97,7 +98,9 @@ async def test_room_id_messaging_keeps_the_callers_connected_room(
     assert broadcast["event_id"]
     assert targeted["event_id"]
     assert next(room for room in rooms if room["room_id"] == home.room.id)["connected"]
-    assert not next(room for room in rooms if room["room_id"] == other.room.id)["connected"]
+    assert not next(room for room in rooms if room["room_id"] == other.room.id)[
+        "connected"
+    ]
 
     messages = await _wait_for_bodies(
         harness,
@@ -130,5 +133,7 @@ async def test_room_id_messaging_refuses_an_unassigned_room(harness: Harness) ->
             await post_message("must not send", room_id=private.room.id)
         with pytest.raises(PermissionError):
             await send_targeted_message(
-                "must not send", target_names=["e2e-room-id-stranger"], room_id=private.room.id
+                "must not send",
+                target_names=["e2e-room-id-stranger"],
+                room_id=private.room.id,
             )
