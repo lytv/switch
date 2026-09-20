@@ -52,6 +52,7 @@ export interface AgentSummary {
   parent_agent_id: string | null;
   known_agent_type: string | null;
   known_agent_options: Record<string, unknown> | null;
+  can_create_agents: boolean;
 }
 
 export interface AgentToolSummary {
@@ -564,6 +565,17 @@ export async function updateAgentAddressingPolicy(
     `/agents/${agentId}/addressing-policy`,
     "PUT",
     { policy },
+  );
+}
+
+export async function updateAgentCreatePermission(
+  agentId: string,
+  canCreateAgents: boolean,
+): Promise<AgentDetail> {
+  return jsonRequest<AgentDetail>(
+    `/agents/${agentId}/create-permission`,
+    "PUT",
+    { can_create_agents: canCreateAgents },
   );
 }
 

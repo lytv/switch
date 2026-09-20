@@ -111,3 +111,36 @@ class TestDeleteAgentWithTasks:
             )
             assert remaining.scalars().first() is None
             assert await verify.get(Agent, performer_id) is not None
+
+
+class TestCanCreateAgentsColumn:
+    """The per-agent create permission defaults off and round-trips."""
+
+    async def test_new_agents_default_to_cannot_create(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            agent = await _make_agent(session, "plain")
+            await session.commit()
+
+        async with session_factory() as verify:
+            stored = await verify.get(Agent, agent.id)
+            assert stored is not None
+            assert stored.can_create_agents is False
+
+    async def test_flag_flips_and_persists(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        store = AgentStore()
+        async with session_factory() as session:
+            agent = await _make_agent(session, "flagged")
+            await session.commit()
+            agent_id = agent.id
+
+            await store.update(session, agent_id, can_create_agents=True)
+            await session.commit()
+
+        async with session_factory() as verify:
+            stored = await verify.get(Agent, agent_id)
+            assert stored is not None
+            assert stored.can_create_agents is True

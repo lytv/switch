@@ -98,7 +98,6 @@ from switch_core.db.models import Agent, Task
 from switch_core.db.stores.api_key_store import ApiKeyStore
 from switch_core.db.stores.feature_flag_store import FeatureFlagStore
 from switch_core.feature_flags import is_known_flag
-from switch_core.gateway.known_agents import KNOWN_AGENTS
 from switch_core.version import switch_core_version
 
 logger = logging.getLogger(__name__)
@@ -211,45 +210,26 @@ async def _register_known(
     Returns ``(agent_id, api_key)``. Shared by the single and bulk
     register-known endpoints.
     """
-    spec = KNOWN_AGENTS.get(agent_type)
-    if spec is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown agent type: {agent_type}",
-        )
-
     try:
-        options = spec.parse_options(options_raw)
-    except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=exc.errors()) from exc
-
-    integration_profile = spec.build_profile(options)
-    metadata = {
-        "known_agent_type": agent_type,
-        "known_agent_options": options.model_dump(),
-    }
-
-    try:
-        result = await protocol.register_agent(
+        result = await protocol.register_known_agent(
+            agent_type=agent_type,
             name=name,
             description=description,
             icon_url=icon_url,
             display_name=display_name,
-            connector_type=spec.connector_type,
-            integration_profile=integration_profile,
-            tools=spec.tools,
-            models=spec.models,
-            metadata=metadata,
-            owner_id=owner_id,
+            options_raw=options_raw,
             parent_agent_id=parent_agent_id,
             overwrite=overwrite,
+            owner_id=owner_id,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=exc.errors()) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except AgentExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return result.agent_id, result.api_key
 

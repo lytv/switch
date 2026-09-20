@@ -89,6 +89,7 @@ from switch_core.events import (
 from switch_core.events import (
     ToolCallReport as MatrixToolCallReport,
 )
+from switch_core.gateway.known_agents import KNOWN_AGENTS
 from switch_core.messages.recorded_types import MEMBERSHIP_EVENT_TYPE
 from switch_core.transport import (
     TransportError,
@@ -490,6 +491,103 @@ class ProtocolService:
             overwrite=overwrite,
             addressable_by_agent_ids=addressable_by_agent_ids,
             owner_only=owner_only,
+        )
+
+    async def register_known_agent(
+        self,
+        *,
+        agent_type: str,
+        name: str,
+        description: str,
+        icon_url: str | None,
+        display_name: str | None,
+        options_raw: dict[str, Any],
+        parent_agent_id: str | None,
+        overwrite: bool,
+        owner_id: str,
+    ) -> RegistrationResult:
+        """Register one agent of a known connector type.
+
+        The domain logic behind both ``POST /agents/register-known`` doors
+        (single and bulk): validate the type, parse and validate its options,
+        build the integration profile, and register. Raises plain domain
+        exceptions — ValueError for an unknown type, pydantic ValidationError
+        for options that fail the type's schema, AgentExistsError on a name
+        clash without ``overwrite`` — leaving HTTP translation to the caller.
+        """
+        spec = KNOWN_AGENTS.get(agent_type)
+        if spec is None:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+
+        options = spec.parse_options(options_raw)
+        integration_profile = spec.build_profile(options)
+        metadata = {
+            "known_agent_type": agent_type,
+            "known_agent_options": options.model_dump(),
+        }
+
+        return await self.register_agent(
+            name=name,
+            description=description,
+            icon_url=icon_url,
+            display_name=display_name,
+            connector_type=spec.connector_type,
+            integration_profile=integration_profile,
+            tools=spec.tools,
+            models=spec.models,
+            metadata=metadata,
+            owner_id=owner_id,
+            parent_agent_id=parent_agent_id,
+            overwrite=overwrite,
+        )
+
+    async def create_agent_as(
+        self,
+        caller_agent_id: str,
+        *,
+        agent_type: str,
+        name: str,
+        description: str,
+        options_raw: dict[str, Any] | None = None,
+        icon_url: str | None = None,
+        display_name: str | None = None,
+    ) -> RegistrationResult:
+        """Create a known-type agent on behalf of a flagged calling agent.
+
+        The caller is re-fetched fresh from the database inside its own
+        session — never trusted from a cached object — so flipping the
+        permission off takes effect on the very next call. Raises ValueError
+        if the calling agent is missing, PermissionError if it has not been
+        granted ``can_create_agents`` by its owner (or an admin).
+
+        The new agent is owned by the caller's own owner and starts
+        owner-only. Overwrite is intentionally unavailable here: a flagged
+        agent creates new agents, it never rotates a sibling's live key.
+        """
+        async with self.session_factory() as session:
+            caller = await self.agent_store.get(session, caller_agent_id)
+            if caller is None:
+                raise ValueError(f"Agent not found: {caller_agent_id}")
+            if not caller.can_create_agents:
+                raise PermissionError(
+                    "This agent has not been granted permission to create agents."
+                )
+            if caller.owner_id is None:
+                raise PermissionError(
+                    "This agent has no owner to attribute a new agent to."
+                )
+            owner_id = caller.owner_id
+
+        return await self.register_known_agent(
+            agent_type=agent_type,
+            name=name,
+            description=description,
+            icon_url=icon_url,
+            display_name=display_name,
+            options_raw=options_raw or {},
+            parent_agent_id=None,
+            overwrite=False,
+            owner_id=owner_id,
         )
 
     async def _create_agent(

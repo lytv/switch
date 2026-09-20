@@ -83,6 +83,7 @@ async def build_agent_summary(
             if isinstance(agent.addressing_policy, dict)
             else None
         ),
+        can_create_agents=agent.can_create_agents,
     )
 
 

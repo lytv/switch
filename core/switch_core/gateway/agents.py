@@ -46,6 +46,7 @@ from switch_core.gateway.schemas import (
     RegisterKnownSubagentsResponse,
     RegisterOtherAgentRequest,
     UpdateAddressingPolicyRequest,
+    UpdateAgentCreatePermissionRequest,
     UpdateAgentDisplayNameRequest,
     UpdateAgentIconRequest,
     UpdateAgentOptionsRequest,
@@ -439,6 +440,48 @@ async def update_agent_display_name(
     logger.info(
         "%s agent %s display name by user %s",
         "Cleared" if display_name is None else "Set",
+        agent.name,
+        user.name,
+    )
+
+    owner_name = user.name if agent.owner_id == user.id else None
+    return await build_agent_summary(session, agent_store, agent, owner_name)
+
+
+@router.put("/{agent_id}/create-permission")
+async def update_agent_create_permission(
+    agent_id: str,
+    req: UpdateAgentCreatePermissionRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> AgentSummary:
+    """Grant or revoke an agent's permission to create other agents.
+
+    ``can_create_agents: true`` lets this agent create new agents via the
+    ``create_agent`` operation, owned by its own owner. Only the agent's owner
+    (or an admin) may flip it — the same rule as the icon and display-name
+    routes.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(Principal(user.id, user.role == "admin"), agent.owner_id)
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can change this permission.",
+        )
+
+    await agent_store.update(session, agent_id, can_create_agents=req.can_create_agents)
+    await session.commit()
+    await session.refresh(agent)
+
+    logger.info(
+        "%s agent %s create permission by user %s",
+        "Granted" if req.can_create_agents else "Revoked",
         agent.name,
         user.name,
     )

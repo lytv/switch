@@ -28,6 +28,7 @@ import {
   titleCase,
 } from "../../theme/hootFormat";
 import AddressingPolicySection from "./AddressingPolicySection";
+import CreatePermissionSection from "./CreatePermissionSection";
 import { extractDefaults, renderOptionFields } from "./optionFields";
 
 // Presence of an agent within a room — mirrors the room detail page so the two
@@ -127,6 +128,12 @@ export default function AgentDetailPage() {
         )}
         <Divider />
         <AddressingPolicySection
+          agent={agent}
+          canEdit={isOwner}
+          onUpdated={refetch}
+        />
+        <Divider />
+        <CreatePermissionSection
           agent={agent}
           canEdit={isOwner}
           onUpdated={refetch}
