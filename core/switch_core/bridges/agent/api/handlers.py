@@ -222,10 +222,10 @@ async def _register_known(
             overwrite=overwrite,
             owner_id=owner_id,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=exc.errors()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except AgentExistsError as exc:

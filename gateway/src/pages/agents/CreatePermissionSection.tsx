@@ -7,7 +7,7 @@ import {
   Switch,
   Typography,
 } from "@mui/material";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { type AgentDetail, updateAgentCreatePermission } from "../../data/api";
 
 export default function CreatePermissionSection({
@@ -22,6 +22,11 @@ export default function CreatePermissionSection({
   const [granted, setGranted] = useState(agent.can_create_agents);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setGranted(agent.can_create_agents);
+    setError(null);
+  }, [agent.can_create_agents]);
 
   const dirty = granted !== agent.can_create_agents;
 
