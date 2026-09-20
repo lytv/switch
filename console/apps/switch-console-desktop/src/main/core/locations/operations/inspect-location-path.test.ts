@@ -70,7 +70,7 @@ async function writeLaunchSpec(dir: string, name: string, providerId: string): P
   );
 }
 
-describe('inspectLocationPath provider inference', () => {
+describe('inspectLocationPath provider inference (unit, on-disk signals only)', () => {
   let dir: string;
 
   beforeEach(async () => {
@@ -82,7 +82,7 @@ describe('inspectLocationPath provider inference', () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('returns the launch-spec provider for a dropped Codex agent', async () => {
+  it('infers codex from a launch spec on disk', async () => {
     await writeStoreEntry(dir, 'codex-hoot', 'sw-codex');
     await writeLaunchSpec(dir, 'codex-hoot', 'codex');
 
@@ -93,7 +93,7 @@ describe('inspectLocationPath provider inference', () => {
     });
   });
 
-  it('returns the launch-spec provider for a dropped OpenCode agent', async () => {
+  it('infers opencode from a launch spec on disk', async () => {
     await writeStoreEntry(dir, 'open-hoot', 'sw-open');
     await writeLaunchSpec(dir, 'open-hoot', 'opencode');
 

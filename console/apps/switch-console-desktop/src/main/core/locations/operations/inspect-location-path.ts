@@ -30,7 +30,7 @@ export async function inspectLocationPath(
 }
 
 /**
- * Best-effort provider for a dropped folder. Uses the same launch-spec then
+ * Best-effort provider for a local directory. Uses the same launch-spec then
  * definition scan as configured-agent discovery. Returns null when the
  * directory does not name exactly one credential file, or when neither signal
  * names a provider - callers fall back to `'claude'`.

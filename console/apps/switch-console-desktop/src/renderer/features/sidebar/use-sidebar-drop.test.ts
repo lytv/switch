@@ -76,7 +76,7 @@ function inspection(overrides: Partial<LocationPathInspection> = {}): LocationPa
   };
 }
 
-describe('useSidebarDrop provider id', () => {
+describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked IPC)', () => {
   let dom: JSDOM;
   let root: Root;
   let container: HTMLDivElement;
@@ -114,7 +114,7 @@ describe('useSidebarDrop provider id', () => {
     dom.window.close();
   });
 
-  async function dropFolder(): Promise<void> {
+  async function callOnDrop(): Promise<void> {
     await act(async () => {
       root.render(React.createElement(Probe));
     });
@@ -127,10 +127,10 @@ describe('useSidebarDrop provider id', () => {
     });
   }
 
-  it('registers a dropped Codex folder with the inferred provider, not claude', async () => {
+  it('passes an inferred codex providerId through to createAgent', async () => {
     mocks.inspectLocationPath.mockResolvedValue(inspection({ providerId: 'codex' }));
 
-    await dropFolder();
+    await callOnDrop();
 
     expect(mocks.createAgent).toHaveBeenCalledWith({
       mode: 'pick',
@@ -141,7 +141,7 @@ describe('useSidebarDrop provider id', () => {
     });
   });
 
-  it('registers a dropped OpenCode folder with the inferred provider', async () => {
+  it('passes an inferred opencode providerId through to createAgent', async () => {
     mocks.getDraggedFilePaths.mockReturnValue(['/tmp/open-hoot']);
     mocks.inspectLocationPath.mockResolvedValue(
       inspection({
@@ -154,17 +154,17 @@ describe('useSidebarDrop provider id', () => {
       })
     );
 
-    await dropFolder();
+    await callOnDrop();
 
     expect(mocks.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/tmp/open-hoot', providerId: 'opencode' })
     );
   });
 
-  it('falls back to claude when inspect finds a Switch agent but no provider', async () => {
+  it('uses claude only when inspect.providerId is null', async () => {
     mocks.inspectLocationPath.mockResolvedValue(inspection({ providerId: null }));
 
-    await dropFolder();
+    await callOnDrop();
 
     expect(mocks.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ providerId: 'claude' })
