@@ -26,7 +26,7 @@ export default function CreatePermissionSection({
   useEffect(() => {
     setGranted(agent.can_create_agents);
     setError(null);
-  }, [agent.can_create_agents]);
+  }, [agent.id, agent.can_create_agents]);
 
   const dirty = granted !== agent.can_create_agents;
 
