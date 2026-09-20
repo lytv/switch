@@ -1,23 +1,27 @@
-import { JSDOM } from 'jsdom';
-import React, { act } from 'react';
+/**
+ * Sidebar folder-drop provider id.
+ *
+ * inspectLocationPath's inference is unit-tested in Node. This file checks the
+ * renderer mapping: the real drop hook, a simulated Files drop, and the
+ * providerId handed to createAgent. It uses the browser (Playwright/Chromium)
+ * project already used by sibling renderer tests, not a live Electron app.
+ */
+import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useSidebarDrop } from '@renderer/features/sidebar/use-sidebar-drop';
 import type { LocationPathInspection } from '@shared/core/locations/locations';
-
-(
-  globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
-).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mocks = vi.hoisted(() => ({
   inspectLocationPath: vi.fn(),
   createAgent: vi.fn(),
   toast: vi.fn(),
   navigate: vi.fn(),
-  getDraggedFilePaths: vi.fn(),
   activeServerId: 'server-1' as string | null,
 }));
 
 vi.mock('@renderer/lib/ipc', () => ({
+  events: { on: vi.fn() },
   rpc: {
     locations: { inspectLocationPath: mocks.inspectLocationPath },
   },
@@ -43,24 +47,34 @@ vi.mock('@renderer/lib/hooks/use-toast', () => ({
   useToast: () => ({ toast: mocks.toast }),
 }));
 
-vi.mock('@renderer/lib/drag-files', () => ({
-  hasDraggedFiles: () => true,
-  getDraggedFilePaths: mocks.getDraggedFilePaths,
-}));
-
 vi.mock('@renderer/utils/logger', () => ({
   log: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
 }));
 
-const { useSidebarDrop } = await import('./use-sidebar-drop');
+let container: HTMLDivElement | null = null;
+let root: Root | null = null;
 
-type SidebarDrop = ReturnType<typeof useSidebarDrop>;
+function DropSurface() {
+  const { onDrop, onDragOver, onDragEnter, onDragLeave } = useSidebarDrop();
+  return (
+    <div
+      data-testid="drop-surface"
+      onDrop={onDrop}
+      onDragOver={onDragOver}
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+    />
+  );
+}
 
-function dropEvent(): React.DragEvent {
-  return {
-    preventDefault: vi.fn(),
-    dataTransfer: { files: [] },
-  } as unknown as React.DragEvent;
+async function renderSurface(): Promise<HTMLDivElement> {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+  await act(async () => {
+    root!.render(<DropSurface />);
+  });
+  return container;
 }
 
 function inspection(overrides: Partial<LocationPathInspection> = {}): LocationPathInspection {
@@ -76,50 +90,43 @@ function inspection(overrides: Partial<LocationPathInspection> = {}): LocationPa
   };
 }
 
-describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked IPC)', () => {
-  let dom: JSDOM;
-  let root: Root;
-  let container: HTMLDivElement;
-  let latest: SidebarDrop | null;
-
-  function Probe() {
-    latest = useSidebarDrop();
-    return null;
+function dropFiles(surface: HTMLElement, paths: string[]): void {
+  const dt = new DataTransfer();
+  for (const filePath of paths) {
+    const name = filePath.split('/').pop() ?? filePath;
+    dt.items.add(new File([''], name));
   }
+  surface.dispatchEvent(
+    new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt })
+  );
+}
 
+describe('sidebar drop maps inspect.providerId onto createAgent', () => {
   beforeEach(() => {
-    latest = null;
     mocks.activeServerId = 'server-1';
     mocks.inspectLocationPath.mockReset();
     mocks.createAgent.mockReset();
     mocks.toast.mockReset();
     mocks.navigate.mockReset();
-    mocks.getDraggedFilePaths.mockReset();
     mocks.createAgent.mockResolvedValue('loc-1');
-    mocks.getDraggedFilePaths.mockReturnValue(['/tmp/agent']);
-
-    dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>');
-    vi.stubGlobal('window', dom.window);
-    vi.stubGlobal('document', dom.window.document);
-    vi.stubGlobal('HTMLElement', dom.window.HTMLElement);
-    container = dom.window.document.getElementById('root') as HTMLDivElement;
-    root = createRoot(container);
+    Object.assign(window.electronAPI, {
+      getPathForFile: (file: File) => `/tmp/${file.name}`,
+    });
   });
 
   afterEach(async () => {
-    await act(async () => {
-      root.unmount();
-    });
-    vi.unstubAllGlobals();
-    dom.window.close();
+    if (root) await act(async () => root!.unmount());
+    container?.remove();
+    container = null;
+    root = null;
   });
 
-  async function callOnDrop(): Promise<void> {
+  async function dropOnSurface(path: string): Promise<void> {
+    const el = await renderSurface();
+    const surface = el.querySelector('[data-testid="drop-surface"]');
+    if (!surface) throw new Error('drop surface not rendered');
     await act(async () => {
-      root.render(React.createElement(Probe));
-    });
-    await act(async () => {
-      latest!.onDrop(dropEvent());
+      dropFiles(surface as HTMLElement, [path]);
     });
     await act(async () => {
       await Promise.resolve();
@@ -130,7 +137,7 @@ describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked 
   it('passes an inferred codex providerId through to createAgent', async () => {
     mocks.inspectLocationPath.mockResolvedValue(inspection({ providerId: 'codex' }));
 
-    await callOnDrop();
+    await dropOnSurface('/tmp/agent');
 
     expect(mocks.createAgent).toHaveBeenCalledWith({
       mode: 'pick',
@@ -142,7 +149,6 @@ describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked 
   });
 
   it('passes an inferred opencode providerId through to createAgent', async () => {
-    mocks.getDraggedFilePaths.mockReturnValue(['/tmp/open-hoot']);
     mocks.inspectLocationPath.mockResolvedValue(
       inspection({
         providerId: 'opencode',
@@ -154,7 +160,7 @@ describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked 
       })
     );
 
-    await callOnDrop();
+    await dropOnSurface('/tmp/open-hoot');
 
     expect(mocks.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/tmp/open-hoot', providerId: 'opencode' })
@@ -164,7 +170,7 @@ describe('useSidebarDrop maps inspect.providerId onto createAgent (unit, mocked 
   it('uses claude only when inspect.providerId is null', async () => {
     mocks.inspectLocationPath.mockResolvedValue(inspection({ providerId: null }));
 
-    await callOnDrop();
+    await dropOnSurface('/tmp/agent');
 
     expect(mocks.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ providerId: 'claude' })
