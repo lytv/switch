@@ -13,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from switch_core.addressing import parse_policy
 from switch_core.bridges.agent.api import operations as ops_api
 from switch_core.bridges.agent.api.handlers import _register_known
 from switch_core.bridges.agent.operations import context as op_context
@@ -29,6 +30,73 @@ from tests.switch_core.bridges.agent.protocol.registration_harness import (
 )
 
 _AGENT_STORE = AgentStore()
+
+
+def _assert_owner_only(raw: dict | None, owner_id: str) -> None:
+    policy = parse_policy(raw)
+    assert policy.is_open() is False
+    assert raw is not None
+    assert (
+        policy.allows(
+            room_id="any-room",
+            group_id=None,
+            sender_kind="user",
+            sender_id="ext-3",
+            sender_user_ids=[owner_id],
+            sender_owner_user_id=None,
+            owner_user_id=owner_id,
+        )
+        is True
+    )
+    assert (
+        policy.allows(
+            room_id="any-room",
+            group_id=None,
+            sender_kind="agent",
+            sender_id="other-agent",
+            sender_user_ids=[],
+            sender_owner_user_id=None,
+            owner_user_id=owner_id,
+        )
+        is False
+    )
+
+
+def _assert_open_to_anyone(raw: dict | None, owner_id: str) -> None:
+    """owner_only=False admits anyone: empty rules, or an explicit * rule."""
+    policy = parse_policy(raw)
+    assert (
+        policy.allows(
+            room_id="any-room",
+            group_id=None,
+            sender_kind="agent",
+            sender_id="stranger",
+            sender_user_ids=[],
+            sender_owner_user_id="someone-else",
+            owner_user_id=owner_id,
+        )
+        is True
+    )
+    assert (
+        policy.allows(
+            room_id="any-room",
+            group_id=None,
+            sender_kind="user",
+            sender_id="ext-stranger",
+            sender_user_ids=["not-the-owner"],
+            sender_owner_user_id=None,
+            owner_user_id=owner_id,
+        )
+        is True
+    )
+    if raw is not None:
+        rules = raw.get("rules") or []
+        assert rules
+        rule = rules[0]
+        assert rule.get("rooms") == "*"
+        assert rule.get("users") == "*"
+        assert rule.get("agents") == "*"
+        assert rule.get("owner") is False
 
 
 async def _flagged_caller(
@@ -92,10 +160,30 @@ class TestCreateAgentAs:
             assert stored.owner_id == owner_id
             assert stored.name == "child"
             # Owner-only start: a scoped policy is stored, not open access.
-            assert stored.addressing_policy is not None
+            _assert_owner_only(stored.addressing_policy, owner_id)
             md = stored.metadata_
             assert isinstance(md, dict)
             assert md["known_agent_type"] == "claude-code"
+
+    async def test_owner_only_false_leaves_the_agent_open(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        svc = make_service(session_factory)
+        owner_id = await make_owner(session_factory)
+        caller_id = await _flagged_caller(svc, session_factory, "caller", owner_id)
+
+        result = await svc.create_agent_as(
+            caller_id,
+            agent_type="claude-code",
+            name="shared",
+            description="shared desc",
+            owner_only=False,
+        )
+
+        async with session_factory() as session:
+            stored = await _AGENT_STORE.get(session, result.agent_id)
+            assert stored is not None
+            _assert_open_to_anyone(stored.addressing_policy, owner_id)
 
     async def test_revoking_the_flag_denies_the_next_call(
         self, session_factory: async_sessionmaker[AsyncSession]
@@ -322,3 +410,31 @@ class TestCreateAgentOperation:
             stored = await _AGENT_STORE.get(session, out["id"])
             assert stored is not None
             assert stored.owner_id == owner_id
+            _assert_owner_only(stored.addressing_policy, owner_id)
+
+    async def test_owner_only_false_leaves_the_agent_open(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        svc = make_service(session_factory)
+        owner_id = await make_owner(session_factory)
+        caller_id = await _flagged_caller(svc, session_factory, "caller", owner_id)
+        monkeypatch.setattr(op_context, "_protocol", svc)
+
+        out = await ops_api.call_operation(
+            operation="create_agent",
+            arguments={
+                "agent_type": "claude-code",
+                "name": "shared",
+                "description": "shared desc",
+                "owner_only": False,
+            },
+            agent_id=caller_id,
+            connection_id=None,
+        )
+
+        async with session_factory() as session:
+            stored = await _AGENT_STORE.get(session, out["id"])
+            assert stored is not None
+            _assert_open_to_anyone(stored.addressing_policy, owner_id)
