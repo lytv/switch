@@ -75,7 +75,7 @@ function parseCredentialIdentity(raw: string | null, name: string): CredentialId
  * its sessions on a remote host, so the most authoritative signal available.
  * Absent for an agent that has never run remotely.
  */
-async function providerFromLaunchSpec(
+export async function providerFromLaunchSpec(
   workspaceFs: PluginFs,
   name: string
 ): Promise<AgentProviderId | null> {
@@ -98,7 +98,9 @@ async function providerFromLaunchSpec(
  * concept at all. Built once per scan: each provider answers with its own
  * discovery rather than this module hardcoding any provider's on-disk layout.
  */
-async function definitionOwners(workspaceFs: PluginFs): Promise<Map<string, AgentProviderId>> {
+export async function definitionOwners(
+  workspaceFs: PluginFs
+): Promise<Map<string, AgentProviderId>> {
   const owners = new Map<string, AgentProviderId>();
   for (const plugin of listPlugins()) {
     const behavior = plugin.behavior.repoAgents;

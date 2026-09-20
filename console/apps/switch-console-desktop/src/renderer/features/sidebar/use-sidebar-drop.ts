@@ -88,9 +88,9 @@ export function useSidebarDrop() {
               name,
               path: filePath,
               serverId,
-              // Quick-add has no agent-type picker; a dropped Switch agent is
-              // detected from its .claude config, so it is a Claude Code agent.
-              providerId: 'claude',
+              // Quick-add has no agent-type picker. Use the inspect guess;
+              // fall back to Claude when the directory names no provider.
+              providerId: status.providerId ?? 'claude',
             });
           } catch (err) {
             log.error('Failed to add dropped location:', err);

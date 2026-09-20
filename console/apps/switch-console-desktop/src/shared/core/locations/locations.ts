@@ -1,3 +1,4 @@
+import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
 import type { SwitchAgentConfig } from '@shared/switch-agents';
 
 /**
@@ -40,6 +41,12 @@ export type LocationPathInspection = LocationPathStatus & {
    * directories that resolve a Switch agent.
    */
   switchAgent?: SwitchAgentConfig | null;
+  /**
+   * Best-effort provider id inferred from the agent's sidecar launch spec
+   * or definition scan. `null` when nothing on disk names a provider -
+   * callers should fall back to `'claude'` for backwards compatibility.
+   */
+  providerId?: AgentProviderId | null;
 };
 
 export type OpenLocationError =
