@@ -146,6 +146,16 @@ describe('attachConfiguredAgents', () => {
     );
   });
 
+  it('creates one row when concurrent paths adopt the same identity', async () => {
+    const results = await Promise.all([
+      attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }])),
+      attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }])),
+    ]);
+
+    expect(results).toMatchObject([{ success: true }, { success: true }]);
+    expect(h.createAgent).toHaveBeenCalledTimes(1);
+  });
+
   it('writes nothing to the working directory', async () => {
     // The workspace belongs to whichever install set the agent up. Any write
     // here rejects, so this passing means attach touched none of their state.
