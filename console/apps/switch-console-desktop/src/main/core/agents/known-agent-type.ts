@@ -16,6 +16,19 @@ const KNOWN_AGENT_TYPE_BY_PROVIDER: Partial<Record<AgentProviderId, KnownAgentTy
 
 const FALLBACK_KNOWN_AGENT_TYPE: KnownAgentType = 'claude-code';
 
+const PROVIDER_BY_KNOWN_AGENT_TYPE: Record<KnownAgentType, AgentProviderId> = {
+  'claude-code': 'claude',
+  codex: 'codex',
+  opencode: 'opencode',
+};
+
+export function providerForKnownAgentType(value: string | null): AgentProviderId | null {
+  if (value === 'claude-code' || value === 'codex' || value === 'opencode') {
+    return PROVIDER_BY_KNOWN_AGENT_TYPE[value];
+  }
+  return null;
+}
+
 /**
  * Map a Switch Console provider to the gateway known-agent type it registers as.
  *

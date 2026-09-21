@@ -39,14 +39,17 @@ function creds(agentId: string, endpoint = 'https://switch.example.com') {
 
 const h = vi.hoisted(() => {
   class GatewayError extends Error {
-    constructor(readonly kind: string) {
+    constructor(
+      readonly kind: string,
+      readonly status?: number
+    ) {
       super(kind);
     }
   }
   const state: {
     workspace: PluginFs | null;
     /** Agent-row names already in the directory, per Switch server. */
-    agentNamesByServer: Record<string, string[]>;
+    agentNamesByServer: Record<string, Array<{ name: string; switchAgentId?: string }>>;
     existsOnServer: boolean;
     existsThrows: Error | null;
   } = { workspace: null, agentNamesByServer: {}, existsOnServer: true, existsThrows: null };
@@ -59,6 +62,12 @@ const h = vi.hoisted(() => {
       if (h.state.existsThrows) throw h.state.existsThrows;
       return h.state.existsOnServer;
     }),
+    getAgents: vi.fn(async () => []),
+    fetchAgentDetail: vi.fn(async () => {
+      if (h.state.existsThrows) throw h.state.existsThrows;
+      if (!h.state.existsOnServer) throw new GatewayError('http', 404);
+      return { knownAgentType: 'codex' };
+    }),
     openLocation: vi.fn(async () => {}),
     emit: vi.fn(),
   };
@@ -69,8 +78,9 @@ vi.mock('@main/core/locations/store', () => ({
   ensureLocation: vi.fn(async () => ({ id: 'loc-1' })),
 }));
 vi.mock('./getAgents', () => ({
-  getLocationAgentsOnServer: vi.fn(async (_locationId: string, serverId: string) =>
-    (h.state.agentNamesByServer[serverId] ?? []).map((name) => ({ name }))
+  getAgents: h.getAgents,
+  getLocationAgentsOnServer: vi.fn(
+    async (_locationId: string, serverId: string) => h.state.agentNamesByServer[serverId] ?? []
   ),
 }));
 vi.mock('./agent-workspace-fs', () => ({
@@ -84,7 +94,7 @@ vi.mock('@main/core/providers/plugin-registry', () => ({
   listPlugins: () => [{ metadata: { id: 'codex' }, behavior: {} }],
 }));
 vi.mock('@main/core/switch-servers/gateway-client', () => ({
-  agentExistsOnServer: h.agentExistsOnServer,
+  fetchAgentDetail: h.fetchAgentDetail,
   GatewayError: h.GatewayError,
 }));
 vi.mock('@main/core/switch-servers/servers-store', () => ({
@@ -118,6 +128,7 @@ describe('attachConfiguredAgents', () => {
     h.state.existsOnServer = true;
     h.state.existsThrows = null;
     h.state.workspace = readOnlyFs({ '.switch/agents/theirs.json': creds('sw-theirs') });
+    h.getAgents.mockResolvedValue([]);
   });
 
   it('adopts the existing Switch identity instead of minting a new one', async () => {
@@ -174,7 +185,7 @@ describe('attachConfiguredAgents', () => {
   });
 
   it('skips an agent this Switch Console already has', async () => {
-    h.state.agentNamesByServer = { 'srv-1': ['theirs'] };
+    h.state.agentNamesByServer = { 'srv-1': [{ name: 'theirs', switchAgentId: 'sw-theirs' }] };
 
     const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
 
@@ -184,7 +195,7 @@ describe('attachConfiguredAgents', () => {
 
   it('attaches an agent already attached to a different server (CHOO-2044)', async () => {
     // Same directory, same name, other server — a separate agent, not a duplicate.
-    h.state.agentNamesByServer = { 'srv-other': ['theirs'] };
+    h.state.agentNamesByServer = { 'srv-other': [{ name: 'theirs', switchAgentId: 'sw-theirs' }] };
 
     const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
 
