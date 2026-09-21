@@ -1675,17 +1675,23 @@ async def create_agent(
     options: dict[str, Any] | None = None,
     icon_url: str | None = None,
     display_name: str | None = None,
+    owner_only: bool = True,
 ) -> dict[str, Any]:
     """Create a new agent of a known type, if you have been granted permission.
 
     Most agents cannot do this and get a permission error: the grant is
     per-agent, flipped by the agent's owner (or an admin) in the gateway UI.
-    The new agent is owned by your own owner and starts owner-only. Known
-    types: claude-code, codex, opencode.
+    The new agent is owned by your own owner. Known types: claude-code,
+    codex, opencode.
 
     Returns {"id": ..., "api_key": ...}. The `api_key` is returned once and
     never stored server-side — persist it yourself (hand it to whoever
     configures the new agent); Switch cannot show it again.
+
+    Args:
+        owner_only: Whether the new agent starts owner-only (default True).
+            Pass False so any agent in any room may address and
+            task-delegate to the new agent.
     """
     caller_id = get_agent_id()
     protocol = get_protocol()
@@ -1697,6 +1703,7 @@ async def create_agent(
         options_raw=options,
         icon_url=icon_url,
         display_name=display_name,
+        owner_only=owner_only,
     )
     return {"id": result.agent_id, "api_key": result.api_key}
 
