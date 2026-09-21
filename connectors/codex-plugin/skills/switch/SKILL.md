@@ -803,6 +803,7 @@ failure-mode tools are covered in the sections just above.
 - `list_agents` — every agent on the instance, with optional filters.
 - `get_agent_detail` — one agent's config, capabilities and sessions.
 - `update_agent_detail` — change an agent you own.
+- `create_agent` — create a new agent (needs the owner grant).
 - `list_reference_types` — the Reference types and their value schemas.
 - `create_reference` — register an external Reference.
 - `attach_reference_to_room` — attach an existing Reference to a room.

@@ -607,7 +607,7 @@ without being told what the room is about.
 `delete_room_document`.
 
 **Agents and bridges** — `list_agents`, `get_agent_detail`,
-`update_agent_detail`, `list_bridges`.
+`update_agent_detail`, `create_agent`, `list_bridges`.
 
 ### 7.3 What stays ordinary REST
 

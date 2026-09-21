@@ -32,7 +32,10 @@ from switch_core.bridges.agent.operations.callctx import (
     set_call_context,
 )
 from switch_core.bridges.agent.protocol.connections import UnknownConnectionError
-from switch_core.bridges.agent.protocol.service import ProtocolService
+from switch_core.bridges.agent.protocol.service import (
+    AgentExistsError,
+    ProtocolService,
+)
 from switch_core.db.models import Agent
 
 logger = logging.getLogger(__name__)
@@ -166,6 +169,8 @@ async def post_operation(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except AgentExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         # Operations raise ValueError for "you asked for something that is not
         # there or not allowed yet" - surfaced rather than swallowed.

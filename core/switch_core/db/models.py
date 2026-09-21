@@ -177,6 +177,12 @@ class Agent(Base):
     # name: that stays the identifier, because it is what bridges match on to
     # recognise an agent's own echo.
     display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Whether this agent may create other agents via the `create_agent`
+    # operation. Flipped only by the agent's owner (or an admin) in the
+    # gateway UI. False for every agent unless a human grants it.
+    can_create_agents: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     agent_type: Mapped[str] = mapped_column(Text, nullable=False)
     connector_type: Mapped[str] = mapped_column(Text, nullable=False)
     integration_profile: Mapped[dict] = mapped_column(JSONB, nullable=False)

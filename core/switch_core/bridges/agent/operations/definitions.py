@@ -1668,6 +1668,40 @@ async def update_agent_detail(
 
 
 @operation
+async def create_agent(
+    agent_type: str,
+    name: str,
+    description: str,
+    options: dict[str, Any] | None = None,
+    icon_url: str | None = None,
+    display_name: str | None = None,
+) -> dict[str, Any]:
+    """Create a new agent of a known type, if you have been granted permission.
+
+    Most agents cannot do this and get a permission error: the grant is
+    per-agent, flipped by the agent's owner (or an admin) in the gateway UI.
+    The new agent is owned by your own owner and starts owner-only. Known
+    types: claude-code, codex, opencode.
+
+    Returns {"id": ..., "api_key": ...}. The `api_key` is returned once and
+    never stored server-side — persist it yourself (hand it to whoever
+    configures the new agent); Switch cannot show it again.
+    """
+    caller_id = get_agent_id()
+    protocol = get_protocol()
+    result = await protocol.create_agent_as(
+        caller_id,
+        agent_type=agent_type,
+        name=name,
+        description=description,
+        options_raw=options,
+        icon_url=icon_url,
+        display_name=display_name,
+    )
+    return {"id": result.agent_id, "api_key": result.api_key}
+
+
+@operation
 async def get_room_detail(room_id: str) -> dict[str, Any]:
     """Get full detail for a room you are a member of.
 

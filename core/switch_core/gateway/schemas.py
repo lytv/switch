@@ -250,6 +250,9 @@ class AgentSummary(BaseModel):
     # owner-restricted without fetching each one — the console warns about
     # exactly that, and per-agent reads would make it a request storm.
     addressing_policy: AddressingPolicy | None = None
+    # Whether this agent may create other agents via the `create_agent`
+    # operation. False unless the agent's owner (or an admin) granted it.
+    can_create_agents: bool = False
 
 
 class AgentToolSummary(BaseModel):
@@ -336,6 +339,17 @@ class UpdateAgentDisplayNameRequest(BaseModel):
     something it forgot to send."""
 
     display_name: str | None
+
+
+class UpdateAgentCreatePermissionRequest(BaseModel):
+    """Grant (or revoke) an agent's permission to create other agents.
+
+    ``can_create_agents: true`` lets this agent create new agents via the
+    ``create_agent`` operation, owned by its own owner. The field is required
+    rather than defaulted so that revoking the permission is always something
+    the client said, never something it forgot to send."""
+
+    can_create_agents: bool
 
 
 class KnownAgentType(BaseModel):
