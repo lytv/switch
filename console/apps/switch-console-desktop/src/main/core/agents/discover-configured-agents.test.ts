@@ -53,7 +53,7 @@ const h = vi.hoisted(() => {
     workspace: PluginFs | null;
     location: { id: string } | undefined;
     /** Agent-row names already in the directory, per Switch server. */
-    agentNamesByServer: Record<string, string[]>;
+    agentNamesByServer: Record<string, Array<{ name: string; switchAgentId?: string }>>;
     claudeDefinitions: Array<{ name: string; description: string | null }>;
   } = { workspace: null, location: { id: 'loc-1' }, agentNamesByServer: {}, claudeDefinitions: [] };
   return { state, warn: vi.fn() };
@@ -63,8 +63,8 @@ vi.mock('@main/core/locations/store', () => ({
   getLocationByHostDir: vi.fn(async () => h.state.location),
 }));
 vi.mock('./getAgents', () => ({
-  getLocationAgentsOnServer: vi.fn(async (_locationId: string, serverId: string) =>
-    (h.state.agentNamesByServer[serverId] ?? []).map((name) => ({ name }))
+  getLocationAgentsOnServer: vi.fn(
+    async (_locationId: string, serverId: string) => h.state.agentNamesByServer[serverId] ?? []
   ),
 }));
 vi.mock('./agent-workspace-fs', () => ({
@@ -161,7 +161,7 @@ describe('discoverConfiguredAgents', () => {
   });
 
   it('marks agents this Switch Console already has a row for', async () => {
-    h.state.agentNamesByServer = { 'srv-a': ['mine'] };
+    h.state.agentNamesByServer = { 'srv-a': [{ name: 'mine', switchAgentId: 'sw-mine' }] };
     h.state.workspace = fakeFs({
       '.switch/agents/mine.json': creds('sw-mine'),
       '.switch/agents/theirs.json': creds('sw-theirs'),
@@ -176,7 +176,7 @@ describe('discoverConfiguredAgents', () => {
     // The directory is a place on disk, not one server's territory. An agent row
     // for server A says nothing about server B, and treating it as "already got
     // this" is what silently emptied the onboarding list.
-    h.state.agentNamesByServer = { 'srv-a': ['shared'] };
+    h.state.agentNamesByServer = { 'srv-a': [{ name: 'shared', switchAgentId: 'sw-shared' }] };
     h.state.workspace = fakeFs({ '.switch/agents/shared.json': creds('sw-shared') });
 
     expect((await scan('srv-a'))[0]).toMatchObject({ name: 'shared', alreadyAgent: true });

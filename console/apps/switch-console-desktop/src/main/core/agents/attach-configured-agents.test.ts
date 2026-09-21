@@ -39,17 +39,27 @@ function creds(agentId: string, endpoint = 'https://switch.example.com') {
 
 const h = vi.hoisted(() => {
   class GatewayError extends Error {
-    constructor(readonly kind: string) {
+    constructor(
+      readonly kind: string,
+      readonly status?: number
+    ) {
       super(kind);
     }
   }
   const state: {
     workspace: PluginFs | null;
     /** Agent-row names already in the directory, per Switch server. */
-    agentNamesByServer: Record<string, string[]>;
+    agentNamesByServer: Record<string, Array<{ name: string; switchAgentId?: string }>>;
     existsOnServer: boolean;
     existsThrows: Error | null;
-  } = { workspace: null, agentNamesByServer: {}, existsOnServer: true, existsThrows: null };
+    knownAgentType: string | null;
+  } = {
+    workspace: null,
+    agentNamesByServer: {},
+    existsOnServer: true,
+    existsThrows: null,
+    knownAgentType: 'codex',
+  };
   return {
     state,
     GatewayError,
@@ -59,6 +69,14 @@ const h = vi.hoisted(() => {
       if (h.state.existsThrows) throw h.state.existsThrows;
       return h.state.existsOnServer;
     }),
+    getAgents: vi.fn(
+      async (): Promise<Array<{ id: string; locationId: string; autoApprove: boolean }>> => []
+    ),
+    fetchAgentDetail: vi.fn(async () => {
+      if (h.state.existsThrows) throw h.state.existsThrows;
+      if (!h.state.existsOnServer) throw new GatewayError('http', 404);
+      return { knownAgentType: h.state.knownAgentType };
+    }),
     openLocation: vi.fn(async () => {}),
     emit: vi.fn(),
   };
@@ -66,11 +84,15 @@ const h = vi.hoisted(() => {
 
 vi.mock('@main/core/locations/store', () => ({
   getLocationByHostDir: vi.fn(async () => ({ id: 'loc-1' })),
-  ensureLocation: vi.fn(async () => ({ id: 'loc-1' })),
+  ensureLocation: vi.fn(async (params: { sshHost: string | null }) => ({
+    id: 'loc-1',
+    sshHost: params.sshHost,
+  })),
 }));
 vi.mock('./getAgents', () => ({
-  getLocationAgentsOnServer: vi.fn(async (_locationId: string, serverId: string) =>
-    (h.state.agentNamesByServer[serverId] ?? []).map((name) => ({ name }))
+  getAgents: h.getAgents,
+  getLocationAgentsOnServer: vi.fn(
+    async (_locationId: string, serverId: string) => h.state.agentNamesByServer[serverId] ?? []
   ),
 }));
 vi.mock('./agent-workspace-fs', () => ({
@@ -84,7 +106,7 @@ vi.mock('@main/core/providers/plugin-registry', () => ({
   listPlugins: () => [{ metadata: { id: 'codex' }, behavior: {} }],
 }));
 vi.mock('@main/core/switch-servers/gateway-client', () => ({
-  agentExistsOnServer: h.agentExistsOnServer,
+  fetchAgentDetail: h.fetchAgentDetail,
   GatewayError: h.GatewayError,
 }));
 vi.mock('@main/core/switch-servers/servers-store', () => ({
@@ -105,10 +127,13 @@ vi.mock('./setAgentAutoSession', () => ({
 vi.mock('./agent-events', () => ({ agentEvents: { _emit: h.emit } }));
 vi.mock('@main/lib/logger', () => ({ log: { info: vi.fn(), warn: h.warn, error: vi.fn() } }));
 
-const { attachConfiguredAgents } = await import('./attach-configured-agents');
+const { attachConfiguredAgents, adoptConfiguredAgent } = await import('./attach-configured-agents');
 
-function params(agents: Array<{ name: string; providerId: 'codex' | 'claude' }>) {
-  return { sshHost: 'vm-1', dir: '/repo', serverId: 'srv-1', agents };
+function params(
+  agents: Array<{ name: string; providerId: 'codex' | 'claude' }>,
+  sshHost: string | null = 'vm-1'
+) {
+  return { sshHost, dir: '/repo', serverId: 'srv-1', agents };
 }
 
 describe('attachConfiguredAgents', () => {
@@ -117,7 +142,9 @@ describe('attachConfiguredAgents', () => {
     h.state.agentNamesByServer = {};
     h.state.existsOnServer = true;
     h.state.existsThrows = null;
+    h.state.knownAgentType = 'codex';
     h.state.workspace = readOnlyFs({ '.switch/agents/theirs.json': creds('sw-theirs') });
+    h.getAgents.mockResolvedValue([]);
   });
 
   it('adopts the existing Switch identity instead of minting a new one', async () => {
@@ -133,6 +160,16 @@ describe('attachConfiguredAgents', () => {
         locationId: 'loc-1',
       })
     );
+  });
+
+  it('creates one row when concurrent paths adopt the same identity', async () => {
+    const results = await Promise.all([
+      attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }])),
+      attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }])),
+    ]);
+
+    expect(results).toMatchObject([{ success: true }, { success: true }]);
+    expect(h.createAgent).toHaveBeenCalledTimes(1);
   });
 
   it('writes nothing to the working directory', async () => {
@@ -174,7 +211,7 @@ describe('attachConfiguredAgents', () => {
   });
 
   it('skips an agent this Switch Console already has', async () => {
-    h.state.agentNamesByServer = { 'srv-1': ['theirs'] };
+    h.state.agentNamesByServer = { 'srv-1': [{ name: 'theirs', switchAgentId: 'sw-theirs' }] };
 
     const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
 
@@ -184,13 +221,82 @@ describe('attachConfiguredAgents', () => {
 
   it('attaches an agent already attached to a different server (CHOO-2044)', async () => {
     // Same directory, same name, other server — a separate agent, not a duplicate.
-    h.state.agentNamesByServer = { 'srv-other': ['theirs'] };
+    h.state.agentNamesByServer = { 'srv-other': [{ name: 'theirs', switchAgentId: 'sw-theirs' }] };
 
     const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
 
     expect(result.success).toBe(true);
     expect(h.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'theirs', serverId: 'srv-1' })
+    );
+  });
+
+  it('inherits autoApprove from an existing sibling at the same location', async () => {
+    h.getAgents.mockResolvedValue([
+      { id: 'agent-sibling', locationId: 'loc-1', autoApprove: true },
+    ]);
+
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], null));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: true }));
+  });
+
+  it('defaults autoApprove to false for a local attach with no sibling opted in', async () => {
+    h.getAgents.mockResolvedValue([
+      { id: 'agent-sibling', locationId: 'loc-1', autoApprove: false },
+    ]);
+
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], null));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: false }));
+  });
+
+  it('defaults autoApprove to true for a manual SSH-remote attach with no siblings', async () => {
+    // A headless tmux session on a remote host has no easy way to answer an
+    // interactive permission prompt, so a remote agent gets unattended
+    // operation on attach even before it has any siblings there.
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], 'vm-1'));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: true }));
+  });
+
+  it('honors the caller-chosen provider even when the gateway reports no known agent type', async () => {
+    // Discovery can't infer a provider from disk for an agent registered
+    // through the plain Agent Bridge, so the caller (the user, via the UI)
+    // picks one. That pick must win over an unsupported/missing gateway type
+    // rather than the agent being silently dropped.
+    h.state.knownAgentType = null;
+
+    const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+
+    expect(result.success).toBe(true);
+    expect(h.createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'theirs', providerId: 'codex' })
+    );
+    expect(h.warn).not.toHaveBeenCalled();
+  });
+
+  it('drops an automatically discovered agent with no caller-supplied provider when the gateway type is unsupported', async () => {
+    h.state.knownAgentType = null;
+
+    const result = await adoptConfiguredAgent({
+      location: { id: 'loc-1', name: 'repo', dir: '/repo', sshHost: null },
+      serverId: 'srv-1',
+      discovered: {
+        name: 'theirs',
+        switchAgentId: 'sw-theirs',
+        apiEndpoint: 'https://switch.example.com',
+        providerId: null,
+        providerSource: 'unknown',
+        alreadyAgent: false,
+      },
+    });
+
+    expect(result).toMatchObject({ success: true, data: null });
+    expect(h.createAgent).not.toHaveBeenCalled();
+    expect(h.warn).toHaveBeenCalledWith(
+      expect.stringContaining('unsupported or missing known agent type'),
+      expect.anything()
     );
   });
 

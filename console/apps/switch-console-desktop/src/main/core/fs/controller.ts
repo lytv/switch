@@ -1,6 +1,7 @@
 import { err, ok } from '@switch-console/shared';
 import { resolveLocationRuntime } from '@main/core/locations/utils';
 import { events } from '@main/lib/events';
+import type { FileWatchEvent } from '@shared/core/fs/fs';
 import { fsWatchEventChannel } from '@shared/core/fs/fsEvents';
 import { createRPCController } from '@shared/lib/ipc/rpc';
 import { type FileWatcher } from './types';
@@ -12,6 +13,43 @@ const watcherRegistry = new Map<string, FileWatcher>();
 // Per-label path groups, keyed by location id → label → paths.
 // Paths are forwarded to update() for SSH compatibility; local ignores them.
 const watcherLabeledPaths = new Map<string, Map<string, string[]>>();
+const watcherSubscribers = new Map<string, Map<string, (events: FileWatchEvent[]) => void>>();
+
+function ensureWatcher(locationId: string): FileWatcher | null {
+  const env = resolveLocationRuntime(locationId);
+  if (!env?.fs.watch) return null;
+  const existing = watcherRegistry.get(locationId);
+  if (existing) return existing;
+  const watcher = env.fs.watch((watchEvents) => {
+    events.emit(fsWatchEventChannel, { locationId, events: watchEvents });
+    for (const subscriber of watcherSubscribers.get(locationId)?.values() ?? []) {
+      subscriber(watchEvents);
+    }
+  });
+  watcherRegistry.set(locationId, watcher);
+  return watcher;
+}
+
+export function subscribeToLocationWatch(
+  locationId: string,
+  label: string,
+  callback: (events: FileWatchEvent[]) => void
+): (() => void) | null {
+  const watcher = ensureWatcher(locationId);
+  if (!watcher) return null;
+  const subscribers = watcherSubscribers.get(locationId) ?? new Map();
+  subscribers.set(label, callback);
+  watcherSubscribers.set(locationId, subscribers);
+  return () => {
+    const current = watcherSubscribers.get(locationId);
+    current?.delete(label);
+    if (!current?.size) watcherSubscribers.delete(locationId);
+    if (!watcherLabeledPaths.has(locationId) && !watcherSubscribers.has(locationId)) {
+      watcherRegistry.get(locationId)?.close();
+      watcherRegistry.delete(locationId);
+    }
+  };
+}
 
 export const filesController = createRPCController({
   watchSetPaths: async (locationId: string, paths: string[], label = 'default') => {
@@ -29,16 +67,9 @@ export const filesController = createRPCController({
     watcherLabeledPaths.set(locationId, groups);
     const union = [...new Set([...groups.values()].flat())];
 
-    const existing = watcherRegistry.get(locationId);
-    if (existing) {
-      existing.update(union);
-    } else {
-      const watcher = env.fs.watch((evts) => {
-        events.emit(fsWatchEventChannel, { locationId, events: evts });
-      });
-      watcher.update(union);
-      watcherRegistry.set(locationId, watcher);
-    }
+    const watcher = ensureWatcher(locationId);
+    if (!watcher) return ok({ supported: false as const });
+    watcher.update(union);
     return ok({ supported: true as const });
   },
 
@@ -48,8 +79,10 @@ export const filesController = createRPCController({
 
     if (!groups?.size) {
       watcherLabeledPaths.delete(locationId);
-      watcherRegistry.get(locationId)?.close();
-      watcherRegistry.delete(locationId);
+      if (!watcherSubscribers.has(locationId)) {
+        watcherRegistry.get(locationId)?.close();
+        watcherRegistry.delete(locationId);
+      }
     } else {
       const union = [...new Set([...groups.values()].flat())];
       watcherRegistry.get(locationId)?.update(union);

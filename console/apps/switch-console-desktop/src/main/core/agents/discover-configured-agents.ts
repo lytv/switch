@@ -29,8 +29,7 @@ export type DiscoveredConfiguredAgent = {
   /** Best-effort: null when nothing on disk names a provider. */
   providerId: AgentProviderId | null;
   providerSource: ProviderSource;
-  /** Whether this Switch Console already has a row for the name at this location, on
-   * the server being onboarded to. */
+  /** Whether this Switch Console already has this server identity at this location. */
   alreadyAgent: boolean;
 };
 
@@ -149,7 +148,11 @@ export async function discoverConfiguredAgents(params: {
 }): Promise<DiscoveredConfiguredAgent[]> {
   const location = await getLocationByHostDir(params.sshHost, params.dir);
   const existing = location
-    ? new Set((await getLocationAgentsOnServer(location.id, params.serverId)).map((a) => a.name))
+    ? new Set(
+        (await getLocationAgentsOnServer(location.id, params.serverId))
+          .map((a) => a.switchAgentId)
+          .filter((id): id is string => id !== null)
+      )
     : new Set<string>();
 
   const workspace = await resolveWorkspaceFsFor(params.sshHost, params.dir);
@@ -186,7 +189,7 @@ export async function discoverConfiguredAgents(params: {
         apiEndpoint: identity.apiEndpoint,
         providerId,
         providerSource,
-        alreadyAgent: existing.has(name),
+        alreadyAgent: existing.has(identity.switchAgentId),
       });
     }
     return discovered;

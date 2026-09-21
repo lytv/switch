@@ -4,17 +4,23 @@ import type { Result } from '@switch-console/shared';
 import { locationManager } from '@main/core/locations/location-manager';
 import { checkIsValidDirectory } from '@main/core/locations/path-utils';
 import { ensureLocation } from '@main/core/locations/store';
-import { agentExistsOnServer, GatewayError } from '@main/core/switch-servers/gateway-client';
+import { fetchAgentDetail, GatewayError } from '@main/core/switch-servers/gateway-client';
 import { getServer } from '@main/core/switch-servers/servers-store';
 import { log } from '@main/lib/logger';
 import type { Agent } from '@shared/core/agents/agents';
 import type { OnboardAgentError } from '@shared/core/agents/onboarding';
+import type { Location } from '@shared/core/locations/locations';
 import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
 import { sameApiEndpoint } from '@shared/core/switch-servers/switch-servers';
 import { basenameFromAnyPath } from '@shared/path-name';
 import { agentEvents } from './agent-events';
 import { createAgent } from './createAgent';
-import { discoverConfiguredAgents } from './discover-configured-agents';
+import {
+  type DiscoveredConfiguredAgent,
+  discoverConfiguredAgents,
+} from './discover-configured-agents';
+import { getAgents } from './getAgents';
+import { providerForKnownAgentType } from './known-agent-type';
 import { reconcileAgentAutoSessionFromGateway } from './setAgentAutoSession';
 
 export type AttachConfiguredAgentsParams = {
@@ -32,6 +38,110 @@ export type AttachConfiguredAgentsParams = {
 };
 
 export type AttachConfiguredAgentsResult = Result<Agent[], OnboardAgentError>;
+
+const pendingAdoptions = new Map<string, Promise<Result<Agent | null, OnboardAgentError>>>();
+
+export function adoptConfiguredAgent(params: {
+  location: Pick<Location, 'id' | 'name' | 'dir' | 'sshHost'>;
+  serverId: string;
+  discovered: DiscoveredConfiguredAgent;
+  /** Caller-chosen provider, for the manual attach path where a user picked
+   * one. When absent (automatic discovery has no one to ask), the provider is
+   * derived from the gateway's known agent type instead. */
+  providerId?: AgentProviderId;
+}): Promise<Result<Agent | null, OnboardAgentError>> {
+  const key = JSON.stringify([
+    params.location.id,
+    params.serverId,
+    params.discovered.switchAgentId,
+  ]);
+  const pending = pendingAdoptions.get(key);
+  if (pending) return pending;
+
+  const adoption = adoptConfiguredAgentOnce(params).finally(() => pendingAdoptions.delete(key));
+  pendingAdoptions.set(key, adoption);
+  return adoption;
+}
+
+async function adoptConfiguredAgentOnce(params: {
+  location: Pick<Location, 'id' | 'name' | 'dir' | 'sshHost'>;
+  serverId: string;
+  discovered: DiscoveredConfiguredAgent;
+  providerId?: AgentProviderId;
+}): Promise<Result<Agent | null, OnboardAgentError>> {
+  const server = await getServer(params.serverId);
+  if (!server) throw new Error(`No Switch server with id ${params.serverId}`);
+
+  const siblings = await getAgents(params.location.id);
+  if (
+    siblings.some(
+      (agent) =>
+        agent.serverId === params.serverId &&
+        agent.switchAgentId === params.discovered.switchAgentId
+    )
+  ) {
+    return ok(null);
+  }
+
+  let remote;
+  try {
+    remote = await fetchAgentDetail(server, params.discovered.switchAgentId);
+  } catch (cause) {
+    if (cause instanceof GatewayError && cause.kind === 'unauthorized') {
+      return err({
+        type: 'switch-server-unauthenticated',
+        dir: params.location.dir,
+        serverId: server.id,
+        serverName: server.name,
+      });
+    }
+    if (cause instanceof GatewayError && cause.kind === 'http' && cause.status === 404) {
+      return err({
+        type: 'switch-agent-not-on-server',
+        dir: params.location.dir,
+        serverId: server.id,
+        serverName: server.name,
+        agentId: params.discovered.switchAgentId,
+      });
+    }
+    throw cause;
+  }
+  const providerId = params.providerId ?? providerForKnownAgentType(remote.knownAgentType);
+  if (!providerId) {
+    log.warn('attachConfiguredAgents: unsupported or missing known agent type', {
+      agentId: params.discovered.switchAgentId,
+      knownAgentType: remote.knownAgentType,
+    });
+    return ok(null);
+  }
+  if (!sameApiEndpoint(params.discovered.apiEndpoint, server.apiUrl)) {
+    log.warn('attachConfiguredAgents: directory endpoint differs from the chosen server', {
+      name: params.discovered.name,
+      dirEndpoint: params.discovered.apiEndpoint,
+      serverEndpoint: server.apiUrl,
+      serverId: server.id,
+    });
+  }
+  const agent = await createAgent({
+    id: randomUUID(),
+    locationId: params.location.id,
+    name: params.discovered.name,
+    providerId,
+    switchAgentId: params.discovered.switchAgentId,
+    apiEndpoint: params.discovered.apiEndpoint,
+    serverId: params.serverId,
+    autoApprove:
+      params.location.sshHost !== null || siblings.some((sibling) => sibling.autoApprove),
+  });
+  await reconcileAgentAutoSessionFromGateway(agent.id).catch((error) => {
+    log.warn('attachConfiguredAgents: failed to reconcile auto_session', {
+      agentId: agent.id,
+      error: String(error),
+    });
+  });
+  agentEvents._emit('agent:created', agent, 'unknown');
+  return ok(agent);
+}
 
 /**
  * Adopt agents already configured in a working directory into this Switch Console,
@@ -114,66 +224,16 @@ export async function attachConfiguredAgents(
     const found = discovered.get(name);
     if (!found) continue;
 
-    try {
-      if (!(await agentExistsOnServer(server, found.switchAgentId))) {
-        return err({
-          type: 'switch-agent-not-on-server',
-          dir: params.dir,
-          serverId: server.id,
-          serverName: server.name,
-          agentId: found.switchAgentId,
-        });
-      }
-    } catch (cause) {
-      if (cause instanceof GatewayError && cause.kind === 'unauthorized') {
-        return err({
-          type: 'switch-server-unauthenticated',
-          dir: params.dir,
-          serverId: server.id,
-          serverName: server.name,
-        });
-      }
-      throw cause;
-    }
-
-    // The directory's endpoint wins over the chosen server's URL: it is what the
-    // launch path will actually hand the session, since the token and endpoint
-    // are read from the same on-disk file. A difference is legitimate (one Switch
-    // server reachable at two URLs) so it is surfaced, not corrected — correcting
-    // it would mean writing to another install's credentials.
-    if (!sameApiEndpoint(found.apiEndpoint, server.apiUrl)) {
-      log.warn('attachConfiguredAgents: directory endpoint differs from the chosen server', {
-        name,
-        dirEndpoint: found.apiEndpoint,
-        serverEndpoint: server.apiUrl,
-        serverId: server.id,
-      });
-    }
-
-    const agent = await createAgent({
-      id: randomUUID(),
-      locationId: location.id,
-      name,
-      providerId,
-      switchAgentId: found.switchAgentId,
-      apiEndpoint: found.apiEndpoint,
+    const adopted = await adoptConfiguredAgent({
+      location,
       serverId: params.serverId,
-      autoApprove: params.sshHost !== null,
+      discovered: found,
+      providerId,
     });
-    created.push(agent);
-
-    await reconcileAgentAutoSessionFromGateway(agent.id).catch((error) => {
-      log.warn('attachConfiguredAgents: failed to reconcile auto_session', {
-        agentId: agent.id,
-        error: String(error),
-      });
-    });
+    if (!adopted.success) return adopted;
+    if (adopted.data) created.push(adopted.data);
   }
 
   await locationManager.openLocation(location);
-  // No control to name: an attach is driven by whichever screen offered the
-  // scan, and nothing on the way here says which. `unknown` reports the absence
-  // of a claim rather than inventing one.
-  for (const agent of created) agentEvents._emit('agent:created', agent, 'unknown');
   return ok(created);
 }

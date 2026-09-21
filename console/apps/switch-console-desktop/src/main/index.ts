@@ -11,6 +11,7 @@ import { registerAppScheme, setupAppProtocol } from './app/protocol';
 import { createMainWindow, getMainWindow } from './app/window';
 import { agentHookService } from './core/agent-hooks/agent-hook-service';
 import { reapOrphanedAgentRuntimes } from './core/agent-runtime/reap-orphaned-runtimes';
+import { configuredAgentDiscoveryService } from './core/agents/configured-agent-discovery-service';
 import { migrateAgentStorage } from './core/agents/migrate-agent-storage';
 import { initializeRemoteDiscovery, initializeRemoteWatchers } from './core/agents/remote-watcher';
 import { resolveAgentServers } from './core/agents/resolve-servers';
@@ -198,6 +199,8 @@ void app.whenReady().then(async () => {
   const dependenciesReady = localDependencyManager.probeAll().catch((e: unknown) => {
     log.error('Failed to probe dependencies:', e);
   });
+
+  configuredAgentDiscoveryService.initialize();
 
   // Relaunch every session that was connected to a Switch room before this
   // restart, so it resumes receiving and responding to room events without the
