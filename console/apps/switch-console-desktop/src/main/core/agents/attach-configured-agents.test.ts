@@ -52,7 +52,14 @@ const h = vi.hoisted(() => {
     agentNamesByServer: Record<string, Array<{ name: string; switchAgentId?: string }>>;
     existsOnServer: boolean;
     existsThrows: Error | null;
-  } = { workspace: null, agentNamesByServer: {}, existsOnServer: true, existsThrows: null };
+    knownAgentType: string | null;
+  } = {
+    workspace: null,
+    agentNamesByServer: {},
+    existsOnServer: true,
+    existsThrows: null,
+    knownAgentType: 'codex',
+  };
   return {
     state,
     GatewayError,
@@ -68,7 +75,7 @@ const h = vi.hoisted(() => {
     fetchAgentDetail: vi.fn(async () => {
       if (h.state.existsThrows) throw h.state.existsThrows;
       if (!h.state.existsOnServer) throw new GatewayError('http', 404);
-      return { knownAgentType: 'codex' };
+      return { knownAgentType: h.state.knownAgentType };
     }),
     openLocation: vi.fn(async () => {}),
     emit: vi.fn(),
@@ -117,7 +124,7 @@ vi.mock('./setAgentAutoSession', () => ({
 vi.mock('./agent-events', () => ({ agentEvents: { _emit: h.emit } }));
 vi.mock('@main/lib/logger', () => ({ log: { info: vi.fn(), warn: h.warn, error: vi.fn() } }));
 
-const { attachConfiguredAgents } = await import('./attach-configured-agents');
+const { attachConfiguredAgents, adoptConfiguredAgent } = await import('./attach-configured-agents');
 
 function params(agents: Array<{ name: string; providerId: 'codex' | 'claude' }>) {
   return { sshHost: 'vm-1', dir: '/repo', serverId: 'srv-1', agents };
@@ -129,6 +136,7 @@ describe('attachConfiguredAgents', () => {
     h.state.agentNamesByServer = {};
     h.state.existsOnServer = true;
     h.state.existsThrows = null;
+    h.state.knownAgentType = 'codex';
     h.state.workspace = readOnlyFs({ '.switch/agents/theirs.json': creds('sw-theirs') });
     h.getAgents.mockResolvedValue([]);
   });
@@ -235,6 +243,46 @@ describe('attachConfiguredAgents', () => {
     await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
 
     expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: false }));
+  });
+
+  it('honors the caller-chosen provider even when the gateway reports no known agent type', async () => {
+    // Discovery can't infer a provider from disk for an agent registered
+    // through the plain Agent Bridge, so the caller (the user, via the UI)
+    // picks one. That pick must win over an unsupported/missing gateway type
+    // rather than the agent being silently dropped.
+    h.state.knownAgentType = null;
+
+    const result = await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+
+    expect(result.success).toBe(true);
+    expect(h.createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'theirs', providerId: 'codex' })
+    );
+    expect(h.warn).not.toHaveBeenCalled();
+  });
+
+  it('drops an automatically discovered agent with no caller-supplied provider when the gateway type is unsupported', async () => {
+    h.state.knownAgentType = null;
+
+    const result = await adoptConfiguredAgent({
+      location: { id: 'loc-1', name: 'repo', dir: '/repo' },
+      serverId: 'srv-1',
+      discovered: {
+        name: 'theirs',
+        switchAgentId: 'sw-theirs',
+        apiEndpoint: 'https://switch.example.com',
+        providerId: null,
+        providerSource: 'unknown',
+        alreadyAgent: false,
+      },
+    });
+
+    expect(result).toMatchObject({ success: true, data: null });
+    expect(h.createAgent).not.toHaveBeenCalled();
+    expect(h.warn).toHaveBeenCalledWith(
+      expect.stringContaining('unsupported or missing known agent type'),
+      expect.anything()
+    );
   });
 
   it('keeps the directory endpoint and warns when it differs from the chosen server', async () => {

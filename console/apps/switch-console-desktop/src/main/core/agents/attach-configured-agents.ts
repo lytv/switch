@@ -44,6 +44,10 @@ export function adoptConfiguredAgent(params: {
   location: { id: string; name: string; dir: string };
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
+  /** Caller-chosen provider, for the manual attach path where a user picked
+   * one. When absent (automatic discovery has no one to ask), the provider is
+   * derived from the gateway's known agent type instead. */
+  providerId?: AgentProviderId;
 }): Promise<Result<Agent | null, OnboardAgentError>> {
   const key = JSON.stringify([
     params.location.id,
@@ -62,6 +66,7 @@ async function adoptConfiguredAgentOnce(params: {
   location: { id: string; name: string; dir: string };
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
+  providerId?: AgentProviderId;
 }): Promise<Result<Agent | null, OnboardAgentError>> {
   const server = await getServer(params.serverId);
   if (!server) throw new Error(`No Switch server with id ${params.serverId}`);
@@ -100,7 +105,7 @@ async function adoptConfiguredAgentOnce(params: {
     }
     throw cause;
   }
-  const providerId = providerForKnownAgentType(remote.knownAgentType);
+  const providerId = params.providerId ?? providerForKnownAgentType(remote.knownAgentType);
   if (!providerId) {
     log.warn('attachConfiguredAgents: unsupported or missing known agent type', {
       agentId: params.discovered.switchAgentId,
@@ -213,7 +218,7 @@ export async function attachConfiguredAgents(
   });
 
   const created: Agent[] = [];
-  for (const { name } of selected) {
+  for (const { name, providerId } of selected) {
     const found = discovered.get(name);
     if (!found) continue;
 
@@ -221,6 +226,7 @@ export async function attachConfiguredAgents(
       location,
       serverId: params.serverId,
       discovered: found,
+      providerId,
     });
     if (!adopted.success) return adopted;
     if (adopted.data) created.push(adopted.data);
