@@ -505,6 +505,7 @@ class ProtocolService:
         parent_agent_id: str | None,
         overwrite: bool,
         owner_id: str,
+        owner_only: bool = True,
     ) -> RegistrationResult:
         """Register one agent of a known connector type.
 
@@ -539,6 +540,7 @@ class ProtocolService:
             owner_id=owner_id,
             parent_agent_id=parent_agent_id,
             overwrite=overwrite,
+            owner_only=owner_only,
         )
 
     async def create_agent_as(
@@ -551,6 +553,7 @@ class ProtocolService:
         options_raw: dict[str, Any] | None = None,
         icon_url: str | None = None,
         display_name: str | None = None,
+        owner_only: bool = True,
     ) -> RegistrationResult:
         """Create a known-type agent on behalf of a flagged calling agent.
 
@@ -560,9 +563,11 @@ class ProtocolService:
         if the calling agent is missing, PermissionError if it has not been
         granted ``can_create_agents`` by its owner (or an admin).
 
-        The new agent is owned by the caller's own owner and starts
-        owner-only. Overwrite is intentionally unavailable here: a flagged
-        agent creates new agents, it never rotates a sibling's live key.
+        The new agent is owned by the caller's own owner. ``owner_only``
+        defaults to True. Pass False so any agent in any room may address
+        and task-delegate to the new agent. Overwrite is intentionally
+        unavailable here: a flagged agent creates new agents, it never
+        rotates a sibling's live key.
         """
         async with self.session_factory() as session:
             caller = await self.agent_store.get(session, caller_agent_id)
@@ -588,6 +593,7 @@ class ProtocolService:
             parent_agent_id=None,
             overwrite=False,
             owner_id=owner_id,
+            owner_only=owner_only,
         )
 
     async def _create_agent(
