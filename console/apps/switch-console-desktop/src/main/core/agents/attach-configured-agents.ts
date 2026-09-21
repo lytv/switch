@@ -41,12 +41,15 @@ export type AttachConfiguredAgentsResult = Result<Agent[], OnboardAgentError>;
 const pendingAdoptions = new Map<string, Promise<Result<Agent | null, OnboardAgentError>>>();
 
 export function adoptConfiguredAgent(params: {
-  sshHost: string | null;
-  location: { id: string; name: string; dir: string; sshHost: string | null };
+  location: { id: string; name: string; dir: string };
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
 }): Promise<Result<Agent | null, OnboardAgentError>> {
-  const key = JSON.stringify([params.location.id, params.serverId, params.discovered.switchAgentId]);
+  const key = JSON.stringify([
+    params.location.id,
+    params.serverId,
+    params.discovered.switchAgentId,
+  ]);
   const pending = pendingAdoptions.get(key);
   if (pending) return pending;
 
@@ -56,8 +59,7 @@ export function adoptConfiguredAgent(params: {
 }
 
 async function adoptConfiguredAgentOnce(params: {
-  sshHost: string | null;
-  location: { id: string; name: string; dir: string; sshHost: string | null };
+  location: { id: string; name: string; dir: string };
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
 }): Promise<Result<Agent | null, OnboardAgentError>> {
@@ -216,7 +218,6 @@ export async function attachConfiguredAgents(
     if (!found) continue;
 
     const adopted = await adoptConfiguredAgent({
-      sshHost: params.sshHost,
       location,
       serverId: params.serverId,
       discovered: found,

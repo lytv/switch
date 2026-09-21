@@ -114,7 +114,6 @@ describe('configuredAgentDiscoveryService', () => {
     await vi.waitFor(() => expect(h.adoptConfiguredAgent).toHaveBeenCalledTimes(1));
     expect(h.adoptConfiguredAgent).toHaveBeenCalledWith(
       expect.objectContaining({
-        sshHost: null,
         serverId: 'srv-1',
         discovered: expect.objectContaining({ switchAgentId: 'sw-theirs' }),
       })

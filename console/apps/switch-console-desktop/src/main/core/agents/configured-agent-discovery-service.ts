@@ -77,7 +77,6 @@ class ConfiguredAgentDiscoveryService {
       this.reconciling.add(key);
       try {
         const result = await adoptConfiguredAgent({
-          sshHost: null,
           location,
           serverId: server.id,
           discovered: agent,

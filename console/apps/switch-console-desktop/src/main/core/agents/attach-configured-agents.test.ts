@@ -62,7 +62,9 @@ const h = vi.hoisted(() => {
       if (h.state.existsThrows) throw h.state.existsThrows;
       return h.state.existsOnServer;
     }),
-    getAgents: vi.fn(async () => []),
+    getAgents: vi.fn(
+      async (): Promise<Array<{ id: string; locationId: string; autoApprove: boolean }>> => []
+    ),
     fetchAgentDetail: vi.fn(async () => {
       if (h.state.existsThrows) throw h.state.existsThrows;
       if (!h.state.existsOnServer) throw new GatewayError('http', 404);
@@ -213,6 +215,26 @@ describe('attachConfiguredAgents', () => {
     expect(h.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'theirs', serverId: 'srv-1' })
     );
+  });
+
+  it('inherits autoApprove from an existing sibling at the same location', async () => {
+    h.getAgents.mockResolvedValue([
+      { id: 'agent-sibling', locationId: 'loc-1', autoApprove: true },
+    ]);
+
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: true }));
+  });
+
+  it('defaults autoApprove to false with no sibling opted in', async () => {
+    h.getAgents.mockResolvedValue([
+      { id: 'agent-sibling', locationId: 'loc-1', autoApprove: false },
+    ]);
+
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: false }));
   });
 
   it('keeps the directory endpoint and warns when it differs from the chosen server', async () => {
