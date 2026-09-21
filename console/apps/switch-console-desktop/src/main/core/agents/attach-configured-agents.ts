@@ -9,6 +9,7 @@ import { getServer } from '@main/core/switch-servers/servers-store';
 import { log } from '@main/lib/logger';
 import type { Agent } from '@shared/core/agents/agents';
 import type { OnboardAgentError } from '@shared/core/agents/onboarding';
+import type { Location } from '@shared/core/locations/locations';
 import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
 import { sameApiEndpoint } from '@shared/core/switch-servers/switch-servers';
 import { basenameFromAnyPath } from '@shared/path-name';
@@ -41,7 +42,7 @@ export type AttachConfiguredAgentsResult = Result<Agent[], OnboardAgentError>;
 const pendingAdoptions = new Map<string, Promise<Result<Agent | null, OnboardAgentError>>>();
 
 export function adoptConfiguredAgent(params: {
-  location: { id: string; name: string; dir: string };
+  location: Pick<Location, 'id' | 'name' | 'dir' | 'sshHost'>;
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
   /** Caller-chosen provider, for the manual attach path where a user picked
@@ -63,7 +64,7 @@ export function adoptConfiguredAgent(params: {
 }
 
 async function adoptConfiguredAgentOnce(params: {
-  location: { id: string; name: string; dir: string };
+  location: Pick<Location, 'id' | 'name' | 'dir' | 'sshHost'>;
   serverId: string;
   discovered: DiscoveredConfiguredAgent;
   providerId?: AgentProviderId;
@@ -129,7 +130,8 @@ async function adoptConfiguredAgentOnce(params: {
     switchAgentId: params.discovered.switchAgentId,
     apiEndpoint: params.discovered.apiEndpoint,
     serverId: params.serverId,
-    autoApprove: siblings.some((sibling) => sibling.autoApprove),
+    autoApprove:
+      params.location.sshHost !== null || siblings.some((sibling) => sibling.autoApprove),
   });
   await reconcileAgentAutoSessionFromGateway(agent.id).catch((error) => {
     log.warn('attachConfiguredAgents: failed to reconcile auto_session', {

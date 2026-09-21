@@ -84,7 +84,10 @@ const h = vi.hoisted(() => {
 
 vi.mock('@main/core/locations/store', () => ({
   getLocationByHostDir: vi.fn(async () => ({ id: 'loc-1' })),
-  ensureLocation: vi.fn(async () => ({ id: 'loc-1' })),
+  ensureLocation: vi.fn(async (params: { sshHost: string | null }) => ({
+    id: 'loc-1',
+    sshHost: params.sshHost,
+  })),
 }));
 vi.mock('./getAgents', () => ({
   getAgents: h.getAgents,
@@ -126,8 +129,11 @@ vi.mock('@main/lib/logger', () => ({ log: { info: vi.fn(), warn: h.warn, error: 
 
 const { attachConfiguredAgents, adoptConfiguredAgent } = await import('./attach-configured-agents');
 
-function params(agents: Array<{ name: string; providerId: 'codex' | 'claude' }>) {
-  return { sshHost: 'vm-1', dir: '/repo', serverId: 'srv-1', agents };
+function params(
+  agents: Array<{ name: string; providerId: 'codex' | 'claude' }>,
+  sshHost: string | null = 'vm-1'
+) {
+  return { sshHost, dir: '/repo', serverId: 'srv-1', agents };
 }
 
 describe('attachConfiguredAgents', () => {
@@ -230,19 +236,28 @@ describe('attachConfiguredAgents', () => {
       { id: 'agent-sibling', locationId: 'loc-1', autoApprove: true },
     ]);
 
-    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], null));
 
     expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: true }));
   });
 
-  it('defaults autoApprove to false with no sibling opted in', async () => {
+  it('defaults autoApprove to false for a local attach with no sibling opted in', async () => {
     h.getAgents.mockResolvedValue([
       { id: 'agent-sibling', locationId: 'loc-1', autoApprove: false },
     ]);
 
-    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }]));
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], null));
 
     expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: false }));
+  });
+
+  it('defaults autoApprove to true for a manual SSH-remote attach with no siblings', async () => {
+    // A headless tmux session on a remote host has no easy way to answer an
+    // interactive permission prompt, so a remote agent gets unattended
+    // operation on attach even before it has any siblings there.
+    await attachConfiguredAgents(params([{ name: 'theirs', providerId: 'codex' }], 'vm-1'));
+
+    expect(h.createAgent).toHaveBeenCalledWith(expect.objectContaining({ autoApprove: true }));
   });
 
   it('honors the caller-chosen provider even when the gateway reports no known agent type', async () => {
@@ -265,7 +280,7 @@ describe('attachConfiguredAgents', () => {
     h.state.knownAgentType = null;
 
     const result = await adoptConfiguredAgent({
-      location: { id: 'loc-1', name: 'repo', dir: '/repo' },
+      location: { id: 'loc-1', name: 'repo', dir: '/repo', sshHost: null },
       serverId: 'srv-1',
       discovered: {
         name: 'theirs',

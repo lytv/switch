@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { log } from '@main/lib/logger';
-import { knownAgentTypeForProvider } from './known-agent-type';
+import { knownAgentTypeForProvider, providerForKnownAgentType } from './known-agent-type';
 
 vi.mock('@main/lib/logger', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -41,5 +41,27 @@ describe('knownAgentTypeForProvider', () => {
         expect.objectContaining({ providerId: id, registeringAs: 'claude-code' })
       );
     }
+  });
+});
+
+describe('providerForKnownAgentType', () => {
+  it('maps claude-code to the claude provider', () => {
+    expect(providerForKnownAgentType('claude-code')).toBe('claude');
+  });
+
+  it('maps codex to the codex provider', () => {
+    expect(providerForKnownAgentType('codex')).toBe('codex');
+  });
+
+  it('maps opencode to the opencode provider', () => {
+    expect(providerForKnownAgentType('opencode')).toBe('opencode');
+  });
+
+  it('returns null for a value outside the known gateway types', () => {
+    expect(providerForKnownAgentType('gemini')).toBeNull();
+  });
+
+  it('returns null when no known agent type is set', () => {
+    expect(providerForKnownAgentType(null)).toBeNull();
   });
 });
