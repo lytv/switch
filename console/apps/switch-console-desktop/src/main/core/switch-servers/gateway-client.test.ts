@@ -30,6 +30,7 @@ vi.mock('./auth', () => ({ refreshSession, reauthenticateManagedServer }));
 const {
   createRoom,
   deleteBridge,
+  fetchAgentRooms,
   fetchBridges,
   fetchMe,
   ownsOwnerAddressedAgent,
@@ -756,5 +757,60 @@ describe('deleteBridge', () => {
     fetchMock.mockResolvedValue(errorResponse(500, 'adapter shutdown failed') as never);
 
     await expect(deleteBridge(SERVER, 'b1')).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+describe('fetchAgentRooms', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal('fetch', fetchMock);
+    getSessionCookie.mockResolvedValue(makeJwt(24 * 60 * 60));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reports a server-gone local agent as having no rooms, not as a failed fetch', async () => {
+    // A 404 here means the same thing it means to agentExistsOnServer: this
+    // install's record is stale, the server has no such agent. That must not
+    // read as "couldn't load this agent's rooms" — retrying a 404 never
+    // succeeds, so treating it as a fetch failure left the sidebar's
+    // "rooms may be out of date" banner stuck on forever.
+    fetchMock.mockResolvedValue(errorResponse(404, '{"detail":"Agent not found"}') as never);
+
+    await expect(fetchAgentRooms(SERVER, 'gone-agent')).resolves.toEqual([]);
+  });
+
+  it('still propagates a failure it has no case for', async () => {
+    fetchMock.mockResolvedValue(errorResponse(500, 'gateway on fire') as never);
+
+    await expect(fetchAgentRooms(SERVER, 'agent-1')).rejects.toMatchObject({ status: 500 });
+  });
+
+  it('returns the agent rooms on success', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        rooms: [
+          {
+            room_id: 'room-1',
+            room_name: 'council',
+            archived: false,
+            status: 'active',
+            room_role: 'member',
+          },
+        ],
+      }) as never
+    );
+
+    await expect(fetchAgentRooms(SERVER, 'agent-1')).resolves.toEqual([
+      {
+        roomId: 'room-1',
+        roomName: 'council',
+        archived: false,
+        status: 'active',
+        roomRole: 'member',
+      },
+    ]);
   });
 });

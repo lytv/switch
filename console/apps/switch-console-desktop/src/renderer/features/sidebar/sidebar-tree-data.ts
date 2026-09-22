@@ -1,5 +1,6 @@
 import { agentsStore } from '@renderer/features/locations/stores/agents-store';
 import type { LocationStore } from '@renderer/features/locations/stores/location';
+import { getLocationManagerStore } from '@renderer/features/locations/stores/location-selectors';
 import type { SessionStore } from '@renderer/features/sessions/stores/session-store';
 import { switchRoomsStore } from '@renderer/features/switch-servers/switch-rooms-store';
 import { switchServersStore } from '@renderer/features/switch-servers/switch-servers-store';
@@ -133,9 +134,18 @@ export async function refreshSidebarRoomState(force: boolean): Promise<void> {
  * Pending-locations only otherwise runs once, at app startup
  * (`processPendingLocations` in `main/index.ts`), which is why a CLI-created
  * room or agent needed a restart to appear.
+ *
+ * A newly-adopted agent's location also has to be mounted into the renderer's
+ * own location list, not only written to the database — `agentsAtLocationInScope`
+ * only ever looks at `sidebarStore.filteredLocations`, so an agent whose
+ * location the renderer has not mounted yet stays invisible even once
+ * `agentsStore` knows about it. {@link LocationManagerStore.reload} is the
+ * existing function for that (CHOO-1440's "mount a location that gained
+ * agents since last load"); this is simply another trigger for it.
  */
 export async function reloadRoomsAndAgents(): Promise<void> {
   await rpc.locations.processPendingLocations();
+  await getLocationManagerStore().reload();
   await refreshSidebarRoomState(true);
 }
 

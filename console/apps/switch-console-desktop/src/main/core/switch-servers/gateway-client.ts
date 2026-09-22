@@ -417,13 +417,29 @@ export async function agentExistsOnServer(server: SwitchServer, agentId: string)
   }
 }
 
+/**
+ * A local agent's rooms, as the gateway currently sees it.
+ *
+ * A 404 here means the server no longer has this agent at all — the local
+ * record is stale, the same fact `agentExistsOnServer` reports as `false` —
+ * not a fetch failure. Reporting it as an error made the sidebar's "rooms may
+ * be out of date" banner fire for every install carrying a stale agent,
+ * forever, since retrying a 404 never succeeds. It has no rooms on this
+ * server, so that is what is returned.
+ */
 export async function fetchAgentRooms(
   server: SwitchServer,
   agentId: string
 ): Promise<RemoteAgentRoom[]> {
-  const res = await gatewayFetch(server, `/agents/${encodeURIComponent(agentId)}`, {
-    authenticated: true,
-  });
+  let res: Response;
+  try {
+    res = await gatewayFetch(server, `/agents/${encodeURIComponent(agentId)}`, {
+      authenticated: true,
+    });
+  } catch (cause) {
+    if (cause instanceof GatewayError && cause.kind === 'http' && cause.status === 404) return [];
+    throw cause;
+  }
   const json = (await res.json()) as {
     rooms?: Array<{
       room_id: string;

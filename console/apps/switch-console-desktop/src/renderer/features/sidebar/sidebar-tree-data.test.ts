@@ -11,6 +11,7 @@ const toast = vi.fn();
 const processPendingLocations = vi.fn().mockResolvedValue(undefined);
 const backfillAgentIcons = vi.fn().mockResolvedValue({ kind: 'written', written: 0 });
 const load = vi.fn().mockResolvedValue(undefined);
+const reloadLocations = vi.fn().mockResolvedValue(undefined);
 const ensureMembershipsFor = vi.fn().mockResolvedValue(undefined);
 const loadRoomNames = vi.fn().mockResolvedValue(undefined);
 
@@ -23,6 +24,9 @@ vi.mock('@renderer/lib/ipc', () => ({
 }));
 vi.mock('@renderer/features/locations/stores/agents-store', () => ({
   agentsStore: { load, byLocation: new Map(), agentsOnServerAtLocation: () => [] },
+}));
+vi.mock('@renderer/features/locations/stores/location-selectors', () => ({
+  getLocationManagerStore: () => ({ reload: reloadLocations }),
 }));
 vi.mock('@renderer/features/switch-servers/switch-rooms-store', () => ({
   switchRoomsStore: { ensureMembershipsFor, loadRoomNames },
@@ -46,16 +50,18 @@ describe('reloadRoomsAndAgents', () => {
   beforeEach(() => {
     processPendingLocations.mockClear();
     load.mockClear();
+    reloadLocations.mockClear();
     ensureMembershipsFor.mockClear();
     loadRoomNames.mockClear();
   });
 
-  it('adopts pending-location folders, then reloads agents and rooms', async () => {
+  it('adopts pending-location folders, mounts new locations, then reloads agents and rooms', async () => {
     const { reloadRoomsAndAgents } = await import('./sidebar-tree-data');
 
     await reloadRoomsAndAgents();
 
     expect(processPendingLocations).toHaveBeenCalledTimes(1);
+    expect(reloadLocations).toHaveBeenCalledTimes(1);
     expect(load).toHaveBeenCalledTimes(1);
     expect(ensureMembershipsFor).toHaveBeenCalledWith([], { force: true });
     expect(loadRoomNames).toHaveBeenCalledTimes(1);
