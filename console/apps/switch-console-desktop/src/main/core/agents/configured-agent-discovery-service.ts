@@ -56,7 +56,10 @@ class ConfiguredAgentDiscoveryService {
     this.stops.delete(locationId);
   }
 
-  private async reconcileLocation(location: Location): Promise<void> {
+  /** Discover and adopt `.switch/agents/*.json` credentials already sitting in
+   * `location.dir`. Public so a fresh location can be reconciled immediately
+   * on open, rather than waiting for the next FS-watch event. */
+  async reconcileLocation(location: Location): Promise<void> {
     if (location.sshHost !== null) return;
     const discovered = await discoverConfiguredAgents({
       sshHost: null,

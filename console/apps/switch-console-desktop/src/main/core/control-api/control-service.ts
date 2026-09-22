@@ -5,6 +5,7 @@ import type { IDisposable, IInitializable } from '@switch-console/shared';
 import { app } from 'electron';
 import { getAgentById } from '@main/core/agents/getAgentById';
 import { getAgents } from '@main/core/agents/getAgents';
+import { openLocationFolder } from '@main/core/locations/open-location';
 import { getSession } from '@main/core/sessions/operations/getSession';
 import { sessionService } from '@main/core/sessions/session-service';
 import { log } from '@main/lib/logger';
@@ -41,6 +42,27 @@ class ControlService implements IInitializable, IDisposable {
   }
 
   private registerRoutes(): void {
+    this.server.route('POST', '/locations/open', async (req, res) => {
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await readJsonBody(req)) as Record<string, unknown>;
+      } catch {
+        sendJson(res, 400, { error: 'invalid request body' });
+        return;
+      }
+      const dir = typeof body['dir'] === 'string' ? body['dir'] : null;
+      if (!dir) {
+        sendJson(res, 400, { error: 'dir is required' });
+        return;
+      }
+      const result = await openLocationFolder(dir);
+      if (!result.success) {
+        sendJson(res, 400, { error: result.error.type, dir: result.error.dir });
+        return;
+      }
+      sendJson(res, 200, { location: result.data });
+    });
+
     this.server.route('GET', '/agents', async (_req, res) => {
       const agents = await getAgents();
       sendJson(res, 200, { agents });
