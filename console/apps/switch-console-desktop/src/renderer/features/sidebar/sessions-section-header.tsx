@@ -4,6 +4,7 @@ import {
   Laptop,
   MoreHorizontal,
   Plus,
+  RefreshCw,
   Server,
   UserPlus,
 } from 'lucide-react';
@@ -12,8 +13,10 @@ import { useState } from 'react';
 import { switchRoomsStore } from '@renderer/features/switch-servers/switch-rooms-store';
 import { AgentIcon } from '@renderer/lib/components/agent-icon';
 import { BridgeIcon, hasBridgeIcon } from '@renderer/lib/components/bridge-icon';
+import { toast } from '@renderer/lib/hooks/use-toast';
 import { useShowModal } from '@renderer/lib/modal/modal-provider';
 import { sidebarStore } from '@renderer/lib/stores/app-state';
+import { Button } from '@renderer/lib/ui/button';
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -28,14 +31,16 @@ import {
 } from '@renderer/lib/ui/dropdown-menu';
 import { SectionLabel } from '@renderer/lib/ui/label';
 import { SegmentedControl } from '@renderer/lib/ui/segmented-control';
+import { Spinner } from '@renderer/lib/ui/spinner';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@renderer/lib/ui/tooltip';
+import { log } from '@renderer/utils/logger';
 import { cn } from '@renderer/utils/utils';
 import type { AgentConnectionKind } from '@shared/core/agents/agent-connection';
 import { getProvider } from '@shared/core/providers/agent-provider-registry';
 import { type SidebarGrouping, UNBRIDGED_FILTER_VALUE } from '@shared/view-state';
 import { listedRoomKeys } from './room-tree';
 import { agentExpandKey, roomViewGroupKey } from './sidebar-store';
-import { scopedAgents } from './sidebar-tree-data';
+import { reloadRoomsAndAgents, scopedAgents } from './sidebar-tree-data';
 
 const CONNECTION_LABEL: Record<AgentConnectionKind, string> = {
   local: 'Local',
@@ -77,6 +82,54 @@ const ViewGroupingToggle = observer(function ViewGroupingToggle() {
       options={GROUPING_OPTIONS}
       ariaLabel="Group sidebar by"
     />
+  );
+});
+
+/**
+ * Re-reads rooms and agents from the server and adopts any agent folder the
+ * CLI created while Console was closed — including one still queued in
+ * pending-locations — so a CLI-created room or agent shows up here without a
+ * restart.
+ *
+ * The lists are left as they were on failure; only a toast reports it, so a
+ * flaky reload does not blank out what is already on screen.
+ */
+const ReloadButton = observer(function ReloadButton() {
+  const [reloading, setReloading] = useState(false);
+
+  const handleReload = async (): Promise<void> => {
+    setReloading(true);
+    try {
+      await reloadRoomsAndAgents();
+    } catch (error) {
+      log.warn('sidebar: reload failed', { error });
+      toast({
+        title: 'Reload failed',
+        description: 'Rooms and agents could not be re-read from the server.',
+        variant: 'destructive',
+      });
+    } finally {
+      setReloading(false);
+    }
+  };
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Reload"
+            disabled={reloading}
+            onClick={() => void handleReload()}
+          >
+            {reloading ? <Spinner className="size-3.5" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+        }
+      />
+      <TooltipContent>Reload</TooltipContent>
+    </Tooltip>
   );
 });
 
@@ -333,7 +386,10 @@ export const SessionsSectionHeader = observer(function SessionsSectionHeader() {
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
-        <ViewGroupingToggle />
+        <div className="flex items-center gap-1.5">
+          <ReloadButton />
+          <ViewGroupingToggle />
+        </div>
       </div>
       {/* Outside the tree's scroller, so it stays put as the list scrolls. */}
       <div className="px-2 pb-1">

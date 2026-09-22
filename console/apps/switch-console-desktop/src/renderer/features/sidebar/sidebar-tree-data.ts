@@ -125,6 +125,21 @@ export async function refreshSidebarRoomState(force: boolean): Promise<void> {
 }
 
 /**
+ * The sidebar's "Reload" button: adopt any agent folder the CLI created while
+ * Console was closed or not yet watching it — including one still queued in
+ * `pending-locations.json` — then re-read rooms and agents the same way
+ * {@link refreshSidebarRoomState} does everywhere else.
+ *
+ * Pending-locations only otherwise runs once, at app startup
+ * (`processPendingLocations` in `main/index.ts`), which is why a CLI-created
+ * room or agent needed a restart to appear.
+ */
+export async function reloadRoomsAndAgents(): Promise<void> {
+  await rpc.locations.processPendingLocations();
+  await refreshSidebarRoomState(true);
+}
+
+/**
  * Gaps between the passes {@link refreshSidebarRoomStateAfterOnboarding} makes.
  * Spread over a few seconds rather than fired once, because the state being
  * waited for does not exist yet when onboarding returns.
