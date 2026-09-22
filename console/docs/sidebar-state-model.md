@@ -75,7 +75,7 @@ Legend: ✅ converges · ⚠️ converges only on window focus · ❌ never conv
 | 3 | Remove agent from room | refetch after RPC | ✅ |
 | 4 | Create room in-app | refetches room list | ✅ |
 | 5 | **Room archived / renamed / deleted** | no in-app path exists; only happens externally | ⚠️ |
-| 6 | **Agent created after the sidebar mounted** | membership load runs once on mount with a fixed agent list; the retry helper only refreshes keys already cached | ⚠️ |
+| 6 | **CLI creates an agent after the sidebar mounted** | **Reload** processes pending locations, remounts locations, and reloads agents, memberships, and room names | ✅ (manual) |
 | 7 | Agent deleted | agents store reloads | ✅ |
 | 8 | **Membership changed externally** (Slack, gateway, another install) | nothing observes it | ⚠️ |
 | 9 | **Server becomes unreachable** | room list keeps last-known values silently | ❌ (never disclosed) |
