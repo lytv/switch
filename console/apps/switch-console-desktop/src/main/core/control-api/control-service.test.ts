@@ -17,9 +17,13 @@ const mockGetSessions = vi.fn();
 const mockSidecarRestart = vi.fn();
 const mockSidecarStop = vi.fn();
 const mockSidecarGetStatus = vi.fn();
+const mockOpenLocationFolder = vi.fn();
 
 vi.mock('@main/core/agents/getAgents', () => ({ getAgents: mockGetAgents }));
 vi.mock('@main/core/agents/getAgentById', () => ({ getAgentById: mockGetAgentById }));
+vi.mock('@main/core/locations/open-location', () => ({
+  openLocationFolder: mockOpenLocationFolder,
+}));
 vi.mock('@main/core/sessions/operations/getSession', () => ({ getSession: mockGetSession }));
 vi.mock('@main/core/sessions/session-service', () => ({
   sessionService: {
@@ -118,6 +122,62 @@ describe('ControlService routes', () => {
 
   afterEach(() => {
     controlService.dispose();
+  });
+
+  describe('POST /locations/open', () => {
+    const LOCATION = {
+      id: 'loc-1',
+      name: 'repo',
+      dir: '/repo',
+      sshHost: null,
+      createdAt: '2025-01-01T00:00:00Z',
+      updatedAt: '2025-01-01T00:00:00Z',
+    };
+
+    it('opens the location and returns it', async () => {
+      mockOpenLocationFolder.mockResolvedValue({ success: true, data: LOCATION });
+      const res = await request(
+        port,
+        'POST',
+        '/locations/open',
+        token,
+        JSON.stringify({ dir: '/repo' })
+      );
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ location: LOCATION });
+      expect(mockOpenLocationFolder).toHaveBeenCalledWith('/repo');
+    });
+
+    it('is a no-op success on a second call for the same folder', async () => {
+      mockOpenLocationFolder.mockResolvedValue({ success: true, data: LOCATION });
+      const body = JSON.stringify({ dir: '/repo' });
+      const first = await request(port, 'POST', '/locations/open', token, body);
+      const second = await request(port, 'POST', '/locations/open', token, body);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+    });
+
+    it('returns 400 when dir is missing', async () => {
+      const res = await request(port, 'POST', '/locations/open', token, JSON.stringify({}));
+      expect(res.status).toBe(400);
+      expect(mockOpenLocationFolder).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 for an invalid directory', async () => {
+      mockOpenLocationFolder.mockResolvedValue({
+        success: false,
+        error: { type: 'invalid-directory', dir: '/nope' },
+      });
+      const res = await request(
+        port,
+        'POST',
+        '/locations/open',
+        token,
+        JSON.stringify({ dir: '/nope' })
+      );
+      expect(res.status).toBe(400);
+      expect(JSON.parse(res.body)).toEqual({ error: 'invalid-directory', dir: '/nope' });
+    });
   });
 
   describe('GET /agents', () => {

@@ -19,6 +19,7 @@ import { appService } from './core/app/service';
 import { controlService } from './core/control-api/control-service';
 import { localDependencyManager } from './core/dependencies/dependency-managers';
 import { locationManager } from './core/locations/location-manager';
+import { processPendingLocations } from './core/locations/pending-locations';
 import { locationSettingsService } from './core/locations/settings/location-settings-service';
 import { localServerService } from './core/managed-switch-server/local-server-service';
 import { remoteServerService } from './core/managed-switch-server/remote-server-service';
@@ -201,6 +202,14 @@ void app.whenReady().then(async () => {
   });
 
   configuredAgentDiscoveryService.initialize();
+
+  // A CLI create that ran while Console was closed leaves its dir here rather
+  // than calling the (not-yet-running) control API. Unawaited: it opens each
+  // location and adopts its credentials the same way the control route does,
+  // and the window must not wait on it.
+  void processPendingLocations().catch((e: unknown) => {
+    log.warn('locations: failed to process pending locations at boot', { error: e });
+  });
 
   // Relaunch every session that was connected to a Switch room before this
   // restart, so it resumes receiving and responding to room events without the
