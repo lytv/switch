@@ -11,7 +11,7 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { chooseDeliveryMode, formatChannelEvent } from './event-format';
 import { notifyRuntimeHook } from './hooks';
-import { connectSwitchRuntime, onChannelNotification, registerSwitchTools } from './mcp-bridge';
+import { connectSwitchRuntime, registerSwitchTools } from './mcp-bridge';
 import type { SwitchBridge } from './mcp-bridge';
 
 export default function switchExtension(pi: ExtensionAPI) {
@@ -31,8 +31,7 @@ export default function switchExtension(pi: ExtensionAPI) {
 
   pi.on('session_start', async (_event, ctx) => {
     try {
-      bridge = await connectSwitchRuntime();
-      onChannelNotification(bridge, (content, meta) => {
+      bridge = await connectSwitchRuntime((content, meta) => {
         const text = formatChannelEvent({ content, meta });
         if (chooseDeliveryMode(!busy) === 'immediate') {
           pi.sendUserMessage(text);

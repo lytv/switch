@@ -39,7 +39,9 @@ export interface SwitchBridge {
 }
 
 /** Spawn the runtime and connect to it as an MCP client. */
-export async function connectSwitchRuntime(): Promise<SwitchBridge> {
+export async function connectSwitchRuntime(
+  onEvent: (content: string, meta: Record<string, string>) => void
+): Promise<SwitchBridge> {
   const transport = new StdioClientTransport({
     command: 'npx',
     args: ['-y', RUNTIME_PACKAGE],
@@ -49,6 +51,12 @@ export async function connectSwitchRuntime(): Promise<SwitchBridge> {
   });
 
   const client = new Client({ name: 'pi-switch-connector', version: '0.1.0' }, { capabilities: {} });
+  client.fallbackNotificationHandler = async (notification: Notification) => {
+    if (notification.method !== 'notifications/claude/channel') return;
+    const params = notification.params as { content?: unknown; meta?: unknown } | undefined;
+    if (typeof params?.content !== 'string') return;
+    onEvent(params.content, (params.meta ?? {}) as Record<string, string>);
+  };
   await client.connect(transport);
 
   return {
@@ -101,29 +109,5 @@ function buildToolDefinition(bridge: SwitchBridge, tool: Tool) {
 
       return mapped;
     },
-  };
-}
-
-/**
- * Deliver the runtime's `notifications/claude/channel` events (its one
- * custom notification method - see `emitNotification` in `bin.ts`) to
- * `onEvent`.
- *
- * The MCP client SDK routes any notification with no registered schema
- * handler to `fallbackNotificationHandler`, which is exactly this method:
- * Claude Code's own `claude/channel` experimental capability is how the
- * runtime was designed to be consumed, and a generic MCP client receives the
- * same notification just as generically.
- */
-export function onChannelNotification(
-  bridge: SwitchBridge,
-  onEvent: (content: string, meta: Record<string, string>) => void
-): void {
-  bridge.client.fallbackNotificationHandler = async (notification: Notification) => {
-    if (notification.method !== 'notifications/claude/channel') return;
-    const params = notification.params as { content?: unknown; meta?: unknown } | undefined;
-    if (typeof params?.content !== 'string') return;
-    const meta = (params.meta ?? {}) as Record<string, string>;
-    onEvent(params.content, meta);
   };
 }

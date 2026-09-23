@@ -185,7 +185,6 @@ interface Waiter {
 export interface StdioMcpClient {
   listTools(): Promise<{ tools: McpToolInfo[] }>;
   callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<McpToolResult>;
-  onNotification(handler: (method: string, params: unknown) => void): void;
   close(): Promise<void>;
 }
 
@@ -329,7 +328,9 @@ class StdioSession {
 }
 
 /** Spawn the runtime and connect over its stdio. Inherits this process's env (SWITCH_* and PATH). */
-export async function connectSwitchRuntime(): Promise<StdioMcpClient> {
+export async function connectSwitchRuntime(
+  onNotification: (method: string, params: unknown) => void
+): Promise<StdioMcpClient> {
   const child = spawn('npx', ['-y', RUNTIME_PACKAGE], {
     stdio: ['pipe', 'pipe', 'inherit'],
     shell: false,
@@ -340,6 +341,7 @@ export async function connectSwitchRuntime(): Promise<StdioMcpClient> {
     throw new Error('Failed to open stdio pipes to the Switch runtime');
   }
   const session = new StdioSession(child);
+  session.onNotification(onNotification);
   try {
     const result = (await session.request(
       'initialize',
@@ -361,7 +363,6 @@ export async function connectSwitchRuntime(): Promise<StdioMcpClient> {
   return {
     listTools: () => session.request('tools/list', {}) as Promise<{ tools: McpToolInfo[] }>,
     callTool: (params) => session.request('tools/call', params) as Promise<McpToolResult>,
-    onNotification: (handler) => session.onNotification(handler),
     close: () => session.close(),
   };
 }
@@ -386,20 +387,17 @@ export default function switchExtension(pi: ExtensionAPI) {
 
   pi.on('session_start', async (_event, ctx) => {
     try {
-      client = await connectSwitchRuntime();
-      if (!managed) {
-        client.onNotification((method, params) => {
-          if (method !== CHANNEL_METHOD) return;
-          const p = params as { content?: unknown; meta?: unknown } | undefined;
-          if (typeof p?.content !== 'string') return;
-          const text = formatChannelEvent(p.content, (p.meta ?? {}) as Record<string, string>);
-          if (chooseDeliveryMode(!busy) === 'immediate') {
-            pi.sendUserMessage(text);
-          } else {
-            pi.sendUserMessage(text, { deliverAs: 'steer' });
-          }
-        });
-      }
+      client = await connectSwitchRuntime((method, params) => {
+        if (managed || method !== CHANNEL_METHOD) return;
+        const p = params as { content?: unknown; meta?: unknown } | undefined;
+        if (typeof p?.content !== 'string') return;
+        const text = formatChannelEvent(p.content, (p.meta ?? {}) as Record<string, string>);
+        if (chooseDeliveryMode(!busy) === 'immediate') {
+          pi.sendUserMessage(text);
+        } else {
+          pi.sendUserMessage(text, { deliverAs: 'steer' });
+        }
+      });
       const { tools } = await client.listTools();
       for (const tool of tools) {
         pi.registerTool({

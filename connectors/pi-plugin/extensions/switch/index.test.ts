@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   connectSwitchRuntime: vi.fn(),
-  onChannelNotification: vi.fn(),
   registerSwitchTools: vi.fn(),
 }));
 
@@ -11,11 +10,11 @@ vi.mock('./mcp-bridge', () => mocks);
 import switchExtension from './index';
 
 describe('switchExtension', () => {
-  it('subscribes to room events before listing tools', async () => {
+  it('handles a room event during runtime startup', async () => {
     const bridge = { client: { listTools: vi.fn() }, sessionPid: 1, close: vi.fn() };
-    mocks.connectSwitchRuntime.mockResolvedValue(bridge);
-    mocks.onChannelNotification.mockImplementation((_bridge, handler) => {
-      handler('ready', { room_id: 'room' });
+    mocks.connectSwitchRuntime.mockImplementation((onEvent) => {
+      onEvent('ready', { room_id: 'room' });
+      return Promise.resolve(bridge);
     });
     mocks.registerSwitchTools.mockResolvedValue(undefined);
 
@@ -29,7 +28,7 @@ describe('switchExtension', () => {
 
     await handlers.get('session_start')?.({} as never, { ui: { notify: vi.fn() } } as never);
 
-    expect(mocks.onChannelNotification).toHaveBeenCalledBefore(mocks.registerSwitchTools);
+    expect(mocks.connectSwitchRuntime).toHaveBeenCalledBefore(mocks.registerSwitchTools);
     expect(pi.sendUserMessage).toHaveBeenCalledWith('[Switch] room room: ready');
   });
 });
