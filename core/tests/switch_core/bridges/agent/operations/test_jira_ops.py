@@ -29,7 +29,7 @@ from switch_core.bridges.agent.operations import all_operations
 from switch_core.bridges.agent.operations import context as op_context
 from switch_core.bridges.jira import routes as jira_webhook_routes
 from switch_core.config import SwitchConfig
-from switch_core.db.models import Agent, ApiKey, Client, Room, User
+from switch_core.db.models import Agent, ApiKey, Client, JiraTrigger, Room, User
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
@@ -348,8 +348,12 @@ async def test_list_deliveries_over_ops(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session:
-        room, _ = await _room_with_member(session, "del-room", "coder")
+        room, coder = await _room_with_member(session, "del-room", "coder")
         room_id = room.id
+        private_room = await _make_room(session, "private-del-room")
+        await _ROOM_STORE.add_agents(session, private_room.id, [coder.id])
+        await session.commit()
+        private_room_id = private_room.id
     client = _ops_client(monkeypatch, session_factory)
     created = await client.post(
         f"/agents/{AGENT}/ops/create_jira_trigger",
@@ -358,6 +362,15 @@ async def test_list_deliveries_over_ops(
     rule_id = created.json()["result"]["id"]
     rule_name = created.json()["result"]["name"]
     async with session_factory() as session:
+        private_trigger = JiraTrigger(
+            name="Private delivery rule",
+            instance="acme",
+            fire_on="created",
+            target_room_id=private_room_id,
+            agent_name="coder",
+            message_template="{{issue.key}}",
+        )
+        await _TRIGGER_STORE.create(session, private_trigger)
         await _TRIGGER_STORE.try_record_firing(
             session,
             issue_key="DEL-1",
@@ -366,7 +379,7 @@ async def test_list_deliveries_over_ops(
             dedupe_window=timedelta(seconds=60),
             instance="acme",
             rule_name=rule_name,
-            matched_rule_ids=[rule_id],
+            matched_rule_ids=[rule_id, private_trigger.id],
         )
         await session.commit()
 
@@ -378,7 +391,8 @@ async def test_list_deliveries_over_ops(
     assert response.status_code == 200
     result = response.json()["result"]
     assert result["retain_seconds"] > 0
-    assert any(d["issue_key"] == "DEL-1" for d in result["deliveries"])
+    delivery = next(d for d in result["deliveries"] if d["issue_key"] == "DEL-1")
+    assert delivery["matched_rule_ids"] == [rule_id]
 
 
 async def test_jira_operations_scope_rules_to_caller_rooms(

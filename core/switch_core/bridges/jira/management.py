@@ -210,10 +210,6 @@ def webhook_url(config: SwitchConfig, instance: str) -> str:
     return urljoin(base + "/", path.lstrip("/"))
 
 
-def _webhook_url(config: SwitchConfig, instance: str) -> str:
-    return webhook_url(config, instance)
-
-
 def _sample_event() -> ParsedJiraEvent:
     return ParsedJiraEvent(
         event_kind="updated",
@@ -242,7 +238,9 @@ async def _rooms_for_group(session: AsyncSession, group_id: str) -> list[Room]:
     return list(result.scalars().all())
 
 
-def _delivery_to_detail(row: object) -> JiraDeliveryDetail:
+def _delivery_to_detail(
+    row: object, visible_rule_ids: set[str] | None = None
+) -> JiraDeliveryDetail:
     room_results_raw = getattr(row, "room_results", None) or []
     room_results = [
         JiraRoomDeliveryResult(
@@ -265,7 +263,11 @@ def _delivery_to_detail(row: object) -> JiraDeliveryDetail:
         instance=row.instance or "",  # type: ignore[attr-defined]
         transition_key=row.transition_key,  # type: ignore[attr-defined]
         status=row.status,  # type: ignore[attr-defined]
-        matched_rule_ids=[str(x) for x in matched],
+        matched_rule_ids=[
+            str(rule_id)
+            for rule_id in matched
+            if visible_rule_ids is None or str(rule_id) in visible_rule_ids
+        ],
         room_results=room_results,
         error=row.error,  # type: ignore[attr-defined]
         attempt_count=int(row.attempt_count or 0),  # type: ignore[attr-defined]
@@ -326,7 +328,7 @@ async def get_setup(config: SwitchConfig) -> JiraSetupResponse:
     instances = [
         JiraInstanceSetup(
             instance=name,
-            webhook_url=_webhook_url(config, name),
+            webhook_url=webhook_url(config, name),
             secret_masked=_mask_secret(secret),
             secret_configured=bool(secret),
         )
@@ -651,8 +653,12 @@ async def list_deliveries(
         limit=limit,
         offset=offset,
     )
+    visible_rule_ids = set(rule_ids) if rule_ids is not None else None
     return JiraDeliveryListResponse(
-        deliveries=[_delivery_to_detail(row) for row in rows],
+        deliveries=[
+            _delivery_to_detail(row, visible_rule_ids)
+            for row in rows
+        ],
         retain_seconds=config.jira_delivery_log_retain_seconds,
         max_rows=config.jira_delivery_log_max_rows,
     )
