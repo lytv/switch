@@ -95,7 +95,7 @@ just test -k "test_name"         # run specific test
 
 ## Connector plugins
 
-There are **three** connector plugins under `connectors/`, one per agent host,
+There are **four** connector plugins under `connectors/`, one per agent host,
 and each ships its own copy of the Switch room-workflow skill at
 `skills/switch/SKILL.md`:
 
@@ -165,18 +165,33 @@ and each ships its own copy of the Switch room-workflow skill at
   rejects unknown keys on an MCP entry and fails the whole config with them,
   which is why the install bookkeeping sits beside `opencode.json` rather than
   inside it.
+- `connectors/pi-plugin/` - manifest `package.json` (a pi package: `pi:
+  {extensions, skills}`). Ships the skill and a pi **extension**
+  (`extensions/switch/`), manually installed with `pi install <path>`.
+  Switch Console also installs its embedded extension and skill as files.
+  pi has **no
+  built-in MCP client** at all (unlike the other three hosts, which register
+  the runtime as an MCP server through host-native config), so the extension
+  itself spawns `@sandboxaq/switch-agent-runtime`'s `./bin` over stdio using
+  the MCP TypeScript SDK's `Client`, and bridges its tools and
+  `notifications/claude/channel` events into pi's own `registerTool()` /
+  `sendUserMessage()`. See the connector's own `README.md` for the rest,
+  including the local-hook-listener calls it makes for the handful of things
+  the runtime's other hosts get from a native `PostToolUse`-style hook.
 
 When you change how agents interact with Switch — new/changed MCP tools, in-room
 commands, room workflow, or anything an agent-facing client needs to know:
 
-- **Update all three skills.** A room-workflow change must land in
-  `connectors/claude-code-plugin/skills/switch/SKILL.md`,
-  `connectors/codex-plugin/skills/switch/SKILL.md` *and*
-  `connectors/opencode-plugin/skills/switch/SKILL.md` so the documented workflow
-  matches actual behavior on every host.
-  `core/tests/switch_core/bridges/agent/test_mcp_tool_surface.py` compares the
-  three `## Tool index` sections against each other and against the tools the
-  server actually registers, so a host left undocumented fails there.
+- **Update every connector's skill.** A room-workflow change must land in
+  `skills/switch/SKILL.md` under each of `connectors/claude-code-plugin/`,
+  `connectors/codex-plugin/`, `connectors/opencode-plugin/` *and*
+  `connectors/pi-plugin/` so the documented workflow matches actual behavior
+  on every host.
+  `core/tests/switch_core/bridges/agent/test_mcp_tool_surface.py` globs
+  `connectors/*/skills/switch/SKILL.md` and compares each one's
+  `## Tool index` section against the others and against the tools the server
+  actually registers, so a host left undocumented - or a new connector
+  missing this file - fails there.
 - **Diff the skills against each other after editing.** They are deliberately not identical
   (host-specific wording for tool namespacing, event delivery, attachments, and
   MCP registration), so diff them to confirm

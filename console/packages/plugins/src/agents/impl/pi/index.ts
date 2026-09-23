@@ -5,6 +5,7 @@ import {
   npmDependency,
 } from '@switch-console/core/agents/plugins/helpers';
 import { PI_EXTENSION_CONTENT } from './plugin-file';
+import { buildPiSwitchConnector } from './switch-connector';
 
 const PI_EXTENSION_PATH = '.pi/extensions/switchdash-hook.ts';
 import { icon } from './icon';
@@ -53,7 +54,14 @@ export const plugin = definePlugin(
       kind: 'resumable',
     },
     repoAgents: { kind: 'none' },
-    switchSetup: { kind: 'none' },
+    // pi has no plugin marketplace to install a connector from, and no
+    // built-in MCP client to register the runtime through — so Switch Console
+    // writes the connector's files itself, like it does for OpenCode.
+    switchSetup: {
+      kind: 'files',
+      connectorName: 'Switch connector',
+      artifact: 'switch-connector-pi',
+    },
   },
   { icon }
 );
@@ -67,4 +75,5 @@ export const provider = registerPluginBehavior(plugin, {
       }),
   },
   plugins: createFileDropPlugin({ relativePath: PI_EXTENSION_PATH, content: PI_EXTENSION_CONTENT }),
+  switchSetup: { files: buildPiSwitchConnector() },
 });

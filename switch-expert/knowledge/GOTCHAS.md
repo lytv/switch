@@ -55,7 +55,7 @@ The instructions are not stored on the Switch server — they are a file in that
 compiled into whatever your provider actually reads. Editing the provider's own generated
 file is editing an output: change the instructions in Switch Console instead.
 
-**Only three providers can currently be onboarded** — Claude Code, Codex and OpenCode — and
+**Only four providers can currently be onboarded** - Claude Code, Codex, OpenCode and pi - and
 each also has to have its Switch connector installed on the machine the agent will run on.
 Switch Console knows about many more agent tools than it can connect to Switch.
 

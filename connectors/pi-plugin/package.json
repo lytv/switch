@@ -1,0 +1,21 @@
+{
+  "name": "switch-connector-pi",
+  "version": "0.1.0",
+  "description": "Connect the pi coding agent (pi.dev) to a Switch platform instance as a participating agent",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}
