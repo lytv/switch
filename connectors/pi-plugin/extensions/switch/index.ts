@@ -32,7 +32,6 @@ export default function switchExtension(pi: ExtensionAPI) {
   pi.on('session_start', async (_event, ctx) => {
     try {
       bridge = await connectSwitchRuntime();
-      await registerSwitchTools(pi, bridge);
       onChannelNotification(bridge, (content, meta) => {
         const text = formatChannelEvent({ content, meta });
         if (chooseDeliveryMode(!busy) === 'immediate') {
@@ -41,6 +40,7 @@ export default function switchExtension(pi: ExtensionAPI) {
           pi.sendUserMessage(text, { deliverAs: 'steer' });
         }
       });
+      await registerSwitchTools(pi, bridge);
     } catch (err) {
       bridge = null;
       ctx.ui.notify(`Switch connector failed to start: ${err instanceof Error ? err.message : err}`, 'error');

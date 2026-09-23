@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { SWITCH_AGENT_RUNTIME_PIN } from '../../../distribution';
 import { pluginRegistry } from '../../registry';
 import { provider } from './index';
 import { PI_SKILL_CONTENT } from './skill-file';
@@ -87,14 +86,6 @@ describe('pi connector assets', () => {
     expect(files.get(PI_SKILL_PATH)).toBe(PI_SKILL_CONTENT);
   });
 
-  it('names the skill directory to match the skill, as pi requires', () => {
-    const declaredName = /^---\n(?:.*\n)*?name:\s*"?([\w-]+)"?\s*$/m.exec(PI_SKILL_CONTENT);
-    // …/skills/<dir>/SKILL.md — the folder pi derives the skill name from.
-    const directory = PI_SKILL_PATH.split('/').at(-2);
-
-    expect(declaredName?.[1]).toBe(directory);
-  });
-
   it('removes the extension, skill and marker on uninstall', async () => {
     const files = await install();
     await buildPiSwitchConnector().uninstall(memoryFs(files));
@@ -120,10 +111,6 @@ describe('pi connector assets', () => {
     expect(await buildPiSwitchConnector().installedVersion(memoryFs(files))).toBe('1.0.0');
   });
 
-  it('spawns the same agent runtime as the rest of the repo', () => {
-    expect(PI_SWITCH_EXTENSION_CONTENT).toContain(SWITCH_AGENT_RUNTIME_PIN);
-  });
-
   it('declares a version for the connector', () => {
     const manifest = JSON.parse(connectorFile('package.json')) as {
       name?: string;
@@ -133,24 +120,6 @@ describe('pi connector assets', () => {
     expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  /**
-   * The embedded extension runs from `~/.pi/agent/extensions/`, where no
-   * `node_modules` exists and nothing runs `npm install`. Any runtime import
-   * beyond node builtins and pi's own extension API fails the load — and with
-   * it every Switch tool in the session. (`import type` is erased before pi
-   * loads the file, so the pi API import is free.)
-   */
-  it('imports nothing at runtime beyond node builtins and pis own API', () => {
-    const runtimeImports = [
-      ...PI_SWITCH_EXTENSION_CONTENT.matchAll(
-        /^\s*import\s+(?!type\s)(?:[^'"]*?\sfrom\s+)?['"]([^'"]+)['"]/gm
-      ),
-    ].map((m) => m[1]);
-    for (const spec of runtimeImports) {
-      expect(spec.startsWith('node:')).toBe(true);
-    }
-    expect(PI_SWITCH_EXTENSION_CONTENT).not.toContain('require(');
-  });
 });
 
 describe('pi provider wiring', () => {

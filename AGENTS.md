@@ -167,8 +167,9 @@ and each ships its own copy of the Switch room-workflow skill at
   inside it.
 - `connectors/pi-plugin/` - manifest `package.json` (a pi package: `pi:
   {extensions, skills}`). Ships the skill and a pi **extension**
-  (`extensions/switch/`), manually installed only (`pi install <path>`) -
-  there is no Switch Console integration for this host yet. pi has **no
+  (`extensions/switch/`), manually installed with `pi install <path>`.
+  Switch Console also installs its embedded extension and skill as files.
+  pi has **no
   built-in MCP client** at all (unlike the other three hosts, which register
   the runtime as an MCP server through host-native config), so the extension
   itself spawns `@sandboxaq/switch-agent-runtime`'s `./bin` over stdio using

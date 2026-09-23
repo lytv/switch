@@ -396,6 +396,19 @@ export default function switchExtension(pi: ExtensionAPI) {
   pi.on('session_start', async (_event, ctx) => {
     try {
       client = await connectSwitchRuntime();
+      if (!managed) {
+        client.onNotification((method, params) => {
+          if (method !== CHANNEL_METHOD) return;
+          const p = params as { content?: unknown; meta?: unknown } | undefined;
+          if (typeof p?.content !== 'string') return;
+          const text = formatChannelEvent(p.content, (p.meta ?? {}) as Record<string, string>);
+          if (chooseDeliveryMode(!busy) === 'immediate') {
+            pi.sendUserMessage(text);
+          } else {
+            pi.sendUserMessage(text, { deliverAs: 'steer' });
+          }
+        });
+      }
       const { tools } = await client.listTools();
       for (const tool of tools) {
         pi.registerTool({
@@ -414,19 +427,6 @@ export default function switchExtension(pi: ExtensionAPI) {
             if (hookPath) void notifyRuntimeHook(sessionPid, hookPath);
             return mapped;
           },
-        });
-      }
-      if (!managed) {
-        client.onNotification((method, params) => {
-          if (method !== CHANNEL_METHOD) return;
-          const p = params as { content?: unknown; meta?: unknown } | undefined;
-          if (typeof p?.content !== 'string') return;
-          const text = formatChannelEvent(p.content, (p.meta ?? {}) as Record<string, string>);
-          if (chooseDeliveryMode(!busy) === 'immediate') {
-            pi.sendUserMessage(text);
-          } else {
-            pi.sendUserMessage(text, { deliverAs: 'steer' });
-          }
         });
       }
     } catch (err) {

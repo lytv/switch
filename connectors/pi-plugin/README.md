@@ -110,16 +110,12 @@ calls the same listener:
   `claude-code-plugin` ship for registering a fresh agent from a bare
   terminal). OpenCode doesn't have one either - env vars or a
   `.switch/agents/*.json` written by hand are the standalone path for both.
-  If pi grows a Switch Console `switchSetup` integration later, that
-  integration point is the natural place to add one.
 - **A Switch Console reporting integration** like OpenCode's
   `plugin/switch-notifications.js` (which reports session state - working,
   idle, tool activity - to Switch Console over a local hook port). pi's
   extension events (`agent_start`, `tool_execution_start/end`,
-  `agent_settled`, …) could support the same thing, but there is no Switch
-  Console `switchSetup` wiring in this pass to consume it, so it's left for
-  the Switch Console integration follow-up above rather than built and left
-  unused.
+  `agent_settled`, …) could support the same thing, but this change does not
+  use them for Console session reporting.
 - **Tool call mediation and local-tool-call event reporting**, the way
   Claude Code's `hooks/switch_hook.py` does (`pre-tool-call` /
   `post-tool-result` mediation, `events/report`). The room-workflow skill
@@ -187,10 +183,9 @@ with the agent name pi should act as before using any other Switch tool.
 ### `/switch` command
 
 Reports whether the connector is connected and how many Switch tools are
-registered. It does not do setup - with no Switch Console and no `configure`
-skill for pi yet, setup is exporting the environment variables above (or
-writing the agent store file another connector's `configure` skill would
-write) before starting pi.
+registered. It does not do setup. Export the environment variables above (or
+write the agent store file another connector's `configure` skill would write)
+before starting a standalone pi session.
 
 ## Testing
 
