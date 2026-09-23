@@ -68,26 +68,36 @@ def _config(**overrides: object) -> SwitchConfig:
 def _ops_client(
     monkeypatch: pytest.MonkeyPatch,
     session_factory: async_sessionmaker[AsyncSession],
+    caller_id: str = AGENT,
 ) -> AsyncClient:
     protocol = SimpleNamespace(session_factory=session_factory, config=_config())
     monkeypatch.setattr(op_context, "_protocol", protocol)
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_agent_from_scope] = lambda: SimpleNamespace(id=AGENT)
+    app.dependency_overrides[get_agent_from_scope] = lambda: SimpleNamespace(id=caller_id)
     app.dependency_overrides[get_api_protocol] = lambda: SimpleNamespace(
         connections=SimpleNamespace(require=lambda *a: None)
     )
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
-async def _make_room(session: AsyncSession, name: str) -> Room:
-    room = Room(matrix_room_id=f"!{name}:test", name=name, description=f"{name} desc")
+async def _make_room(
+    session: AsyncSession, name: str, group_id: str | None = None
+) -> Room:
+    room = Room(
+        matrix_room_id=f"!{name}:test",
+        name=name,
+        description=f"{name} desc",
+        group_id=group_id,
+    )
     session.add(room)
     await session.flush()
     return room
 
 
-async def _make_agent(session: AsyncSession, name: str) -> Agent:
+async def _make_agent(
+    session: AsyncSession, name: str, agent_id: str | None = None
+) -> Agent:
     user = User(name=f"{name}-owner", email=f"{name}-owner@test", role="user")
     session.add(user)
     await session.flush()
@@ -106,6 +116,7 @@ async def _make_agent(session: AsyncSession, name: str) -> Agent:
     session.add_all([api_key, client])
     await session.flush()
     agent = Agent(
+        id=agent_id,
         name=name,
         description=f"{name} desc",
         agent_type="session_addressable",
@@ -124,7 +135,8 @@ async def _room_with_member(
 ) -> tuple[Room, Agent]:
     room = await _make_room(session, room_name)
     agent = await _make_agent(session, agent_name)
-    await _ROOM_STORE.add_agents(session, room.id, [agent.id])
+    caller = await _make_agent(session, "caller", AGENT)
+    await _ROOM_STORE.add_agents(session, room.id, [agent.id, caller.id])
     await session.commit()
     return room, agent
 
@@ -153,7 +165,14 @@ async def test_list_jira_instances_masks_the_secret(
         service=object(),  # type: ignore[arg-type]
         secrets_by_instance={"acme": SECRET},
     )
+    async with session_factory() as session:
+        room, _ = await _room_with_member(session, "setup-room", "coder")
+        room_id = room.id
     client = _ops_client(monkeypatch, session_factory)
+    created = await client.post(
+        f"/agents/{AGENT}/ops/create_jira_trigger", json=_create_body(room_id)
+    )
+    assert created.status_code == 200
 
     response = await client.post(f"/agents/{AGENT}/ops/list_jira_instances", json={})
 
@@ -217,6 +236,8 @@ async def test_create_refuses_agent_outside_the_room(
     async with session_factory() as session:
         room = await _make_room(session, "lonely-room")
         await _make_agent(session, "coder")
+        caller = await _make_agent(session, "caller", AGENT)
+        await _ROOM_STORE.add_agents(session, room.id, [caller.id])
         await session.commit()
         room_id = room.id
     client = _ops_client(monkeypatch, session_factory)
@@ -357,6 +378,101 @@ async def test_list_deliveries_over_ops(
     result = response.json()["result"]
     assert result["retain_seconds"] > 0
     assert any(d["issue_key"] == "DEL-1" for d in result["deliveries"])
+
+
+async def test_jira_operations_scope_rules_to_caller_rooms(
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        room, _ = await _room_with_member(session, "scoped-room", "coder")
+        outsider = await _make_agent(session, "outsider")
+        room_id = room.id
+        await session.commit()
+    client = _ops_client(monkeypatch, session_factory)
+    created = await client.post(
+        f"/agents/{AGENT}/ops/create_jira_trigger", json=_create_body(room_id)
+    )
+    assert created.status_code == 200
+    trigger_id = created.json()["result"]["id"]
+    async with session_factory() as session:
+        await _TRIGGER_STORE.try_record_firing(
+            session,
+            issue_key="SCOPE-1",
+            rule_id=trigger_id,
+            transition_key="transition",
+            dedupe_window=timedelta(seconds=60),
+            instance="acme",
+            rule_name="scoped",
+        )
+        await session.commit()
+    jira_webhook_routes.init_jira_routes(
+        service=object(), secrets_by_instance={"acme": SECRET}  # type: ignore[arg-type]
+    )
+    outsider_client = _ops_client(monkeypatch, session_factory, outsider.id)
+
+    listed = await outsider_client.post(f"/agents/{AGENT}/ops/list_jira_triggers", json={})
+    setup = await outsider_client.post(f"/agents/{AGENT}/ops/list_jira_instances", json={})
+    deliveries = await outsider_client.post(
+        f"/agents/{AGENT}/ops/list_jira_deliveries", json={}
+    )
+    assert listed.status_code == 200
+    assert listed.json()["result"] == []
+    assert setup.status_code == 200
+    assert setup.json()["result"]["instances"] == []
+    assert deliveries.status_code == 200
+    assert deliveries.json()["result"]["deliveries"] == []
+
+    for operation, body in (
+        ("get_jira_trigger", {"trigger_id": trigger_id}),
+        ("update_jira_trigger", {"trigger_id": trigger_id, "enabled": False}),
+        ("delete_jira_trigger", {"trigger_id": trigger_id}),
+        ("dry_run_jira_trigger", {"trigger_id": trigger_id}),
+        ("create_jira_trigger", _create_body(room_id)),
+        ("list_jira_agent_options", {"room_id": room_id}),
+    ):
+        response = await outsider_client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+        assert response.status_code == 403
+
+
+async def test_jira_group_targets_require_a_member_room(
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        group = await _ROOM_GROUP_STORE.create(
+            session,
+            name="scoped-group",
+            description=None,
+            color=None,
+            parent_group_id=None,
+        )
+        room = await _make_room(session, "group-room", group.id)
+        caller = await _make_agent(session, "caller", AGENT)
+        await _make_agent(session, "coder")
+        outsider = await _make_agent(session, "outsider")
+        await _ROOM_STORE.add_agents(session, room.id, [caller.id])
+        await session.commit()
+    client = _ops_client(monkeypatch, session_factory)
+    created = await client.post(
+        f"/agents/{AGENT}/ops/create_jira_trigger",
+        json=_create_body(
+            room.id,
+            target_kind="group",
+            target_room_id=None,
+            target_group_id=group.id,
+        ),
+    )
+    assert created.status_code == 200
+    trigger_id = created.json()["result"]["id"]
+    outsider_client = _ops_client(monkeypatch, session_factory, outsider.id)
+
+    for operation, body in (
+        ("get_jira_trigger", {"trigger_id": trigger_id}),
+        ("list_jira_agent_options", {"group_id": group.id}),
+    ):
+        response = await outsider_client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+        assert response.status_code == 403
 
 
 async def test_message_tokens_over_ops(

@@ -634,6 +634,7 @@ async def list_deliveries(
     *,
     instance: str | None = None,
     rule_id: str | None = None,
+    rule_ids: list[str] | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> JiraDeliveryListResponse:
@@ -641,6 +642,7 @@ async def list_deliveries(
         session,
         instance=instance,
         rule_id=rule_id,
+        rule_ids=rule_ids,
         limit=limit,
         offset=offset,
     )

@@ -812,6 +812,7 @@ failure-mode tools are covered in the sections just above.
 - `attach_reference_to_room` — attach an existing Reference to a room.
 - `link_rooms` — add a directed pointer between two rooms.
 - `unlink_rooms` — remove one.
+- Jira operations only access targets in rooms you belong to.
 - `list_jira_instances` — Jira webhook instances, masked secrets only.
 - `list_jira_triggers` — trigger rules, optionally for one instance.
 - `get_jira_trigger` — one rule's detail.

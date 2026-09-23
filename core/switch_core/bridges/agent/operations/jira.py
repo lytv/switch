@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from switch_core.bridges.agent.operations.context import get_protocol
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from switch_core.bridges.agent.operations.context import get_agent_id, get_protocol
 from switch_core.bridges.agent.operations.registry import operation
 from switch_core.bridges.jira import management as jira_management
 from switch_core.bridges.jira.template import MESSAGE_TOKENS
@@ -35,6 +37,41 @@ _ROOM_GROUP_STORE = RoomGroupStore()
 _AGENT_STORE = AgentStore()
 
 
+async def _caller_scope(session: AsyncSession) -> tuple[set[str], set[str]]:
+    rooms = await _ROOM_STORE.get_rooms_for_agent(session, get_agent_id())
+    return {room.id for room in rooms}, {room.group_id for room in rooms if room.group_id}
+
+
+def _in_scope(trigger: Any, scope: tuple[set[str], set[str]]) -> bool:
+    room_ids, group_ids = scope
+    return trigger.target_room_id in room_ids or trigger.target_group_id in group_ids
+
+
+def _require_target_scope(
+    scope: tuple[set[str], set[str]],
+    *,
+    room_id: str | None,
+    group_id: str | None,
+) -> None:
+    if room_id in scope[0] or group_id in scope[1]:
+        return
+    raise PermissionError("You are not a member of this Jira trigger target")
+
+
+async def _require_trigger_scope(
+    session: AsyncSession, trigger_id: str, scope: tuple[set[str], set[str]]
+) -> Any:
+    trigger = await _TRIGGER_STORE.get(session, trigger_id)
+    if trigger is None:
+        raise HTTPException(status_code=404, detail="Jira trigger not found")
+    _require_target_scope(
+        scope,
+        room_id=trigger.target_room_id,
+        group_id=trigger.target_group_id,
+    )
+    return trigger
+
+
 @operation
 async def list_jira_instances() -> dict[str, Any]:
     """List configured Jira webhook instances (setup-read).
@@ -47,7 +84,13 @@ async def list_jira_instances() -> dict[str, Any]:
     """
     protocol = get_protocol()
     setup = await jira_management.get_setup(protocol.config)
-    return setup.model_dump()
+    async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        triggers = await _TRIGGER_STORE.list(session)
+    instances = {trigger.instance for trigger in triggers if _in_scope(trigger, scope)}
+    return setup.model_copy(
+        update={"instances": [item for item in setup.instances if item.instance in instances]}
+    ).model_dump()
 
 
 @operation
@@ -62,6 +105,7 @@ async def list_jira_triggers(instance: str | None = None) -> list[dict[str, Any]
     """
     protocol = get_protocol()
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
         triggers = await jira_management.list_triggers(
             session,
             _TRIGGER_STORE,
@@ -69,7 +113,11 @@ async def list_jira_triggers(instance: str | None = None) -> list[dict[str, Any]
             _ROOM_GROUP_STORE,
             instance=instance,
         )
-    return [t.model_dump() for t in triggers]
+    return [
+        trigger.model_dump()
+        for trigger in triggers
+        if trigger.target_room_id in scope[0] or trigger.target_group_id in scope[1]
+    ]
 
 
 @operation
@@ -84,6 +132,8 @@ async def get_jira_trigger(trigger_id: str) -> dict[str, Any]:
     """
     protocol = get_protocol()
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        await _require_trigger_scope(session, trigger_id, scope)
         trigger = await jira_management.get_trigger(
             session,
             _TRIGGER_STORE,
@@ -154,6 +204,12 @@ async def create_jira_trigger(
         thread_by=thread_by,
     )
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        target_kind = req.target_kind.strip().casefold()
+        if target_kind == "room":
+            _require_target_scope(scope, room_id=req.target_room_id, group_id=None)
+        elif target_kind == "group":
+            _require_target_scope(scope, room_id=None, group_id=req.target_group_id)
         trigger = await jira_management.create_trigger(
             session,
             _TRIGGER_STORE,
@@ -219,6 +275,15 @@ async def update_jira_trigger(
     }
     req = JiraTriggerUpdateRequest(**fields)
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        trigger = await _require_trigger_scope(session, trigger_id, scope)
+        target_kind = str(fields.get("target_kind", trigger.target_kind)).strip().casefold()
+        target_room_id = fields.get("target_room_id", trigger.target_room_id)
+        target_group_id = fields.get("target_group_id", trigger.target_group_id)
+        if target_kind == "room":
+            _require_target_scope(scope, room_id=target_room_id, group_id=None)
+        elif target_kind == "group":
+            _require_target_scope(scope, room_id=None, group_id=target_group_id)
         trigger = await jira_management.update_trigger(
             session,
             _TRIGGER_STORE,
@@ -243,6 +308,8 @@ async def delete_jira_trigger(trigger_id: str) -> dict[str, str]:
     """
     protocol = get_protocol()
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        await _require_trigger_scope(session, trigger_id, scope)
         await jira_management.delete_trigger(session, _TRIGGER_STORE, trigger_id)
     return {"trigger_id": trigger_id, "status": "deleted"}
 
@@ -268,6 +335,8 @@ async def dry_run_jira_trigger(
     protocol = get_protocol()
     req = JiraDryRunRequest(payload=payload, sample_overrides=sample_overrides)
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        await _require_trigger_scope(session, trigger_id, scope)
         result = await jira_management.dry_run_trigger(
             session,
             _TRIGGER_STORE,
@@ -301,12 +370,16 @@ async def list_jira_deliveries(
     """
     protocol = get_protocol()
     async with protocol.session_factory() as session:
+        scope = await _caller_scope(session)
+        triggers = await _TRIGGER_STORE.list(session, instance=instance)
+        rule_ids = [trigger.id for trigger in triggers if _in_scope(trigger, scope)]
         result = await jira_management.list_deliveries(
             session,
             _TRIGGER_STORE,
             protocol.config,
             instance=instance,
             rule_id=rule_id,
+            rule_ids=rule_ids,
             limit=limit,
             offset=offset,
         )
@@ -341,6 +414,10 @@ async def list_jira_agent_options(
     """
     protocol = get_protocol()
     async with protocol.session_factory() as session:
+        if bool(room_id) != bool(group_id):
+            _require_target_scope(
+                await _caller_scope(session), room_id=room_id, group_id=group_id
+            )
         return await jira_management.list_agent_options(
             session,
             _ROOM_STORE,

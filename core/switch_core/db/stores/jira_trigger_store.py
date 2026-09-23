@@ -276,6 +276,7 @@ class JiraTriggerStore:
         *,
         instance: str | None = None,
         rule_id: str | None = None,
+        rule_ids: Sequence[str] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> Sequence[JiraTriggerFiring]:
@@ -284,6 +285,8 @@ class JiraTriggerStore:
             stmt = stmt.where(JiraTriggerFiring.instance == instance)
         if rule_id is not None:
             stmt = stmt.where(JiraTriggerFiring.rule_id == rule_id)
+        if rule_ids is not None:
+            stmt = stmt.where(JiraTriggerFiring.rule_id.in_(rule_ids))
         stmt = stmt.offset(max(offset, 0)).limit(max(1, min(limit, 200)))
         result = await session.execute(stmt)
         return list(result.scalars().all())
