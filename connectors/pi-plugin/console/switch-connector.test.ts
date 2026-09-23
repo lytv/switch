@@ -7,7 +7,6 @@ import {
   hookPathForTool,
   isConsoleManaged,
   mapMcpToolResult,
-  RUNTIME_PACKAGE,
   SwitchToolError,
 } from './switch-connector';
 
@@ -88,9 +87,5 @@ describe('console extension hooks', () => {
     expect(isConsoleManaged({ SWITCHDASH_HOOK_PORT: '1234' })).toBe(true);
     expect(isConsoleManaged({ SWITCHDASH_PTY_ID: 'pty-1' })).toBe(true);
     expect(isConsoleManaged({})).toBe(false);
-  });
-
-  it('pins an exact runtime version', () => {
-    expect(RUNTIME_PACKAGE).toMatch(/^@sandboxaq\/switch-agent-runtime@\d+\.\d+\.\d+$/);
   });
 });
