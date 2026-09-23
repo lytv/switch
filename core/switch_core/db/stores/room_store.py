@@ -221,6 +221,20 @@ class RoomStore:
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_rooms_for_agent_for_update(
+        self, session: AsyncSession, agent_id: str
+    ) -> list[Room]:
+        result = await session.execute(
+            select(Room)
+            .join(room_agents, Room.id == room_agents.c.room_id)
+            .where(
+                room_agents.c.agent_id == agent_id,
+                Room.archived_at.is_(None),
+            )
+            .with_for_update(of=(Room, room_agents))
+        )
+        return list(result.scalars().all())
+
     async def get_agent_ids(self, session: AsyncSession, room_id: str) -> list[str]:
         result = await session.execute(
             select(room_agents.c.agent_id).where(room_agents.c.room_id == room_id)
