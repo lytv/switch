@@ -1,10 +1,13 @@
 """Agent operations: defined once, served through every front door."""
 
-# Importing the definitions module is what populates the registry. Both front
-# doors read the registry, so this import is the single point at which the
+# Importing the definitions modules is what populates the registry. Both front
+# doors read the registry, so these imports are the single point at which the
 # operation set comes into existence.
 from switch_core.bridges.agent.operations import (
     definitions as _definitions,  # noqa: E402,F401
+)
+from switch_core.bridges.agent.operations import (
+    jira as _jira,  # noqa: E402,F401
 )
 from switch_core.bridges.agent.operations.registry import (
     Operation,
