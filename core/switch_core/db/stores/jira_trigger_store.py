@@ -30,9 +30,7 @@ class JiraTriggerStore:
         self, session: AsyncSession, trigger_id: str
     ) -> JiraTrigger | None:
         result = await session.execute(
-            select(JiraTrigger)
-            .where(JiraTrigger.id == trigger_id)
-            .with_for_update()
+            select(JiraTrigger).where(JiraTrigger.id == trigger_id).with_for_update()
         )
         return result.scalar_one_or_none()
 

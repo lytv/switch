@@ -655,10 +655,7 @@ async def list_deliveries(
     )
     visible_rule_ids = set(rule_ids) if rule_ids is not None else None
     return JiraDeliveryListResponse(
-        deliveries=[
-            _delivery_to_detail(row, visible_rule_ids)
-            for row in rows
-        ],
+        deliveries=[_delivery_to_detail(row, visible_rule_ids) for row in rows],
         retain_seconds=config.jira_delivery_log_retain_seconds,
         max_rows=config.jira_delivery_log_max_rows,
     )

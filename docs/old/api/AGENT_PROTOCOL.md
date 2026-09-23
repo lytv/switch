@@ -609,6 +609,11 @@ without being told what the room is about.
 **Agents and bridges** — `list_agents`, `get_agent_detail`,
 `update_agent_detail`, `create_agent`, `list_bridges`.
 
+**Jira** — `list_jira_instances`, `list_jira_triggers`, `get_jira_trigger`,
+`create_jira_trigger`, `update_jira_trigger`, `delete_jira_trigger`,
+`dry_run_jira_trigger`, `list_jira_deliveries`, `list_jira_message_tokens`,
+`list_jira_agent_options`. Scoped to rooms the calling agent belongs to.
+
 ### 7.3 What stays ordinary REST
 
 Not agent operations, and shaped wrongly by RPC over JSON:

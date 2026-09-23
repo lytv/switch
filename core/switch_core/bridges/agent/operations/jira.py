@@ -17,6 +17,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from switch_core.bridges.agent.operations.context import get_agent_id, get_protocol
 from switch_core.bridges.agent.operations.registry import operation
 from switch_core.bridges.jira import management as jira_management
@@ -39,7 +40,9 @@ _AGENT_STORE = AgentStore()
 
 async def _caller_scope(session: AsyncSession) -> tuple[set[str], set[str]]:
     rooms = await _ROOM_STORE.get_rooms_for_agent_for_update(session, get_agent_id())
-    return {room.id for room in rooms}, {room.group_id for room in rooms if room.group_id}
+    return {room.id for room in rooms}, {
+        room.group_id for room in rooms if room.group_id
+    }
 
 
 def _in_scope(trigger: Any, scope: tuple[set[str], set[str]]) -> bool:
@@ -89,7 +92,11 @@ async def list_jira_instances() -> dict[str, Any]:
         triggers = await _TRIGGER_STORE.list(session, for_update=True)
     instances = {trigger.instance for trigger in triggers if _in_scope(trigger, scope)}
     return setup.model_copy(
-        update={"instances": [item for item in setup.instances if item.instance in instances]}
+        update={
+            "instances": [
+                item for item in setup.instances if item.instance in instances
+            ]
+        }
     ).model_dump()
 
 
@@ -278,7 +285,9 @@ async def update_jira_trigger(
     async with protocol.session_factory() as session:
         scope = await _caller_scope(session)
         trigger = await _require_trigger_scope(session, trigger_id, scope)
-        target_kind = str(fields.get("target_kind", trigger.target_kind)).strip().casefold()
+        target_kind = (
+            str(fields.get("target_kind", trigger.target_kind)).strip().casefold()
+        )
         target_room_id = fields.get("target_room_id", trigger.target_room_id)
         target_group_id = fields.get("target_group_id", trigger.target_group_id)
         if target_kind == "room":

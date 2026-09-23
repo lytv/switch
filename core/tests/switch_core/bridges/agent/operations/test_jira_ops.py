@@ -75,7 +75,9 @@ def _ops_client(
     monkeypatch.setattr(op_context, "_protocol", protocol)
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_agent_from_scope] = lambda: SimpleNamespace(id=caller_id)
+    app.dependency_overrides[get_agent_from_scope] = lambda: SimpleNamespace(
+        id=caller_id
+    )
     app.dependency_overrides[get_api_protocol] = lambda: SimpleNamespace(
         connections=SimpleNamespace(require=lambda *a: None)
     )
@@ -422,12 +424,17 @@ async def test_jira_operations_scope_rules_to_caller_rooms(
         )
         await session.commit()
     jira_webhook_routes.init_jira_routes(
-        service=object(), secrets_by_instance={"acme": SECRET}  # type: ignore[arg-type]
+        service=object(),
+        secrets_by_instance={"acme": SECRET},  # type: ignore[arg-type]
     )
     outsider_client = _ops_client(monkeypatch, session_factory, outsider.id)
 
-    listed = await outsider_client.post(f"/agents/{AGENT}/ops/list_jira_triggers", json={})
-    setup = await outsider_client.post(f"/agents/{AGENT}/ops/list_jira_instances", json={})
+    listed = await outsider_client.post(
+        f"/agents/{AGENT}/ops/list_jira_triggers", json={}
+    )
+    setup = await outsider_client.post(
+        f"/agents/{AGENT}/ops/list_jira_instances", json={}
+    )
     deliveries = await outsider_client.post(
         f"/agents/{AGENT}/ops/list_jira_deliveries", json={}
     )
@@ -446,7 +453,9 @@ async def test_jira_operations_scope_rules_to_caller_rooms(
         ("create_jira_trigger", _create_body(room_id)),
         ("list_jira_agent_options", {"room_id": room_id}),
     ):
-        response = await outsider_client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+        response = await outsider_client.post(
+            f"/agents/{AGENT}/ops/{operation}", json=body
+        )
         assert response.status_code == 403
 
 
@@ -486,7 +495,9 @@ async def test_jira_group_targets_require_a_member_room(
         ("get_jira_trigger", {"trigger_id": trigger_id}),
         ("list_jira_agent_options", {"group_id": group.id}),
     ):
-        response = await outsider_client.post(f"/agents/{AGENT}/ops/{operation}", json=body)
+        response = await outsider_client.post(
+            f"/agents/{AGENT}/ops/{operation}", json=body
+        )
         assert response.status_code == 403
 
 
