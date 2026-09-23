@@ -402,8 +402,11 @@ async def list_triggers(
     room_group_store: RoomGroupStore,
     *,
     instance: str | None = None,
+    for_update: bool = False,
 ) -> list[JiraTriggerDetail]:
-    triggers = await trigger_store.list(session, instance=instance)
+    triggers = await trigger_store.list(
+        session, instance=instance, for_update=for_update
+    )
     return [
         await _resolve_names(session, room_store, room_group_store, t) for t in triggers
     ]

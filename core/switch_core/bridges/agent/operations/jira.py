@@ -38,7 +38,7 @@ _AGENT_STORE = AgentStore()
 
 
 async def _caller_scope(session: AsyncSession) -> tuple[set[str], set[str]]:
-    rooms = await _ROOM_STORE.get_rooms_for_agent(session, get_agent_id())
+    rooms = await _ROOM_STORE.get_rooms_for_agent_for_update(session, get_agent_id())
     return {room.id for room in rooms}, {room.group_id for room in rooms if room.group_id}
 
 
@@ -61,7 +61,7 @@ def _require_target_scope(
 async def _require_trigger_scope(
     session: AsyncSession, trigger_id: str, scope: tuple[set[str], set[str]]
 ) -> Any:
-    trigger = await _TRIGGER_STORE.get(session, trigger_id)
+    trigger = await _TRIGGER_STORE.get_for_update(session, trigger_id)
     if trigger is None:
         raise HTTPException(status_code=404, detail="Jira trigger not found")
     _require_target_scope(
@@ -86,7 +86,7 @@ async def list_jira_instances() -> dict[str, Any]:
     setup = await jira_management.get_setup(protocol.config)
     async with protocol.session_factory() as session:
         scope = await _caller_scope(session)
-        triggers = await _TRIGGER_STORE.list(session)
+        triggers = await _TRIGGER_STORE.list(session, for_update=True)
     instances = {trigger.instance for trigger in triggers if _in_scope(trigger, scope)}
     return setup.model_copy(
         update={"instances": [item for item in setup.instances if item.instance in instances]}
@@ -112,6 +112,7 @@ async def list_jira_triggers(instance: str | None = None) -> list[dict[str, Any]
             _ROOM_STORE,
             _ROOM_GROUP_STORE,
             instance=instance,
+            for_update=True,
         )
     return [
         trigger.model_dump()
@@ -371,7 +372,9 @@ async def list_jira_deliveries(
     protocol = get_protocol()
     async with protocol.session_factory() as session:
         scope = await _caller_scope(session)
-        triggers = await _TRIGGER_STORE.list(session, instance=instance)
+        triggers = await _TRIGGER_STORE.list(
+            session, instance=instance, for_update=True
+        )
         rule_ids = [trigger.id for trigger in triggers if _in_scope(trigger, scope)]
         result = await jira_management.list_deliveries(
             session,

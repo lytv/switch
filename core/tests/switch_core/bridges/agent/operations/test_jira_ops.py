@@ -12,6 +12,7 @@ worker-thread portal cannot share asyncpg connections.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -475,6 +476,41 @@ async def test_jira_group_targets_require_a_member_room(
         assert response.status_code == 403
 
 
+async def test_trigger_scope_lock_blocks_a_concurrent_retarget(
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        room, _ = await _room_with_member(session, "locked-room", "coder")
+        room_id = room.id
+        private_room = await _make_room(session, "private-room")
+        await session.commit()
+        private_room_id = private_room.id
+    client = _ops_client(monkeypatch, session_factory)
+    created = await client.post(
+        f"/agents/{AGENT}/ops/create_jira_trigger", json=_create_body(room_id)
+    )
+    assert created.status_code == 200
+    trigger_id = created.json()["result"]["id"]
+
+    async with session_factory() as locked:
+        trigger = await _TRIGGER_STORE.get_for_update(locked, trigger_id)
+        assert trigger is not None
+
+        async def retarget() -> None:
+            async with session_factory() as concurrent:
+                await _TRIGGER_STORE.update(
+                    concurrent, trigger_id, target_room_id=private_room_id
+                )
+                await concurrent.commit()
+
+        task = asyncio.create_task(retarget())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+        await locked.rollback()
+        await asyncio.wait_for(task, timeout=1)
+
+
 async def test_message_tokens_over_ops(
     monkeypatch: pytest.MonkeyPatch,
     session_factory: async_sessionmaker[AsyncSession],
@@ -504,7 +540,7 @@ async def test_agent_options_needs_exactly_one_scope(
         f"/agents/{AGENT}/ops/list_jira_agent_options", json={"room_id": room_id}
     )
     assert by_room.status_code == 200
-    assert [a["name"] for a in by_room.json()["result"]] == ["coder"]
+    assert [a["name"] for a in by_room.json()["result"]] == ["caller", "coder"]
 
     neither = await client.post(f"/agents/{AGENT}/ops/list_jira_agent_options", json={})
     assert neither.status_code == 400
