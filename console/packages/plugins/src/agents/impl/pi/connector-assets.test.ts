@@ -119,7 +119,6 @@ describe('pi connector assets', () => {
     expect(manifest.name).toBe('switch-connector-pi');
     expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/);
   });
-
 });
 
 describe('pi provider wiring', () => {
