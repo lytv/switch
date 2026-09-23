@@ -12,6 +12,6 @@
     "lib": ["ES2022"],
     "types": ["node"]
   },
-  "include": ["extensions/**/*.ts"],
+  "include": ["extensions/**/*.ts", "console/**/*.ts"],
   "exclude": ["node_modules"]
 }

@@ -46,7 +46,7 @@ with what the other connectors get from host-native hooks.
 1. **`skills/switch/SKILL.md`** - the room-workflow skill, copied verbatim
    from `connectors/opencode-plugin/skills/switch/SKILL.md`. It is identical
    across every connector; do not rewrite it here.
-2. **`extensions/switch/`** - the pi extension:
+2. **`extensions/switch/`** - the pi extension for manual installs:
    - `mcp-bridge.ts` spawns the runtime and bridges its MCP tool surface and
      `claude/channel` notifications.
    - `event-format.ts` renders a channel notification as the `[Switch] …`
@@ -62,7 +62,18 @@ with what the other connectors get from host-native hooks.
    - `index.ts` is the extension entry: it connects on `session_start`,
      registers a `/switch` status command, and cleans up on
      `session_shutdown`.
-3. **`README.md`** (this file).
+3. **`console/switch-connector.ts`** - the single-file, dependency-free port
+   of the same extension that Switch Console writes into
+   `~/.pi/agent/extensions/` for its own managed sessions (plus the skill
+   above into `~/.pi/agent/skills/`). It cannot import the MCP SDK — nothing
+   runs `npm install` in the home directory — so it hand-rolls the MCP stdio
+   framing over `node:child_process` instead. It is the source of truth for
+   what Console installs; `console/packages/plugins/src/agents/impl/pi/`
+   embeds it verbatim and fails its drift guard if the two disagree. In a
+   Console-managed session it registers tools only and leaves event delivery
+   to Console's own `[Switch]` injection; standalone, it bridges channel
+   notifications into pi turns like the manual extension does.
+4. **`README.md`** (this file).
 
 Pinned runtime version: `@sandboxaq/switch-agent-runtime@0.4.1`, the same pin
 `connectors/{claude-code,codex,opencode}-plugin` use. Bump all four together.
@@ -91,11 +102,6 @@ calls the same listener:
 
 ### Explicitly deferred
 
-- **Switch Console deep integration** - the Settings → Agents card, a
-  `console/packages/plugins/src/agents/impl/pi/` provider plugin, and any
-  `connector-assets.test.ts`-style drift guard. This connector is manually
-  installed only, the same way OpenCode's was before Switch Console learned to
-  write it for that host.
 - **Publishing to any marketplace or package registry.** pi has its own
   package mechanism (`pi install`, see below) but this connector is not
   published anywhere yet - install it from a local path.
@@ -123,9 +129,18 @@ calls the same listener:
 
 ## Installing
 
-This connector is a [pi package](https://pi.dev) - a directory with a `pi`
-manifest in its `package.json` (`extensions/`, `skills/`). Install it from a
-local checkout of this repository:
+Switch Console installs this connector itself: pi appears in Settings →
+Agent providers with install/status controls like the other CLI agents, and
+as an agent type wherever Console creates a new agent. That install writes
+`console/switch-connector.ts` to `~/.pi/agent/extensions/` and the skill to
+`~/.pi/agent/skills/`, stamped with the `switch-connector-pi` artifact
+version, so "update available" means the connector actually changed.
+
+For a standalone pi session with no Switch Console involved, install the
+manual connector below instead. It is a [pi
+package](https://pi.dev) - a directory with a `pi` manifest in its
+`package.json` (`extensions/`, `skills/`). Install it from a local checkout
+of this repository:
 
 ```bash
 cd connectors/pi-plugin
@@ -189,6 +204,7 @@ Tests cover the non-trivial logic this connector adds: the MCP-result-to-pi-
 tool-result mapping (`tool-result.test.ts`), the channel-notification-to-pi-
 turn formatting and delivery-mode decision (`event-format.test.ts`), the
 runtime hook plumbing (`hooks.test.ts`), and environment passthrough
-(`env.test.ts`). The verbatim-copied skill and the thin `index.ts` wiring
+(`env.test.ts`), plus the same coverage for the dependency-free Console port
+(`console/switch-connector.test.ts`). The verbatim-copied skill and the thin `index.ts` wiring
 (which only calls the tested functions above) are not separately tested, per
 the repo's existing test conventions.

@@ -143,6 +143,15 @@ artifacts:
     version: 0.1.11
     declared_in: connectors/opencode-plugin/package.json
 
+  switch-connector-pi:
+    description: >-
+      The pi coding-agent connector. Like OpenCode's it is written by Switch
+      Console rather than installed from a marketplace, because pi has no
+      built-in MCP client to register the runtime through — the connector is a
+      pi extension that bridges the runtime itself.
+    version: 0.1.0
+    declared_in: connectors/pi-plugin/package.json
+
 contracts:
   agent-protocol:
     description: >-

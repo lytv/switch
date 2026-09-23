@@ -1,11 +1,11 @@
-// Verbatim copy of `connectors/opencode-plugin/skills/switch/SKILL.md`.
+// Verbatim copy of `connectors/pi-plugin/skills/switch/SKILL.md`.
 //
 // That file is the source of truth — edit it, not this. The app carries this
 // copy because it writes the connector itself rather than fetching it from a
 // marketplace, and `connector-assets.test.ts` fails if the two drift. Drift
 // here is silent and nasty: the connector directory is what gets reviewed,
 // while sessions load whatever is written below.
-export const OPENCODE_SKILL_CONTENT = `\
+export const PI_SKILL_CONTENT = `\
 ---
 name: "switch"
 description: "How to take part in a Switch room. Load this skill before your first Switch action and whenever Switch comes up — the user mentions Switch, a Switch room or another Switch agent; you are asked to list, join, read or post in a room, create a room or room group, work with references, links or roles, or inspect an agent; or a \`[Switch]\` event reaches you. Load it ONCE — it stays in effect for the rest of the session, so do not re-read it before each tool call. Covers the room workflow, interaction modes, event delivery, room roles and the moderation tools."
