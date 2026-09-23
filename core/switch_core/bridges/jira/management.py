@@ -454,9 +454,10 @@ async def create_trigger(
         thread_by=req.thread_by.strip().casefold(),
     )
     await trigger_store.create(session, trigger)
-    await session.commit()
     await session.refresh(trigger)
-    return await _resolve_names(session, room_store, room_group_store, trigger)
+    detail = await _resolve_names(session, room_store, room_group_store, trigger)
+    await session.commit()
+    return detail
 
 
 async def get_trigger(
@@ -538,9 +539,10 @@ async def update_trigger(
 
     updated = await trigger_store.update(session, trigger_id, **fields)
     assert updated is not None
-    await session.commit()
     await session.refresh(updated)
-    return await _resolve_names(session, room_store, room_group_store, updated)
+    detail = await _resolve_names(session, room_store, room_group_store, updated)
+    await session.commit()
+    return detail
 
 
 async def delete_trigger(
