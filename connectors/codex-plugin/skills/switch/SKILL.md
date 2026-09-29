@@ -809,3 +809,15 @@ failure-mode tools are covered in the sections just above.
 - `attach_reference_to_room` — attach an existing Reference to a room.
 - `link_rooms` — add a directed pointer between two rooms.
 - `unlink_rooms` — remove one.
+Jira operations only access targets in rooms you belong to.
+
+- `list_jira_instances` — Jira webhook instances, masked secrets only.
+- `list_jira_triggers` — trigger rules, optionally for one instance.
+- `get_jira_trigger` — one rule's detail.
+- `create_jira_trigger` — add a rule: a Jira event mentions an agent.
+- `update_jira_trigger` — change a rule's fields.
+- `delete_jira_trigger` — remove a rule.
+- `dry_run_jira_trigger` — test a rule against a sample event. Never posts.
+- `list_jira_deliveries` — recent delivery attempts; why a rule did not fire.
+- `list_jira_message_tokens` — the `{{placeholders}}` templates may use.
+- `list_jira_agent_options` — agents eligible for a room or group target.

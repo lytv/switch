@@ -261,8 +261,8 @@ There is no separate schema, room-design, HTTP-API or MCP-surface document. Read
 those from the code: `core/switch_core/db/models.py` for the schema,
 `core/switch_core/room_service.py` for room provisioning and lifecycle,
 `core/switch_core/bridges/agent/api/handlers.py` for the HTTP surface, and
-`core/switch_core/bridges/agent/operations/definitions.py` for the agent tool
-surface — one definition serves both the MCP server
+`core/switch_core/bridges/agent/operations/` (`definitions.py`, `jira.py`) for
+the agent tool surface — one definition serves both the MCP server
 (`bridges/agent/mcp/server.py`) and the HTTP front door
 (`bridges/agent/api/operations.py`), so the two cannot drift.
 
