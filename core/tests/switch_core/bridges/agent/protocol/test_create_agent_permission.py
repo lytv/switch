@@ -216,6 +216,21 @@ class TestCreateAgentAs:
                 description="child desc",
             )
 
+    async def test_pi_agent_type_is_accepted(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        svc = make_service(session_factory)
+        owner_id = await make_owner(session_factory)
+        caller_id = await _flagged_caller(svc, session_factory, "caller", owner_id)
+
+        result = await svc.create_agent_as(
+            caller_id,
+            agent_type="pi",
+            name="pi-child",
+            description="pi child desc",
+        )
+        assert result.agent_id
+
     async def test_unknown_agent_type_is_a_value_error(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
