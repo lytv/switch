@@ -29,6 +29,11 @@ describe('knownAgentTypeForProvider', () => {
     expect(log.warn).not.toHaveBeenCalled();
   });
 
+  it('maps pi to its own gateway known-agent type', () => {
+    expect(knownAgentTypeForProvider('pi')).toBe('pi');
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
   it('warns when a provider has no gateway known-agent type, then falls back visibly', () => {
     // Only the types in KNOWN_AGENTS exist server-side, so anything else
     // registers as a type it is not. That is a disclosed fallback, never a
@@ -55,6 +60,10 @@ describe('providerForKnownAgentType', () => {
 
   it('maps opencode to the opencode provider', () => {
     expect(providerForKnownAgentType('opencode')).toBe('opencode');
+  });
+
+  it('maps pi to the pi provider', () => {
+    expect(providerForKnownAgentType('pi')).toBe('pi');
   });
 
   it('returns null for a value outside the known gateway types', () => {

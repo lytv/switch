@@ -368,7 +368,7 @@ none of it is needed to take part in a conversation.
   `list_participants`, which is scoped to one room (the connected room by
   default, or another you belong to via `room_id`). Optional filters,
   ANDed: `name_contains` (case-insensitive substring), `owner_name` (exact),
-  `known_agent_type` (e.g. `"opencode"`, `"codex"`, `"claude-code"`). Sorted by
+  `known_agent_type` (e.g. `"opencode"`, `"codex"`, `"claude-code"`, `"pi"`). Sorted by
   name.
 - **`get_agent_detail`** — one agent's full detail: config, capabilities,
   `known_agent_type` / `known_agent_options`, `integration_profile`, room
@@ -376,7 +376,7 @@ none of it is needed to take part in a conversation.
 - **`update_agent_detail`** — change an agent's editable settings.
   **Owner-only**: the agent's owner must match your own. `options` is a
   PARTIAL map of known-agent options merged over the current ones, and the
-  keys differ per type — for `opencode` and `codex`: `repo_dir` (working
+  keys differ per type — for `opencode`, `codex` and `pi`: `repo_dir` (working
   directory), `auto_session`; for `claude-code`: those plus
   `channels_enabled` and `subagent_name`. Only the keys you pass change, and a
   key the type does not define is **ignored rather than rejected** — so check

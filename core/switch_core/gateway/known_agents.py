@@ -607,10 +607,136 @@ class OpenCodeKnownAgent(KnownAgent):
         )
 
 
+class PiOptions(KnownAgentOptions):
+    auto_session: bool = False
+    """When True, the operator's connector (Switch Console) watches every room this
+    agent belongs to and auto-spawns a pi session — connected to the room and
+    wired to the agent's identity — the moment the agent is addressed in a
+    room where it has no live session. The registered profile becomes
+    `auto_session`. Like Codex and OpenCode, pi has no connector channel of
+    its own; Switch Console delivers inbound room messages by injecting them
+    into the session's terminal."""
+
+    repo_dir: str | None = None
+    """Absolute path to the directory the operator runs pi from. Used to
+    generate a ready-to-paste `cd <repo_dir> && pi "connect to switch room …"`
+    command shown when the agent is addressed with no live session. None → a
+    `<pi-dir>` placeholder is shown instead."""
+
+    # No `channels_enabled`, for the same reason as Codex and OpenCode: Switch
+    # Console sends it for every provider, but pi has no connector channel for
+    # it to act on.
+
+    @field_validator("repo_dir", mode="before")
+    @classmethod
+    def _blank_string_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
+
+class PiKnownAgent(KnownAgent):
+    connector_type = "Pi CLI"
+    options_schema = PiOptions
+    tools = [
+        ToolSpec(name="Bash", description="Executes shell commands"),
+        ToolSpec(name="Edit", description="Edits existing files"),
+        ToolSpec(name="Write", description="Writes new files"),
+        ToolSpec(name="Read", description="Reads file contents"),
+        ToolSpec(name="Grep", description="Searches file contents"),
+        ToolSpec(name="Glob", description="Finds files by pattern"),
+    ]
+    models: ClassVar[list[ModelSpec]] = []
+
+    @classmethod
+    def build_profile(cls, options: KnownAgentOptions) -> IntegrationProfile:
+        assert isinstance(options, PiOptions)
+        return IntegrationProfile(
+            connection_model=(
+                "auto_session" if options.auto_session else "session_addressable"
+            ),
+            message_exchange=True,
+            # pi's extension reports session and tool activity to Switch Console
+            # over its local hook port, same as OpenCode — none of it reaches
+            # Switch as reported events, and nothing mediates a tool call before
+            # it runs.
+            pre_invocation_mediation=[],
+            post_invocation_mediation=[],
+            event_reporting=[],
+            task_protocol=TaskProtocolConfig(can_delegate=True, can_accept=True),
+            # A TUI, so reset / compact / interrupt only work while Switch Console
+            # is driving the session and can write to it. A standalone `pi`
+            # cannot be controlled, so all three resolve per live session via
+            # AgentRuntimeState.
+            command_capabilities=CommandCapabilities(
+                reset="session_dependent",
+                compact="session_dependent",
+                interrupt="session_dependent",
+            ),
+        )
+
+    @classmethod
+    def connect_command(
+        cls,
+        options: KnownAgentOptions,
+        agent: Agent,
+        room_name: str,
+        assume_role: str | None,
+    ) -> str | None:
+        """pi takes the prompt as a bare positional argument, never a `--prompt`
+        flag (unlike OpenCode, which reserves the first positional for the
+        project directory)."""
+        assert isinstance(options, PiOptions)
+        dir_token = options.repo_dir if options.repo_dir else "<pi-dir>"
+        prompt = connect_prompt(room_name, agent.name, assume_role, also_pull=False)
+        return f'cd "{dir_token}" && pi "{prompt}"'
+
+    @classmethod
+    def start_session_instructions(
+        cls,
+        options: KnownAgentOptions,
+        agent: Agent,
+        room_name: str,
+        owner_handle: str | None,
+        assume_role: str | None = None,
+        other_room_names: list[str] | None = None,
+        connected_not_live: bool = False,
+    ) -> str | None:
+        """Build the room-facing onboarding message for a pi agent."""
+        assert isinstance(options, PiOptions)
+        cmd = cls.connect_command(options, agent, room_name, assume_role)
+
+        prefix = f"@{owner_handle}\n\n" if owner_handle else ""
+        if connected_not_live:
+            opening = (
+                "I have a session connected to this room, but it isn't reporting "
+                "as live, so I'm not receiving messages. Relaunch it, or start a "
+                "fresh session, with:"
+            )
+        elif other_room_names:
+            where = ", ".join(f"**{name}**" for name in other_room_names)
+            opening = (
+                f"I don't have a session connected to this room right now, but I "
+                f"do have other session(s) connected to {where}. Either ask me in "
+                "one of those rooms to come here, or start a new session connected "
+                "to this room — my operator should run:"
+            )
+        else:
+            opening = (
+                "I don't have a session connected to this room. To set up a new "
+                "session connected to this room, my operator should run:"
+            )
+        return (
+            f"{prefix}{opening}\n\n```\n{cmd}\n```\n\n(or start pi manually and "
+            "ask me to connect to the room.)"
+        )
+
+
 KNOWN_AGENTS: dict[str, type[KnownAgent]] = {
     "claude-code": ClaudeCodeKnownAgent,
     "codex": CodexKnownAgent,
     "opencode": OpenCodeKnownAgent,
+    "pi": PiKnownAgent,
 }
 
 

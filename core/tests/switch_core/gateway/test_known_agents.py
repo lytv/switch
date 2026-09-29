@@ -10,6 +10,8 @@ from switch_core.gateway.known_agents import (
     CodexOptions,
     OpenCodeKnownAgent,
     OpenCodeOptions,
+    PiKnownAgent,
+    PiOptions,
     known_agent_for,
 )
 
@@ -572,6 +574,100 @@ class TestOpenCodeKnownAgent:
         spec, options = result
         assert spec is OpenCodeKnownAgent
         assert isinstance(options, OpenCodeOptions)
+        assert options.auto_session is True
+        assert options.repo_dir == "/tmp/r"
+
+
+class TestPiKnownAgent:
+    def test_registered_under_pi_key(self) -> None:
+        assert KNOWN_AGENTS.get("pi") is PiKnownAgent
+        assert PiKnownAgent.connector_type == "Pi CLI"
+
+    def test_default_profile_is_session_addressable(self) -> None:
+        profile = PiKnownAgent.build_profile(PiOptions())
+        assert profile.connection_model == "session_addressable"
+
+    def test_auto_session_sets_auto_session_model(self) -> None:
+        profile = PiKnownAgent.build_profile(PiOptions(auto_session=True))
+        assert profile.connection_model == "auto_session"
+
+    def test_no_tool_call_mediation_or_reporting(self) -> None:
+        profile = PiKnownAgent.build_profile(PiOptions())
+        assert profile.pre_invocation_mediation == []
+        assert profile.post_invocation_mediation == []
+        assert profile.event_reporting == []
+
+    def test_can_delegate_and_accept_tasks(self) -> None:
+        profile = PiKnownAgent.build_profile(PiOptions())
+        assert profile.task_protocol.can_delegate is True
+        assert profile.task_protocol.can_accept is True
+
+    def test_commands_are_session_dependent(self) -> None:
+        caps = PiKnownAgent.build_profile(PiOptions()).command_capabilities
+        assert caps.reset == "session_dependent"
+        assert caps.compact == "session_dependent"
+        assert caps.interrupt == "session_dependent"
+
+    def test_prompt_is_passed_as_a_positional_not_a_flag(self) -> None:
+        # Unlike OpenCode, pi takes the prompt as a bare positional argument,
+        # never `--prompt`.
+        opts = PiOptions(repo_dir="/Users/x/repo")
+        msg = PiKnownAgent.start_session_instructions(
+            opts, _agent_named("pi.test"), "hub", None
+        )
+        assert msg is not None
+        assert (
+            'cd "/Users/x/repo" && pi "connect to switch room hub'
+            f'{_identity("pi.test")}"'
+        ) in msg
+        assert "--prompt" not in msg
+
+    def test_start_session_instructions_emit_pi_only(self) -> None:
+        opts = PiOptions(repo_dir="/Users/x/repo")
+        msg = PiKnownAgent.start_session_instructions(
+            opts, _agent_named("pi.test"), "hub", None
+        )
+        assert msg is not None
+        assert "claude" not in msg
+        assert "codex" not in msg
+        assert "opencode" not in msg
+        assert "--dangerously-load-development-channels" not in msg
+        assert "start pi manually" in msg
+
+    def test_repo_dir_with_spaces_stays_quoted(self) -> None:
+        opts = PiOptions(repo_dir="/Users/alice/my project")
+        msg = PiKnownAgent.start_session_instructions(opts, _agent({}), "hub", None)
+        assert msg is not None
+        assert 'cd "/Users/alice/my project" && pi' in msg
+
+    def test_no_repo_dir_uses_placeholder(self) -> None:
+        msg = PiKnownAgent.start_session_instructions(
+            PiOptions(repo_dir=None), _agent({}), "triage", None
+        )
+        assert msg is not None
+        assert 'cd "<pi-dir>"' in msg
+
+    def test_channels_enabled_is_dropped_not_offered_as_an_option(self) -> None:
+        assert "channels_enabled" not in PiOptions.model_json_schema()["properties"]
+
+        opts = PiOptions.model_validate({"channels_enabled": False})
+        assert "channels_enabled" not in opts.model_dump()
+        assert (
+            PiKnownAgent.build_profile(opts).connection_model == "session_addressable"
+        )
+
+    def test_known_agent_for_round_trips_pi(self) -> None:
+        agent = _agent(
+            {
+                "known_agent_type": "pi",
+                "known_agent_options": {"auto_session": True, "repo_dir": "/tmp/r"},
+            }
+        )
+        result = known_agent_for(agent)
+        assert result is not None
+        spec, options = result
+        assert spec is PiKnownAgent
+        assert isinstance(options, PiOptions)
         assert options.auto_session is True
         assert options.repo_dir == "/tmp/r"
 

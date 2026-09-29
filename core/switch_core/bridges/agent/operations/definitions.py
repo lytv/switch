@@ -1682,7 +1682,7 @@ async def create_agent(
     Most agents cannot do this and get a permission error: the grant is
     per-agent, flipped by the agent's owner (or an admin) in the gateway UI.
     The new agent is owned by your own owner. Known types: claude-code,
-    codex, opencode.
+    codex, opencode, pi.
 
     Returns {"id": ..., "api_key": ...}. The `api_key` is returned once and
     never stored server-side — persist it yourself (hand it to whoever
