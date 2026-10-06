@@ -508,6 +508,8 @@ const CONNECTION_ID = BORROWED_CONNECTION_ID ?? randomUUID();
 const OWNS_CONNECTION = BORROWED_CONNECTION_ID === null;
 
 let pollingRoomId: string | null = null;
+// The message named by the latest working report, so turn-end clears that same one.
+let runtimeStateThreadId: string | null = null;
 let streamAbort: AbortController | null = null;
 let leaseAbort: AbortController | null = null;
 let heartbeatAbort: AbortController | null = null;
@@ -1561,7 +1563,14 @@ async function handleHookRequest(req: Request): Promise<Response> {
     // the agent ended without posting a reply — Slack's faked indicator is
     // a real message that lingers until explicitly deleted (the reply path
     // clears it server-side, but a no-reply turn would otherwise leave it).
-    if (pollingRoomId) void setTyping(pollingRoomId, false);
+    if (pollingRoomId) {
+      void setTyping(pollingRoomId, false);
+      // Console already reports runtime state for a session it manages.
+      // A second idle report from here would clear the mark it is showing.
+      if (!SUPPRESS_NOTIFICATIONS) {
+        void setRuntimeState(pollingRoomId, 'idle', runtimeStateThreadId);
+      }
+    }
     return new Response('ok');
   }
 
@@ -1629,6 +1638,14 @@ async function handleEvent(event: AgentEvent) {
     // its reply, and on turn end via the Stop hook (`/turn-end`) for the case
     // where the agent finishes without replying.
     void setTyping(room_id, true);
+    // The collaboration bridge draws the working mark from this report.
+    // A Console-managed session already sends it (SWITCH_CHANNEL_DISABLE_POLL),
+    // so reporting here too would race that connector.
+    if (!SUPPRESS_NOTIFICATIONS) {
+      const threadId = msg.thread_id ?? msg.message_id;
+      runtimeStateThreadId = threadId;
+      void setRuntimeState(room_id, 'working', threadId);
+    }
 
     // Materialise every attachment to a local file so Claude can Read it,
     // whatever the type. Images are surfaced as image_path (Claude renders
@@ -1820,6 +1837,27 @@ async function setTyping(roomId: string, isTyping: boolean) {
     }
   } catch (err) {
     process.stderr.write(`switch: set typing error: ${err}\n`);
+  }
+}
+
+async function setRuntimeState(roomId: string, state: 'working' | 'idle', threadId: string | null) {
+  try {
+    const url = `${API_ENDPOINT}/agents/${AGENT_ID}/runtime-state`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ room_id: roomId, state, thread_id: threadId }),
+    });
+    if (!resp.ok) {
+      process.stderr.write(
+        `switch: set runtime state failed: HTTP ${resp.status}: ${await resp.text()}\n`
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`switch: set runtime state error: ${err}\n`);
   }
 }
 
