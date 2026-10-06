@@ -508,8 +508,10 @@ const CONNECTION_ID = BORROWED_CONNECTION_ID ?? randomUUID();
 const OWNS_CONNECTION = BORROWED_CONNECTION_ID === null;
 
 let pollingRoomId: string | null = null;
-// The message named by the latest working report, so turn-end clears that same one.
-let runtimeStateThreadId: string | null = null;
+type RuntimeStateTurn = { id: string; roomId: string; threadId: string };
+
+let runtimeStateTurn: RuntimeStateTurn | null = null;
+let runtimeStateReports = Promise.resolve();
 let streamAbort: AbortController | null = null;
 let leaseAbort: AbortController | null = null;
 let heartbeatAbort: AbortController | null = null;
@@ -1563,12 +1565,21 @@ async function handleHookRequest(req: Request): Promise<Response> {
     // the agent ended without posting a reply — Slack's faked indicator is
     // a real message that lingers until explicitly deleted (the reply path
     // clears it server-side, but a no-reply turn would otherwise leave it).
-    if (pollingRoomId) {
+    let turnId: string | null = null;
+    try {
+      const body = (await req.json()) as { turn_id?: unknown };
+      if (typeof body.turn_id === 'string') turnId = body.turn_id;
+    } catch {
+      // Older hooks do not send a body.
+    }
+    const turn = runtimeStateTurn;
+    if (pollingRoomId && (!turnId || turn?.id === turnId)) {
       void setTyping(pollingRoomId, false);
       // Console already reports runtime state for a session it manages.
       // A second idle report from here would clear the mark it is showing.
-      if (!SUPPRESS_NOTIFICATIONS) {
-        void setRuntimeState(pollingRoomId, 'idle', runtimeStateThreadId);
+      if (!SUPPRESS_NOTIFICATIONS && turn && turn.id === turnId) {
+        runtimeStateTurn = null;
+        void reportRuntimeState(turn, 'idle');
       }
     }
     return new Response('ok');
@@ -1641,10 +1652,11 @@ async function handleEvent(event: AgentEvent) {
     // The collaboration bridge draws the working mark from this report.
     // A Console-managed session already sends it (SWITCH_CHANNEL_DISABLE_POLL),
     // so reporting here too would race that connector.
+    let turn: RuntimeStateTurn | null = null;
     if (!SUPPRESS_NOTIFICATIONS) {
-      const threadId = msg.thread_id ?? msg.message_id;
-      runtimeStateThreadId = threadId;
-      void setRuntimeState(room_id, 'working', threadId);
+      turn = { id: randomUUID(), roomId: room_id, threadId: msg.thread_id ?? msg.message_id };
+      runtimeStateTurn = turn;
+      void reportRuntimeState(turn, 'working');
     }
 
     // Materialise every attachment to a local file so Claude can Read it,
@@ -1674,6 +1686,7 @@ async function handleEvent(event: AgentEvent) {
       sender_name: msg.sender_name,
       message_id: msg.message_id,
       timestamp: ts,
+      ...(turn ? { turn_id: turn.id } : {}),
       // Lets an addressed agent reply back into the same thread.
       ...(msg.thread_id ? { thread_id: msg.thread_id } : {}),
       ...(imagePaths.length ? { image_path: imagePaths.join(',') } : {}),
@@ -1859,6 +1872,13 @@ async function setRuntimeState(roomId: string, state: 'working' | 'idle', thread
   } catch (err) {
     process.stderr.write(`switch: set runtime state error: ${err}\n`);
   }
+}
+
+function reportRuntimeState(turn: RuntimeStateTurn, state: 'working' | 'idle') {
+  runtimeStateReports = runtimeStateReports.then(() =>
+    setRuntimeState(turn.roomId, state, turn.threadId)
+  );
+  return runtimeStateReports;
 }
 
 async function emitNotification(content: string, meta: Record<string, string>) {

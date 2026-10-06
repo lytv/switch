@@ -20,19 +20,23 @@ export default function switchExtension(pi: ExtensionAPI) {
   // `ExtensionContext`: the channel notification handler fires outside any
   // event dispatch, so there is no ctx in scope there to call isIdle() on.
   let busy = false;
+  let turnId: string | null = null;
 
   pi.on('agent_start', () => {
     busy = true;
   });
   pi.on('agent_settled', () => {
     busy = false;
-    if (bridge) void notifyRuntimeHook(bridge.sessionPid, '/turn-end');
+    const settledTurnId = turnId;
+    turnId = null;
+    if (bridge) void notifyRuntimeHook(bridge.sessionPid, '/turn-end', { turn_id: settledTurnId });
   });
 
   pi.on('session_start', async (_event, ctx) => {
     try {
       bridge = await connectSwitchRuntime((content, meta) => {
         const text = formatChannelEvent({ content, meta });
+        if (meta.turn_id) turnId = meta.turn_id;
         if (chooseDeliveryMode(!busy) === 'immediate') {
           pi.sendUserMessage(text);
         } else {

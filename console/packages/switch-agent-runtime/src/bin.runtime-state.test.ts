@@ -47,6 +47,7 @@ type Bridge = {
   endpoint: string;
   recorded: () => Recorded[];
   push: (event: Record<string, unknown>) => void;
+  releaseRuntimeState: () => void;
 };
 
 const running: ChildProcess[] = [];
@@ -76,12 +77,14 @@ function sandbox(): string {
  * stream this test can write into, and a record of every other POST.
  */
 async function bridge(
-  opts: { failRuntimeState?: boolean; singleStream?: boolean } = {}
+  opts: { failRuntimeState?: boolean; holdFirstRuntimeState?: boolean; singleStream?: boolean } = {}
 ): Promise<Bridge> {
   const recorded: Recorded[] = [];
   let sse: http.ServerResponse | null = null;
   let sseHasRoom = false;
   const queued: string[] = [];
+  let runtimeStateCount = 0;
+  let releaseRuntimeState = () => {};
   const streamIsLive = (): boolean => opts.singleStream === true || sseHasRoom;
 
   const server = http.createServer((req, res) => {
@@ -138,6 +141,17 @@ async function bridge(
         return;
       }
 
+      if (req.method === 'POST' && path.endsWith('/runtime-state') && opts.holdFirstRuntimeState) {
+        runtimeStateCount++;
+        if (runtimeStateCount === 1) {
+          releaseRuntimeState = () => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end('{"ok":true}');
+          };
+          return;
+        }
+      }
+
       if (req.method === 'POST' && path.endsWith('/ops/connect_to_room')) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ result: { ok: true } }));
@@ -155,6 +169,7 @@ async function bridge(
   return {
     endpoint: `http://127.0.0.1:${port}`,
     recorded: () => recorded,
+    releaseRuntimeState: () => releaseRuntimeState(),
     push(event) {
       const frame = `id: 1\nevent: message\ndata: ${JSON.stringify(event)}\n\n`;
       if (sse && streamIsLive()) sse.write(frame);
@@ -312,6 +327,21 @@ async function hookPort(root: string): Promise<number> {
   return Number(readFileSync(file, 'utf8').trim());
 }
 
+function turnIds(run: Running): string[] {
+  return run
+    .stdout()
+    .split('\n')
+    .flatMap((line) => {
+      try {
+        const message = JSON.parse(line) as { params?: { meta?: { turn_id?: unknown } } };
+        const turnId = message.params?.meta?.turn_id;
+        return typeof turnId === 'string' ? [turnId] : [];
+      } catch {
+        return [];
+      }
+    });
+}
+
 describe('runtime state for sessions Console does not manage', { timeout: 20_000 }, () => {
   it('reports working on an addressed message and idle when the turn ends', async () => {
     const bridgeServer = await bridge();
@@ -343,9 +373,15 @@ describe('runtime state for sessions Console does not manage', { timeout: 20_000
     ]);
     expect(typing(bridgeServer)).toContainEqual({ room_id: 'room-1', is_typing: true });
     await until('notification', () => run.stdout().includes('please look'));
+    const turnId = turnIds(run)[0];
+    expect(turnId).toBeDefined();
 
     const port = await hookPort(run.root);
-    const turnEnd = await fetch(`http://127.0.0.1:${port}/turn-end`, { method: 'POST' });
+    const turnEnd = await fetch(`http://127.0.0.1:${port}/turn-end`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turn_id: turnId }),
+    });
     expect(turnEnd.status).toBe(200);
 
     await until('idle report', () =>
@@ -357,6 +393,62 @@ describe('runtime state for sessions Console does not manage', { timeout: 20_000
       thread_id: 'thread-3',
     });
     expect(typing(bridgeServer)).toContainEqual({ room_id: 'room-1', is_typing: false });
+  });
+
+  it('keeps a later turn working when an earlier turn ends', async () => {
+    const bridgeServer = await bridge({ holdFirstRuntimeState: true });
+    const run = start({
+      SWITCH_API_ENDPOINT: bridgeServer.endpoint,
+      SWITCH_API_TOKEN: 'tok-runtime-state',
+      SWITCH_AGENT_ID: 'agent-runtime-state',
+    });
+    await connect(run, bridgeServer, 'room-1');
+
+    bridgeServer.push(
+      messageEvent('room-1', {
+        addressed: true,
+        message_id: 'msg-1',
+        thread_id: 'thread-1',
+        body: 'first turn',
+      })
+    );
+    await until('first runtime report', () => runtimeStates(bridgeServer).length === 1);
+    await until('first notification', () => turnIds(run).length === 1);
+
+    bridgeServer.push(
+      messageEvent('room-1', {
+        addressed: true,
+        message_id: 'msg-2',
+        thread_id: 'thread-2',
+        body: 'second turn',
+      })
+    );
+    await until('second notification', () => turnIds(run).length === 2);
+
+    const port = await hookPort(run.root);
+    const staleEnd = await fetch(`http://127.0.0.1:${port}/turn-end`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turn_id: turnIds(run)[0] }),
+    });
+    expect(staleEnd.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(runtimeStates(bridgeServer)).toHaveLength(1);
+
+    const currentEnd = await fetch(`http://127.0.0.1:${port}/turn-end`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turn_id: turnIds(run)[1] }),
+    });
+    expect(currentEnd.status).toBe(200);
+    bridgeServer.releaseRuntimeState();
+
+    await until('ordered reports', () => runtimeStates(bridgeServer).length === 3);
+    expect(runtimeStates(bridgeServer)).toEqual([
+      { room_id: 'room-1', state: 'working', thread_id: 'thread-1' },
+      { room_id: 'room-1', state: 'working', thread_id: 'thread-2' },
+      { room_id: 'room-1', state: 'idle', thread_id: 'thread-2' },
+    ]);
   });
 
   it('uses the message id when the addressed message has no thread', async () => {
