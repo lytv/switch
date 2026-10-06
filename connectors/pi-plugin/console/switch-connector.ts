@@ -32,7 +32,7 @@ import * as path from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
 /** Pinned to the same version every other connector runs. Bump all together. */
-export const RUNTIME_PACKAGE = '@sandboxaq/switch-agent-runtime@0.4.2';
+export const RUNTIME_PACKAGE = '@sandboxaq/switch-agent-runtime@0.4.4';
 
 const INITIALIZE_TIMEOUT_MS = 60_000;
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;

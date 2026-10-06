@@ -75,7 +75,7 @@ with what the other connectors get from host-native hooks.
    notifications into pi turns like the manual extension does.
 4. **`README.md`** (this file).
 
-Pinned runtime version: `@sandboxaq/switch-agent-runtime@0.4.2`, the same pin
+Pinned runtime version: `@sandboxaq/switch-agent-runtime@0.4.4`, the same pin
 `connectors/{claude-code,codex,opencode}-plugin` use. Bump all four together.
 
 ### Feature parity with the other connectors
