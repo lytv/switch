@@ -508,6 +508,10 @@ const CONNECTION_ID = BORROWED_CONNECTION_ID ?? randomUUID();
 const OWNS_CONNECTION = BORROWED_CONNECTION_ID === null;
 
 let pollingRoomId: string | null = null;
+type RuntimeStateTurn = { id: string; roomId: string; threadId: string };
+
+let runtimeStateTurn: RuntimeStateTurn | null = null;
+let runtimeStateReports = Promise.resolve();
 let streamAbort: AbortController | null = null;
 let leaseAbort: AbortController | null = null;
 let heartbeatAbort: AbortController | null = null;
@@ -1557,11 +1561,27 @@ async function handleHookRequest(req: Request): Promise<Response> {
   }
 
   if (url.pathname === '/turn-end') {
-    // The Claude Code turn finished. Clear the "thinking" indicator in case
+    // The agent turn finished. Clear the "thinking" indicator in case
     // the agent ended without posting a reply — Slack's faked indicator is
     // a real message that lingers until explicitly deleted (the reply path
     // clears it server-side, but a no-reply turn would otherwise leave it).
-    if (pollingRoomId) void setTyping(pollingRoomId, false);
+    let turnId: string | null = null;
+    try {
+      const body = (await req.json()) as { turn_id?: unknown };
+      if (typeof body.turn_id === 'string') turnId = body.turn_id;
+    } catch {
+      // Older hooks do not send a body.
+    }
+    const turn = runtimeStateTurn;
+    if (pollingRoomId && (!turnId || turn?.id === turnId)) {
+      void setTyping(pollingRoomId, false);
+      // Console already reports runtime state for a session it manages.
+      // A second idle report from here would clear the mark it is showing.
+      if (!SUPPRESS_NOTIFICATIONS && turn && turn.id === turnId) {
+        runtimeStateTurn = null;
+        void reportRuntimeState(turn, 'idle');
+      }
+    }
     return new Response('ok');
   }
 
@@ -1629,6 +1649,15 @@ async function handleEvent(event: AgentEvent) {
     // its reply, and on turn end via the Stop hook (`/turn-end`) for the case
     // where the agent finishes without replying.
     void setTyping(room_id, true);
+    // The collaboration bridge draws the working mark from this report.
+    // A Console-managed session already sends it (SWITCH_CHANNEL_DISABLE_POLL),
+    // so reporting here too would race that connector.
+    let turn: RuntimeStateTurn | null = null;
+    if (!SUPPRESS_NOTIFICATIONS) {
+      turn = { id: randomUUID(), roomId: room_id, threadId: msg.thread_id ?? msg.message_id };
+      runtimeStateTurn = turn;
+      void reportRuntimeState(turn, 'working');
+    }
 
     // Materialise every attachment to a local file so Claude can Read it,
     // whatever the type. Images are surfaced as image_path (Claude renders
@@ -1657,6 +1686,7 @@ async function handleEvent(event: AgentEvent) {
       sender_name: msg.sender_name,
       message_id: msg.message_id,
       timestamp: ts,
+      ...(turn ? { turn_id: turn.id } : {}),
       // Lets an addressed agent reply back into the same thread.
       ...(msg.thread_id ? { thread_id: msg.thread_id } : {}),
       ...(imagePaths.length ? { image_path: imagePaths.join(',') } : {}),
@@ -1821,6 +1851,34 @@ async function setTyping(roomId: string, isTyping: boolean) {
   } catch (err) {
     process.stderr.write(`switch: set typing error: ${err}\n`);
   }
+}
+
+async function setRuntimeState(roomId: string, state: 'working' | 'idle', threadId: string | null) {
+  try {
+    const url = `${API_ENDPOINT}/agents/${AGENT_ID}/runtime-state`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ room_id: roomId, state, thread_id: threadId }),
+    });
+    if (!resp.ok) {
+      process.stderr.write(
+        `switch: set runtime state failed: HTTP ${resp.status}: ${await resp.text()}\n`
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`switch: set runtime state error: ${err}\n`);
+  }
+}
+
+function reportRuntimeState(turn: RuntimeStateTurn, state: 'working' | 'idle') {
+  runtimeStateReports = runtimeStateReports.then(() =>
+    setRuntimeState(turn.roomId, state, turn.threadId)
+  );
+  return runtimeStateReports;
 }
 
 async function emitNotification(content: string, meta: Record<string, string>) {

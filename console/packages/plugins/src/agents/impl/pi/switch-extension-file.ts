@@ -382,6 +382,7 @@ export default function switchExtension(pi: ExtensionAPI) {
   // Tracked from pi's own turn lifecycle: the channel handler fires outside
   // any event dispatch, so there is no ctx in scope to call isIdle() on.
   let busy = false;
+  let turnId: string | null = null;
   // In a Console-managed session Console injects [Switch] lines into the PTY
   // itself; bridging the same events here would deliver every one twice.
   const managed = isConsoleManaged();
@@ -391,7 +392,9 @@ export default function switchExtension(pi: ExtensionAPI) {
   });
   pi.on('agent_settled', () => {
     busy = false;
-    if (client) void notifyRuntimeHook(sessionPid, '/turn-end');
+    const settledTurnId = turnId;
+    turnId = null;
+    if (client) void notifyRuntimeHook(sessionPid, '/turn-end', { turn_id: settledTurnId });
   });
 
   pi.on('session_start', async (_event, ctx) => {
@@ -400,7 +403,9 @@ export default function switchExtension(pi: ExtensionAPI) {
         if (managed || method !== CHANNEL_METHOD) return;
         const p = params as { content?: unknown; meta?: unknown } | undefined;
         if (typeof p?.content !== 'string') return;
-        const text = formatChannelEvent(p.content, (p.meta ?? {}) as Record<string, string>);
+        const meta = (p.meta ?? {}) as Record<string, string>;
+        const text = formatChannelEvent(p.content, meta);
+        if (meta.turn_id) turnId = meta.turn_id;
         if (chooseDeliveryMode(!busy) === 'immediate') {
           pi.sendUserMessage(text);
         } else {
