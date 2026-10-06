@@ -28,7 +28,7 @@ import { mapMcpToolResult, type McpToolResult } from './tool-result';
  * Pinned to the same version the other connectors register
  * (`connectors/{claude-code,codex,opencode}-plugin`). Bump all four together.
  */
-export const RUNTIME_PACKAGE = '@sandboxaq/switch-agent-runtime@0.4.2';
+export const RUNTIME_PACKAGE = '@sandboxaq/switch-agent-runtime@0.4.4';
 
 export interface SwitchBridge {
   client: Client;
