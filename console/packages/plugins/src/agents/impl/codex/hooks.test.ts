@@ -281,7 +281,9 @@ describe('buildCodexHookConfig install/read/delete', () => {
     const hooks = plugin.capabilities.hooks;
     const declared = hooks.kind === 'none' ? [] : hooks.supportedEvents;
 
-    expect([...declared].sort()).toEqual([...new Set(emitted)].sort());
+    expect([...declared].sort((a, b) => a.localeCompare(b))).toEqual(
+      [...new Set(emitted)].sort((a, b) => a.localeCompare(b))
+    );
   });
 
   it('reflects installation state through getHooksInstalled + readHooks', async () => {

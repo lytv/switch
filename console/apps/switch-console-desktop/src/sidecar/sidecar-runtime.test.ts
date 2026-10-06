@@ -287,7 +287,7 @@ describe('SidecarRuntime (multi-session)', () => {
     // registry restored for a pane that outlived a supervisor restart.
     const { runtime } = makeRuntime();
 
-    await runtime.ensureForSession('session-a', 'claude-code', null);
+    runtime.ensureForSession('session-a', 'claude-code', null);
 
     expect(runtime.connectedSessions()).toEqual([]);
   });
