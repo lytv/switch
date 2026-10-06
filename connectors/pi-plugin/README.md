@@ -97,15 +97,16 @@ calls the same listener:
 - after `assume_role` / `release_role`, so the runtime's exclusive-role
   lease-renewal loop starts and stops with a live session holding the role;
 - after each pi turn triggered by a Switch event ends (`agent_settled`), so
-  the runtime clears the "typing" indicator it sets on the room's bridged
-  channel when the agent doesn't reply.
+  the runtime clears its typing indicator and working mark when the agent
+  does not reply. The hook includes the event turn ID. The runtime serializes
+  working and idle reports, so an earlier completed turn cannot clear a newer
+  turn's mark.
 
 ### Explicitly deferred
 
 - **Publishing to any marketplace or package registry.** pi has its own
   package mechanism (`pi install`, see below) but this connector is not
   published anywhere yet - install it from a local path.
-- **Changing the shared runtime package** (`console/packages/switch-agent-runtime/`).
 - **A standalone `configure` skill** (the kind `codex-plugin` and
   `claude-code-plugin` ship for registering a fresh agent from a bare
   terminal). OpenCode doesn't have one either - env vars or a

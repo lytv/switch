@@ -1561,7 +1561,7 @@ async function handleHookRequest(req: Request): Promise<Response> {
   }
 
   if (url.pathname === '/turn-end') {
-    // The Claude Code turn finished. Clear the "thinking" indicator in case
+    // The agent turn finished. Clear the "thinking" indicator in case
     // the agent ended without posting a reply — Slack's faked indicator is
     // a real message that lingers until explicitly deleted (the reply path
     // clears it server-side, but a no-reply turn would otherwise leave it).
