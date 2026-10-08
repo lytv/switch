@@ -87,4 +87,5 @@ async def jira_webhook(
 
     service = _require_service()
     background_tasks.add_task(service.process_event, instance=instance, event=event)
+    background_tasks.add_task(service.record_worker_intake, event=event)
     return JSONResponse(status_code=202, content={"status": "accepted"})

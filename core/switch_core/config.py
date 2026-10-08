@@ -136,6 +136,18 @@ class SwitchConfig(BaseSettings):
     jira_delivery_log_retain_seconds: int = 7 * 24 * 3600
     jira_delivery_log_max_rows: int = 5000
 
+    # Jira ticket worker (option C, intake only v1). Off by default: an empty
+    # enabled-projects list leaves the existing Jira bridge exactly as today.
+    # Pilot enables one Jira project key here, e.g. JIRA_WORKER_ENABLED_PROJECTS='["KAN"]'.
+    jira_worker_enabled_projects: list[str] = []
+    # Watermark poll period for enabled projects (read-only Jira search).
+    jira_worker_poll_interval_seconds: int = 300
+    # Read-only Jira REST credentials for the watermark poll. When any of the
+    # three is unset the poll is skipped with one log line, never a crash.
+    jira_worker_base_url: str | None = None
+    jira_worker_email: str | None = None
+    jira_worker_api_token: str | None = None
+
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead
     # of being truncated or silently dropped.
