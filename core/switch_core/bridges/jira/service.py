@@ -140,7 +140,9 @@ class JiraBridgeService:
                 session,
                 event,
                 instance=instance,
-                enabled_projects=self._config.jira_worker_enabled_projects.get(instance, []),
+                enabled_projects=self._config.jira_worker_enabled_projects.get(
+                    instance, []
+                ),
                 webhook_identifier=webhook_identifier,
             )
             await session.commit()

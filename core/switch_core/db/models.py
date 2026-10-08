@@ -1090,7 +1090,9 @@ class JiraWorkerTicket(Base):
 
     __tablename__ = "jira_worker_ticket_map"
     __table_args__ = (
-        UniqueConstraint("instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"),
+        UniqueConstraint(
+            "instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"
+        ),
         Index("ix_jira_worker_ticket_map_instance_project", "instance", "project_key"),
     )
 
@@ -1145,7 +1147,9 @@ class JiraWorkerEvent(Base):
 
     __tablename__ = "jira_worker_event_log"
     __table_args__ = (
-        UniqueConstraint("instance", "idempotency_key", name="uq_jira_worker_event_instance_key"),
+        UniqueConstraint(
+            "instance", "idempotency_key", name="uq_jira_worker_event_instance_key"
+        ),
         Index("ix_jira_worker_event_log_instance_issue", "instance", "issue_key"),
     )
 

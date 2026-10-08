@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
 from switch_core.bridges.jira.worker import (
-    JiraWorkerScheduler,
     JiraPollClient,
+    JiraWorkerScheduler,
     build_poll_clients,
     claim_due_jobs,
     complete_job,
@@ -128,7 +128,9 @@ async def test_worker_migration_creates_five_tables(mig_url: str) -> None:
         await engine.dispose()
 
 
-def _webhook_event(project: str = "KAN", issue_key: str = "KAN-1") -> NormalizedTriggerEvent:
+def _webhook_event(
+    project: str = "KAN", issue_key: str = "KAN-1"
+) -> NormalizedTriggerEvent:
     raw: dict[str, Any] = {
         "webhookEvent": "jira:issue_updated",
         "timestamp": 1791443000000,
@@ -168,7 +170,11 @@ async def test_disabled_by_default_records_nothing(
     async with session_factory() as session:
         assert (
             await record_webhook_event(
-                session, _webhook_event(), instance="acme", enabled_projects=[], webhook_identifier=None
+                session,
+                _webhook_event(),
+                instance="acme",
+                enabled_projects=[],
+                webhook_identifier=None,
             )
             is False
         )
@@ -191,13 +197,21 @@ async def test_idempotent_intake_and_ticket_upsert(
     async with session_factory() as session:
         assert (
             await record_webhook_event(
-                session, _webhook_event(), instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+                session,
+                _webhook_event(),
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier=None,
             )
             is True
         )
         assert (
             await record_webhook_event(
-                session, _webhook_event(), instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+                session,
+                _webhook_event(),
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier=None,
             )
             is False
         )
@@ -290,10 +304,23 @@ async def test_distinct_changelog_ids_are_distinct_events(
     second.raw["changelog"] = {"id": "20002"}
     async with session_factory() as session:
         assert (
-            await record_webhook_event(session, first, instance="acme", enabled_projects=["KAN"], webhook_identifier=None) is True
+            await record_webhook_event(
+                session,
+                first,
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier=None,
+            )
+            is True
         )
         assert (
-            await record_webhook_event(session, second, instance="acme", enabled_projects=["KAN"], webhook_identifier=None)
+            await record_webhook_event(
+                session,
+                second,
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier=None,
+            )
             is True
         )
         await session.commit()
@@ -327,7 +354,9 @@ async def test_instances_with_same_project_and_issue_key_stay_separate(
     async with session_factory() as session:
         rows = (
             await session.execute(
-                text("SELECT instance, issue_key FROM jira_worker_ticket_map ORDER BY instance")
+                text(
+                    "SELECT instance, issue_key FROM jira_worker_ticket_map ORDER BY instance"
+                )
             )
         ).all()
         assert rows == [("acme", "KAN-1"), ("other", "KAN-1")]
@@ -345,16 +374,26 @@ async def test_ticket_keeps_latest_jira_updated_timestamp(
     older.raw["changelog"] = {"id": "20002"}
     async with session_factory() as session:
         assert await record_webhook_event(
-            session, newer, instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+            session,
+            newer,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
         )
         assert await record_webhook_event(
-            session, older, instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+            session,
+            older,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
         )
         await session.commit()
     async with session_factory() as session:
         ticket = (
             await session.execute(
-                text("SELECT summary FROM jira_worker_ticket_map WHERE instance = 'acme'")
+                text(
+                    "SELECT summary FROM jira_worker_ticket_map WHERE instance = 'acme'"
+                )
             )
         ).scalar_one()
         assert ticket == "New summary"
@@ -392,10 +431,18 @@ async def test_unique_key_enforced_at_db_level(
 
 
 async def _insert_due_job(
-    session: AsyncSession, *, instance: str = "acme", project: str = "KAN", due: datetime
+    session: AsyncSession,
+    *,
+    instance: str = "acme",
+    project: str = "KAN",
+    due: datetime,
 ) -> str:
     job = JiraWorkerJob(
-        kind="watermark_poll", instance=instance, project_key=project, due_at=due, status="pending"
+        kind="watermark_poll",
+        instance=instance,
+        project_key=project,
+        due_at=due,
+        status="pending",
     )
     session.add(job)
     await session.flush()
@@ -468,8 +515,7 @@ async def test_claim_commits_successor_before_poll_runs(
         rows = (
             await session.execute(
                 text(
-                    "SELECT status, payload FROM jira_worker_job_record "
-                    "ORDER BY due_at"
+                    "SELECT status, payload FROM jira_worker_job_record ORDER BY due_at"
                 )
             )
         ).all()
@@ -605,7 +651,9 @@ async def test_poll_advances_watermark(
     # scheduled job due again, as if the interval elapsed.
     async with session_factory() as session:
         await session.execute(
-            text("UPDATE jira_worker_job_record SET due_at = now() - interval '1 second' WHERE status='pending'")
+            text(
+                "UPDATE jira_worker_job_record SET due_at = now() - interval '1 second' WHERE status='pending'"
+            )
         )
         await session.commit()
     await scheduler.run_once()
@@ -648,8 +696,12 @@ async def test_ensure_poll_job_is_idempotent(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session:
-        await ensure_poll_job(session, instance="acme", project_key="KAN", interval_seconds=300)
-        await ensure_poll_job(session, instance="acme", project_key="KAN", interval_seconds=300)
+        await ensure_poll_job(
+            session, instance="acme", project_key="KAN", interval_seconds=300
+        )
+        await ensure_poll_job(
+            session, instance="acme", project_key="KAN", interval_seconds=300
+        )
         await session.commit()
         count = (
             await session.execute(text("SELECT count(*) FROM jira_worker_job_record"))

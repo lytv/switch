@@ -56,7 +56,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"),
+        sa.UniqueConstraint(
+            "instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"
+        ),
     )
     op.create_index(
         "ix_jira_worker_ticket_map_instance_project",
@@ -101,7 +103,9 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("instance", "idempotency_key", name="uq_jira_worker_event_instance_key"),
+        sa.UniqueConstraint(
+            "instance", "idempotency_key", name="uq_jira_worker_event_instance_key"
+        ),
     )
     op.create_index(
         "ix_jira_worker_event_log_instance_issue",
@@ -134,12 +138,15 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_jira_worker_outbox_status", table_name="jira_worker_outbox")
     op.drop_table("jira_worker_outbox")
-    op.drop_index("ix_jira_worker_event_log_instance_issue", table_name="jira_worker_event_log")
+    op.drop_index(
+        "ix_jira_worker_event_log_instance_issue", table_name="jira_worker_event_log"
+    )
     op.drop_table("jira_worker_event_log")
     op.drop_index("ix_jira_worker_job_record_due", table_name="jira_worker_job_record")
     op.drop_table("jira_worker_job_record")
     op.drop_index(
-        "ix_jira_worker_ticket_map_instance_project", table_name="jira_worker_ticket_map"
+        "ix_jira_worker_ticket_map_instance_project",
+        table_name="jira_worker_ticket_map",
     )
     op.drop_table("jira_worker_ticket_map")
     op.drop_table("jira_worker_identity_map")

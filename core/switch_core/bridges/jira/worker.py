@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -37,9 +37,7 @@ ClockFn = Callable[[], datetime]
 _PENDING_OR_CLAIMED = ("pending", "claimed")
 
 
-def is_worker_enabled(
-    config: SwitchConfig, instance: str, project_key: str
-) -> bool:
+def is_worker_enabled(config: SwitchConfig, instance: str, project_key: str) -> bool:
     """Per-Jira-project on/off switch. Off by default (empty list)."""
     return project_key in config.jira_worker_enabled_projects.get(instance, [])
 
@@ -344,7 +342,7 @@ async def claim_due_jobs(
             )
         )
         if scopes is not None
-        else True
+        else true()
     )
     due = (
         select(JiraWorkerJob.id)
