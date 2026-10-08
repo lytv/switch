@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -72,7 +73,18 @@ def jira_updated_at(payload: dict[str, Any]) -> datetime:
     fields = issue.get("fields") if isinstance(issue, dict) else None
     updated = fields.get("updated") if isinstance(fields, dict) else None
     if isinstance(updated, str):
-        return datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        text = updated.strip()
+        if text[-1:] in ("Z", "z"):
+            text = text[:-1] + "+00:00"
+        elif re.search(r"[+-]\d{4}$", text):
+            text = text[:-2] + ":" + text[-2:]
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+        except ValueError:
+            pass
     timestamp = payload.get("timestamp")
     if isinstance(timestamp, (int, float)):
         return datetime.fromtimestamp(timestamp / 1000, UTC)
