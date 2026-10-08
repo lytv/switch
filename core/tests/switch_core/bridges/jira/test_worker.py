@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
 from switch_core.bridges.jira.worker import (
     JiraWorkerScheduler,
-    build_poll_client,
+    build_poll_clients,
     claim_due_jobs,
     complete_job,
     ensure_poll_job,
@@ -126,17 +126,17 @@ async def test_worker_migration_creates_five_tables(mig_url: str) -> None:
         await engine.dispose()
 
 
-def _webhook_event(project: str = "KAN") -> NormalizedTriggerEvent:
+def _webhook_event(project: str = "KAN", issue_key: str = "KAN-1") -> NormalizedTriggerEvent:
     raw: dict[str, Any] = {
         "webhookEvent": "jira:issue_updated",
         "timestamp": 1791443000000,
-        "issue": {"id": "10001", "key": "KAN-1"},
+        "issue": {"id": "10001", "key": issue_key},
         "changelog": {"id": "20001"},
     }
     return NormalizedTriggerEvent(
         event_kind="updated",
         webhook_event="jira:issue_updated",
-        key="KAN-1",
+        key=issue_key,
         summary="First ticket",
         issue_type="Task",
         project=project,
@@ -161,11 +161,13 @@ def test_webhook_idempotency_key_uses_raw_parts() -> None:
 async def test_disabled_by_default_records_nothing(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    assert _config().jira_worker_enabled_projects == []
-    assert is_worker_enabled(_config(), "KAN") is False
+    assert _config().jira_worker_enabled_projects == {}
+    assert is_worker_enabled(_config(), "acme", "KAN") is False
     async with session_factory() as session:
         assert (
-            await record_webhook_event(session, _webhook_event(), enabled_projects=[])
+            await record_webhook_event(
+                session, _webhook_event(), instance="acme", enabled_projects=[], webhook_identifier=None
+            )
             is False
         )
         await session.commit()
@@ -187,13 +189,13 @@ async def test_idempotent_intake_and_ticket_upsert(
     async with session_factory() as session:
         assert (
             await record_webhook_event(
-                session, _webhook_event(), enabled_projects=["KAN"]
+                session, _webhook_event(), instance="acme", enabled_projects=["KAN"], webhook_identifier=None
             )
             is True
         )
         assert (
             await record_webhook_event(
-                session, _webhook_event(), enabled_projects=["KAN"]
+                session, _webhook_event(), instance="acme", enabled_projects=["KAN"], webhook_identifier=None
             )
             is False
         )
@@ -219,6 +221,66 @@ async def test_idempotent_intake_and_ticket_upsert(
 
 
 @pytest.mark.asyncio
+async def test_webhook_identifier_is_primary_idempotency_key(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first, second = _webhook_event(), _webhook_event()
+    second.raw["changelog"] = {"id": "20002"}
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session,
+            first,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier="atlassian-event-1",
+        )
+        assert not await record_webhook_event(
+            session,
+            second,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier="atlassian-event-1",
+        )
+        await session.commit()
+    async with session_factory() as session:
+        key = (
+            await session.execute(
+                text("SELECT idempotency_key FROM jira_worker_event_log")
+            )
+        ).scalar_one()
+        assert key == "atlassian-event-1"
+
+
+@pytest.mark.asyncio
+async def test_fallback_webhook_idempotency_key_records_distinct_changelog_ids(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first, second = _webhook_event(), _webhook_event()
+    second.raw["changelog"] = {"id": "20002"}
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session,
+            first,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        assert await record_webhook_event(
+            session,
+            second,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        await session.commit()
+    async with session_factory() as session:
+        count = (
+            await session.execute(text("SELECT count(*) FROM jira_worker_event_log"))
+        ).scalar_one()
+        assert count == 2
+
+
+@pytest.mark.asyncio
 async def test_distinct_changelog_ids_are_distinct_events(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -226,10 +288,10 @@ async def test_distinct_changelog_ids_are_distinct_events(
     second.raw["changelog"] = {"id": "20002"}
     async with session_factory() as session:
         assert (
-            await record_webhook_event(session, first, enabled_projects=["KAN"]) is True
+            await record_webhook_event(session, first, instance="acme", enabled_projects=["KAN"], webhook_identifier=None) is True
         )
         assert (
-            await record_webhook_event(session, second, enabled_projects=["KAN"])
+            await record_webhook_event(session, second, instance="acme", enabled_projects=["KAN"], webhook_identifier=None)
             is True
         )
         await session.commit()
@@ -241,12 +303,69 @@ async def test_distinct_changelog_ids_are_distinct_events(
 
 
 @pytest.mark.asyncio
+async def test_instances_with_same_project_and_issue_key_stay_separate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session,
+            _webhook_event(),
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        assert await record_webhook_event(
+            session,
+            _webhook_event(),
+            instance="other",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        await session.commit()
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text("SELECT instance, issue_key FROM jira_worker_ticket_map ORDER BY instance")
+            )
+        ).all()
+        assert rows == [("acme", "KAN-1"), ("other", "KAN-1")]
+
+
+@pytest.mark.asyncio
+async def test_ticket_keeps_latest_jira_updated_timestamp(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    newer, older = _webhook_event(), _webhook_event()
+    newer.raw["issue"]["fields"] = {"updated": "2026-10-08T02:00:00+00:00"}
+    older.raw["issue"]["fields"] = {"updated": "2026-10-08T01:00:00+00:00"}
+    newer = replace(newer, summary="New summary")
+    older = replace(older, summary="Old summary")
+    older.raw["changelog"] = {"id": "20002"}
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session, newer, instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+        )
+        assert await record_webhook_event(
+            session, older, instance="acme", enabled_projects=["KAN"], webhook_identifier=None
+        )
+        await session.commit()
+    async with session_factory() as session:
+        ticket = (
+            await session.execute(
+                text("SELECT summary FROM jira_worker_ticket_map WHERE instance = 'acme'")
+            )
+        ).scalar_one()
+        assert ticket == "New summary"
+
+
+@pytest.mark.asyncio
 async def test_unique_key_enforced_at_db_level(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session:
         assert await record_event(
             session,
+            instance="acme",
             idempotency_key="k|1",
             issue_key="KAN-1",
             project_key="KAN",
@@ -257,6 +376,7 @@ async def test_unique_key_enforced_at_db_level(
         assert (
             await record_event(
                 session,
+                instance="acme",
                 idempotency_key="k|1",
                 issue_key="KAN-1",
                 project_key="KAN",
@@ -270,10 +390,10 @@ async def test_unique_key_enforced_at_db_level(
 
 
 async def _insert_due_job(
-    session: AsyncSession, *, project: str = "KAN", due: datetime
+    session: AsyncSession, *, instance: str = "acme", project: str = "KAN", due: datetime
 ) -> str:
     job = JiraWorkerJob(
-        kind="watermark_poll", project_key=project, due_at=due, status="pending"
+        kind="watermark_poll", instance=instance, project_key=project, due_at=due, status="pending"
     )
     session.add(job)
     await session.flush()
@@ -307,12 +427,14 @@ async def test_restart_rereads_overdue_rows(
 ) -> None:
     """An overdue pending job survives a 'restart': a fresh scheduler claims it."""
     async with session_factory() as session:
-        await _insert_due_job(session, due=datetime.now(UTC) - timedelta(hours=1))
+        await _insert_due_job(
+            session, instance="acme", due=datetime.now(UTC) - timedelta(hours=1)
+        )
         await session.commit()
     scheduler = JiraWorkerScheduler(
         session_factory=session_factory,
-        config=_config(jira_worker_enabled_projects=["KAN"]),
-        poll_client=None,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={"acme": _FakePollClient([])},  # type: ignore[dict-item]
     )
     await scheduler.run_once()
     async with session_factory() as session:
@@ -363,8 +485,8 @@ async def test_poll_advances_watermark(
     )
     scheduler = JiraWorkerScheduler(
         session_factory=session_factory,
-        config=_config(jira_worker_enabled_projects=["KAN"]),
-        poll_client=client,  # type: ignore[arg-type]
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={"acme": client},  # type: ignore[dict-item]
     )
     await scheduler.run_once()
     assert client.calls and client.calls[0]["updated_since"] is None
@@ -402,17 +524,14 @@ async def test_poll_advances_watermark(
 @pytest.mark.asyncio
 async def test_poll_skipped_without_credentials(
     session_factory: async_sessionmaker[AsyncSession],
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    assert build_poll_client(_config()) is None
+    assert build_poll_clients(_config()) == {}
     scheduler = JiraWorkerScheduler(
         session_factory=session_factory,
-        config=_config(jira_worker_enabled_projects=["KAN"]),
-        poll_client=None,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={},
     )
-    with caplog.at_level(logging.WARNING, logger="switch_core.bridges.jira.worker"):
-        await scheduler.run_once()
-    assert "no Jira credentials" in caplog.text
+    await scheduler.run_once()
     async with session_factory() as session:
         count = (
             await session.execute(text("SELECT count(*) FROM jira_worker_event_log"))
@@ -425,7 +544,7 @@ async def test_poll_skipped_without_credentials(
                 )
             )
         ).scalar_one()
-        assert pending == 1
+        assert pending == 0
 
 
 @pytest.mark.asyncio
@@ -433,8 +552,8 @@ async def test_ensure_poll_job_is_idempotent(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with session_factory() as session:
-        await ensure_poll_job(session, project_key="KAN", interval_seconds=300)
-        await ensure_poll_job(session, project_key="KAN", interval_seconds=300)
+        await ensure_poll_job(session, instance="acme", project_key="KAN", interval_seconds=300)
+        await ensure_poll_job(session, instance="acme", project_key="KAN", interval_seconds=300)
         await session.commit()
         count = (
             await session.execute(text("SELECT count(*) FROM jira_worker_job_record"))
@@ -466,7 +585,7 @@ async def test_scheduler_start_stop(
     scheduler = JiraWorkerScheduler(
         session_factory=session_factory,
         config=_config(),
-        poll_client=None,
+        poll_clients={},
     )
     assert scheduler.running is False
     scheduler.start()

@@ -1089,10 +1089,14 @@ class JiraWorkerTicket(Base):
     """One row per Jira issue the worker has seen."""
 
     __tablename__ = "jira_worker_ticket_map"
-    __table_args__ = (Index("ix_jira_worker_ticket_map_project", "project_key"),)
+    __table_args__ = (
+        UniqueConstraint("instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"),
+        Index("ix_jira_worker_ticket_map_instance_project", "instance", "project_key"),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    issue_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False)
     issue_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
     project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1119,6 +1123,7 @@ class JiraWorkerJob(Base):
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     kind: Mapped[str] = mapped_column(Text, nullable=False)
+    instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
     project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     due_at: Mapped[str] = mapped_column(DateTime(timezone=True), nullable=False)
     # pending | claimed | done | error
@@ -1139,10 +1144,14 @@ class JiraWorkerEvent(Base):
     """Durable intake log. The idempotency key makes redeliveries no-ops."""
 
     __tablename__ = "jira_worker_event_log"
-    __table_args__ = (Index("ix_jira_worker_event_log_issue", "issue_key"),)
+    __table_args__ = (
+        UniqueConstraint("instance", "idempotency_key", name="uq_jira_worker_event_instance_key"),
+        Index("ix_jira_worker_event_log_instance_issue", "instance", "issue_key"),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    idempotency_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
     issue_key: Mapped[str] = mapped_column(Text, nullable=False)
     project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     event_kind: Mapped[str] = mapped_column(Text, nullable=False, default="")

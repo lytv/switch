@@ -3,11 +3,17 @@ import ssl
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import model_validator
+from pydantic import BaseModel, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # A Postgres time value: a bare count of milliseconds, or a count with a unit.
 _PG_INTERVAL_RE = re.compile(r"^\d+\s*(us|ms|s|min|h|d)?$")
+
+
+class JiraWorkerCredentials(BaseModel):
+    base_url: str
+    email: str
+    api_token: str
 
 
 class SwitchConfig(BaseSettings):
@@ -138,15 +144,13 @@ class SwitchConfig(BaseSettings):
 
     # Jira ticket worker (option C, intake only v1). Off by default: an empty
     # enabled-projects list leaves the existing Jira bridge exactly as today.
-    # Pilot enables one Jira project key here, e.g. JIRA_WORKER_ENABLED_PROJECTS='["KAN"]'.
-    jira_worker_enabled_projects: list[str] = []
+    # Pilot enables projects by Jira instance, e.g.
+    # JIRA_WORKER_ENABLED_PROJECTS='{"acme":["KAN"]}'.
+    jira_worker_enabled_projects: dict[str, list[str]] = {}
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
-    # Read-only Jira REST credentials for the watermark poll. When any of the
-    # three is unset the poll is skipped with one log line, never a crash.
-    jira_worker_base_url: str | None = None
-    jira_worker_email: str | None = None
-    jira_worker_api_token: str | None = None
+    # Read-only Jira REST credentials by instance for the watermark poll.
+    jira_worker_credentials: dict[str, JiraWorkerCredentials] = {}
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

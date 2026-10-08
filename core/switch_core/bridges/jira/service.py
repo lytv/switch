@@ -122,18 +122,26 @@ class JiraBridgeService:
 
         await self._prune_delivery_log()
 
-    async def record_worker_intake(self, *, event: NormalizedTriggerEvent) -> None:
+    async def record_worker_intake(
+        self,
+        *,
+        instance: str,
+        event: NormalizedTriggerEvent,
+        webhook_identifier: str | None,
+    ) -> None:
         """Step-1 worker intake: event log + ticket map for enabled projects.
 
         Returns immediately when the event's project is not enabled, leaving
         the existing bridge behaviour unchanged."""
-        if not is_worker_enabled(self._config, event.project):
+        if not is_worker_enabled(self._config, instance, event.project):
             return
         async with self._session_factory() as session:
             await record_webhook_event(
                 session,
                 event,
-                enabled_projects=self._config.jira_worker_enabled_projects or [],
+                instance=instance,
+                enabled_projects=self._config.jira_worker_enabled_projects.get(instance, []),
+                webhook_identifier=webhook_identifier,
             )
             await session.commit()
 

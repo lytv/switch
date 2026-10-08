@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -36,9 +36,11 @@ ClockFn = Callable[[], datetime]
 _PENDING_OR_CLAIMED = ("pending", "claimed")
 
 
-def is_worker_enabled(config: SwitchConfig, project_key: str) -> bool:
+def is_worker_enabled(
+    config: SwitchConfig, instance: str, project_key: str
+) -> bool:
     """Per-Jira-project on/off switch. Off by default (empty list)."""
-    return project_key in (config.jira_worker_enabled_projects or [])
+    return project_key in config.jira_worker_enabled_projects.get(instance, [])
 
 
 def webhook_idempotency_key(payload: dict[str, Any], issue_key: str) -> str:
@@ -65,9 +67,22 @@ def poll_idempotency_key(issue_key: str, updated: str) -> str:
     return f"poll|{issue_key}|{updated}"
 
 
+def jira_updated_at(payload: dict[str, Any]) -> datetime:
+    issue = payload.get("issue")
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    updated = fields.get("updated") if isinstance(fields, dict) else None
+    if isinstance(updated, str):
+        return datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, (int, float)):
+        return datetime.fromtimestamp(timestamp / 1000, UTC)
+    return datetime.now(UTC)
+
+
 async def record_event(
     session: AsyncSession,
     *,
+    instance: str,
     idempotency_key: str,
     issue_key: str,
     project_key: str,
@@ -80,6 +95,7 @@ async def record_event(
         insert(JiraWorkerEvent)
         .values(
             id=str(uuid.uuid4()),
+            instance=instance,
             idempotency_key=idempotency_key,
             issue_key=issue_key,
             project_key=project_key,
@@ -87,7 +103,7 @@ async def record_event(
             webhook_event=webhook_event,
             payload=payload,
         )
-        .on_conflict_do_nothing(index_elements=["idempotency_key"])
+        .on_conflict_do_nothing(index_elements=["instance", "idempotency_key"])
         .returning(JiraWorkerEvent.id)
     )
     result = await session.execute(stmt)
@@ -98,32 +114,34 @@ async def record_event(
 async def upsert_ticket(
     session: AsyncSession,
     *,
+    instance: str,
     issue_key: str,
     issue_id: str = "",
     project_key: str = "",
     summary: str = "",
     status: str = "",
-    now: datetime | None = None,
+    updated_at: datetime,
 ) -> None:
-    clock = now or datetime.now(UTC)
     stmt = insert(JiraWorkerTicket).values(
         id=str(uuid.uuid4()),
+        instance=instance,
         issue_key=issue_key,
         issue_id=issue_id,
         project_key=project_key,
         summary=summary,
         status=status,
-        last_event_at=clock,
+        last_event_at=updated_at,
     )
     stmt = stmt.on_conflict_do_update(
-        index_elements=["issue_key"],
+        index_elements=["instance", "issue_key"],
         set_={
             "issue_id": stmt.excluded.issue_id,
             "project_key": stmt.excluded.project_key,
             "summary": stmt.excluded.summary,
             "status": stmt.excluded.status,
-            "last_event_at": clock,
+            "last_event_at": stmt.excluded.last_event_at,
         },
+        where=JiraWorkerTicket.last_event_at <= stmt.excluded.last_event_at,
     )
     await session.execute(stmt)
     await session.flush()
@@ -133,7 +151,9 @@ async def record_webhook_event(
     session: AsyncSession,
     event: NormalizedTriggerEvent,
     *,
+    instance: str,
     enabled_projects: Sequence[str],
+    webhook_identifier: str | None,
 ) -> bool:
     """Record one parsed webhook event. Duplicate deliveries are no-ops.
 
@@ -143,9 +163,10 @@ async def record_webhook_event(
     if event.project not in enabled_projects:
         return False
     raw = event.raw if isinstance(event.raw, dict) else {}
-    key = webhook_idempotency_key(raw, event.key)
+    key = webhook_identifier or webhook_idempotency_key(raw, event.key)
     inserted = await record_event(
         session,
+        instance=instance,
         idempotency_key=key,
         issue_key=event.key,
         project_key=event.project,
@@ -160,11 +181,13 @@ async def record_webhook_event(
         issue_id = str(raw["issue"].get("id") or "")
     await upsert_ticket(
         session,
+        instance=instance,
         issue_key=event.key,
         issue_id=issue_id,
         project_key=event.project,
         summary=event.summary,
         status=event.status,
+        updated_at=jira_updated_at(raw),
     )
     return True
 
@@ -172,6 +195,8 @@ async def record_webhook_event(
 async def record_polled_issue(
     session: AsyncSession,
     issue: dict[str, Any],
+    *,
+    instance: str,
 ) -> bool:
     """Record one Jira search hit through the same event-log path as webhooks."""
     fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
@@ -195,6 +220,7 @@ async def record_polled_issue(
     updated = str(fields.get("updated") or "")
     inserted = await record_event(
         session,
+        instance=instance,
         idempotency_key=poll_idempotency_key(issue_key, updated),
         issue_key=issue_key,
         project_key=project_key,
@@ -206,11 +232,13 @@ async def record_polled_issue(
         return False
     await upsert_ticket(
         session,
+        instance=instance,
         issue_key=issue_key,
         issue_id=str(issue.get("id") or ""),
         project_key=project_key,
         summary=str(fields.get("summary") or ""),
         status=status_name,
+        updated_at=jira_updated_at({"issue": issue}),
     )
     return True
 
@@ -218,6 +246,7 @@ async def record_polled_issue(
 async def ensure_poll_job(
     session: AsyncSession,
     *,
+    instance: str,
     project_key: str,
     interval_seconds: int,
     now: datetime | None = None,
@@ -228,6 +257,7 @@ async def ensure_poll_job(
         select(JiraWorkerJob.id)
         .where(
             JiraWorkerJob.kind == POLL_JOB_KIND,
+            JiraWorkerJob.instance == instance,
             JiraWorkerJob.project_key == project_key,
             JiraWorkerJob.status.in_(_PENDING_OR_CLAIMED),
         )
@@ -238,6 +268,7 @@ async def ensure_poll_job(
     session.add(
         JiraWorkerJob(
             kind=POLL_JOB_KIND,
+            instance=instance,
             project_key=project_key,
             due_at=clock,
             status="pending",
@@ -250,6 +281,7 @@ async def ensure_poll_job(
 async def schedule_next_poll(
     session: AsyncSession,
     *,
+    instance: str,
     project_key: str,
     watermark: str | None,
     interval_seconds: int,
@@ -260,6 +292,7 @@ async def schedule_next_poll(
     session.add(
         JiraWorkerJob(
             kind=POLL_JOB_KIND,
+            instance=instance,
             project_key=project_key,
             due_at=due,
             status="pending",
@@ -275,6 +308,7 @@ async def claim_due_jobs(
     now: datetime | None = None,
     limit: int = 10,
     owner: str = "scheduler",
+    scopes: Sequence[tuple[str, str]] | None = None,
 ) -> Sequence[JiraWorkerJob]:
     """Claim due rows transactionally: pending → claimed in one statement.
 
@@ -282,12 +316,28 @@ async def claim_due_jobs(
     CTE locks candidates with SKIP LOCKED and the UPDATE only touches rows
     still pending.
     """
+    if scopes == []:
+        return []
     clock = now or datetime.now(UTC)
+    scope_filter = (
+        or_(
+            *(
+                and_(
+                    JiraWorkerJob.instance == instance,
+                    JiraWorkerJob.project_key == project_key,
+                )
+                for instance, project_key in scopes
+            )
+        )
+        if scopes is not None
+        else True
+    )
     due = (
         select(JiraWorkerJob.id)
         .where(
             JiraWorkerJob.status == "pending",
             JiraWorkerJob.due_at <= clock,
+            scope_filter,
         )
         .order_by(JiraWorkerJob.due_at.asc())
         .limit(max(1, limit))
@@ -373,19 +423,16 @@ class JiraPollClient:
             await self._client.aclose()
 
 
-def build_poll_client(config: SwitchConfig) -> JiraPollClient | None:
-    """Return a poll client, or None when credentials are not configured."""
-    if not (
-        config.jira_worker_base_url
-        and config.jira_worker_email
-        and config.jira_worker_api_token
-    ):
-        return None
-    return JiraPollClient(
-        base_url=config.jira_worker_base_url,
-        email=config.jira_worker_email,
-        api_token=config.jira_worker_api_token,
-    )
+def build_poll_clients(config: SwitchConfig) -> dict[str, JiraPollClient]:
+    """Build read-only poll clients for configured Jira instances."""
+    return {
+        instance: JiraPollClient(
+            base_url=credentials.base_url,
+            email=credentials.email,
+            api_token=credentials.api_token,
+        )
+        for instance, credentials in config.jira_worker_credentials.items()
+    }
 
 
 class JiraWorkerScheduler:
@@ -400,14 +447,14 @@ class JiraWorkerScheduler:
         *,
         session_factory: async_sessionmaker[AsyncSession],
         config: SwitchConfig,
-        poll_client: JiraPollClient | None = None,
+        poll_clients: dict[str, JiraPollClient] | None = None,
         clock: ClockFn | None = None,
         sleep: SleepFn | None = None,
         owner: str = "scheduler",
     ) -> None:
         self._session_factory = session_factory
         self._config = config
-        self._poll_client = poll_client
+        self._poll_clients = poll_clients or {}
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._owner = owner
@@ -441,16 +488,28 @@ class JiraWorkerScheduler:
     async def run_once(self) -> None:
         """One scheduler pass: seed poll jobs, claim due rows, handle them."""
         now = self._clock()
-        projects = list(self._config.jira_worker_enabled_projects or [])
+        projects = self._config.jira_worker_enabled_projects
+        scopes = [
+            (instance, project_key)
+            for instance, project_keys in projects.items()
+            if instance in self._poll_clients
+            for project_key in project_keys
+        ]
         async with self._session_factory() as session:
-            for project_key in projects:
-                await ensure_poll_job(
-                    session,
-                    project_key=project_key,
-                    interval_seconds=self._config.jira_worker_poll_interval_seconds,
-                    now=now,
-                )
-            jobs = await claim_due_jobs(session, now=now, limit=10, owner=self._owner)
+            for instance, project_keys in projects.items():
+                if instance not in self._poll_clients:
+                    continue
+                for project_key in project_keys:
+                    await ensure_poll_job(
+                        session,
+                        instance=instance,
+                        project_key=project_key,
+                        interval_seconds=self._config.jira_worker_poll_interval_seconds,
+                        now=now,
+                    )
+            jobs = await claim_due_jobs(
+                session, now=now, limit=10, owner=self._owner, scopes=scopes
+            )
             await session.commit()
         for job in jobs:
             try:
@@ -478,6 +537,7 @@ class JiraWorkerScheduler:
                         )
                         await schedule_next_poll(
                             session,
+                            instance=job.instance,
                             project_key=job.project_key,
                             watermark=watermark,
                             interval_seconds=self._config.jira_worker_poll_interval_seconds,
@@ -502,11 +562,11 @@ class JiraWorkerScheduler:
             raw_watermark if isinstance(raw_watermark, str) else None
         )
         new_watermark: str | None = watermark
-        client = self._poll_client
+        client = self._poll_clients.get(job.instance)
         if client is None:
             logger.warning(
-                "Jira worker poll for project %s skipped: no Jira credentials "
-                "configured (set JIRA_WORKER_BASE_URL/EMAIL/API_TOKEN)",
+                "Jira worker poll for instance %s project %s skipped: no Jira credentials",
+                job.instance,
                 job.project_key,
             )
             new_watermark = watermark
@@ -516,7 +576,7 @@ class JiraWorkerScheduler:
             )
             async with self._session_factory() as session:
                 for issue in issues:
-                    await record_polled_issue(session, issue)
+                    await record_polled_issue(session, issue, instance=job.instance)
                 await session.commit()
             stamps = [
                 str(issue.get("fields", {}).get("updated") or "")
@@ -535,6 +595,7 @@ class JiraWorkerScheduler:
             await complete_job(session, job.id, status="done", now=self._clock())
             await schedule_next_poll(
                 session,
+                instance=job.instance,
                 project_key=job.project_key,
                 watermark=new_watermark,
                 interval_seconds=self._config.jira_worker_poll_interval_seconds,

@@ -36,6 +36,7 @@ def upgrade() -> None:
     op.create_table(
         "jira_worker_ticket_map",
         sa.Column("id", sa.Text(), nullable=False),
+        sa.Column("instance", sa.Text(), nullable=False),
         sa.Column("issue_key", sa.Text(), nullable=False),
         sa.Column("issue_id", sa.Text(), nullable=False),
         sa.Column("project_key", sa.Text(), nullable=False),
@@ -55,17 +56,18 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("issue_key"),
+        sa.UniqueConstraint("instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"),
     )
     op.create_index(
-        "ix_jira_worker_ticket_map_project",
+        "ix_jira_worker_ticket_map_instance_project",
         "jira_worker_ticket_map",
-        ["project_key"],
+        ["instance", "project_key"],
     )
     op.create_table(
         "jira_worker_job_record",
         sa.Column("id", sa.Text(), nullable=False),
         sa.Column("kind", sa.Text(), nullable=False),
+        sa.Column("instance", sa.Text(), nullable=False),
         sa.Column("project_key", sa.Text(), nullable=False),
         sa.Column("due_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("status", sa.Text(), nullable=False),
@@ -85,6 +87,7 @@ def upgrade() -> None:
     op.create_table(
         "jira_worker_event_log",
         sa.Column("id", sa.Text(), nullable=False),
+        sa.Column("instance", sa.Text(), nullable=False),
         sa.Column("idempotency_key", sa.Text(), nullable=False),
         sa.Column("issue_key", sa.Text(), nullable=False),
         sa.Column("project_key", sa.Text(), nullable=False),
@@ -98,12 +101,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("idempotency_key"),
+        sa.UniqueConstraint("instance", "idempotency_key", name="uq_jira_worker_event_instance_key"),
     )
     op.create_index(
-        "ix_jira_worker_event_log_issue",
+        "ix_jira_worker_event_log_instance_issue",
         "jira_worker_event_log",
-        ["issue_key"],
+        ["instance", "issue_key"],
     )
     op.create_table(
         "jira_worker_outbox",
@@ -131,12 +134,12 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_jira_worker_outbox_status", table_name="jira_worker_outbox")
     op.drop_table("jira_worker_outbox")
-    op.drop_index("ix_jira_worker_event_log_issue", table_name="jira_worker_event_log")
+    op.drop_index("ix_jira_worker_event_log_instance_issue", table_name="jira_worker_event_log")
     op.drop_table("jira_worker_event_log")
     op.drop_index("ix_jira_worker_job_record_due", table_name="jira_worker_job_record")
     op.drop_table("jira_worker_job_record")
     op.drop_index(
-        "ix_jira_worker_ticket_map_project", table_name="jira_worker_ticket_map"
+        "ix_jira_worker_ticket_map_instance_project", table_name="jira_worker_ticket_map"
     )
     op.drop_table("jira_worker_ticket_map")
     op.drop_table("jira_worker_identity_map")

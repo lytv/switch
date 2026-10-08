@@ -62,7 +62,7 @@ from switch_core.bridges.collaboration.telegram.adapter import (
     TelegramConnectionConfig,
 )
 from switch_core.bridges.jira.identity import ensure_jira_system_agent
-from switch_core.bridges.jira.worker import JiraWorkerScheduler, build_poll_client
+from switch_core.bridges.jira.worker import JiraWorkerScheduler, build_poll_clients
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.admin_client import AdminClient
 from switch_core.clients.agent_client import AgentClient
@@ -427,11 +427,11 @@ async def run(config: SwitchConfig) -> None:
 
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     worker_scheduler: JiraWorkerScheduler | None = None
-    if config.jira_worker_enabled_projects:
+    if config.jira_worker_enabled_projects and config.jira_worker_credentials:
         worker_scheduler = JiraWorkerScheduler(
             session_factory=session_factory,
             config=config,
-            poll_client=build_poll_client(config),
+            poll_clients=build_poll_clients(config),
         )
     original_lifespan = agent_bridge_app.router.lifespan_context
 
