@@ -433,6 +433,17 @@ async def run(config: SwitchConfig) -> None:
             config=config,
             poll_clients=build_poll_clients(config),
         )
+    elif config.jira_worker_enabled_projects:
+        missing = sorted(
+            f"{instance}/{project_key}"
+            for instance, project_keys in config.jira_worker_enabled_projects.items()
+            if instance not in config.jira_worker_credentials
+            for project_key in project_keys
+        )
+        logger.warning(
+            "Jira worker enabled for %s but no Jira credentials are configured; polling is disabled",
+            ", ".join(missing) if missing else "enabled projects",
+        )
     original_lifespan = agent_bridge_app.router.lifespan_context
 
     @asynccontextmanager

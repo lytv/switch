@@ -545,6 +545,12 @@ class JiraWorkerScheduler:
         async with self._session_factory() as session:
             for instance, project_keys in projects.items():
                 if instance not in self._poll_clients:
+                    for project_key in project_keys:
+                        logger.warning(
+                            "Jira worker poll for instance %s project %s skipped: no Jira credentials",
+                            instance,
+                            project_key,
+                        )
                     continue
                 for project_key in project_keys:
                     await ensure_poll_job(
