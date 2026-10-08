@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from alembic.config import Config
 from alembic.runtime.environment import EnvironmentContext
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
 from switch_core.bridges.jira.worker import (
     JiraWorkerScheduler,
+    JiraPollClient,
     build_poll_clients,
     claim_due_jobs,
     complete_job,
@@ -29,7 +31,7 @@ from switch_core.bridges.jira.worker import (
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.base import Base
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
 
 _CORE = Path(__file__).resolve().parents[4]
 _MIG_DB = "jira_worker_mig"
@@ -411,7 +413,9 @@ async def test_two_claimers_one_wins(
 
     async def claim(owner: str) -> int:
         async with session_factory() as session:
-            jobs = await claim_due_jobs(session, now=now, owner=owner)
+            jobs = await claim_due_jobs(
+                session, now=now, owner=owner, interval_seconds=300
+            )
             await session.commit()
             return len(jobs)
 
@@ -448,6 +452,48 @@ async def test_restart_rereads_overdue_rows(
         assert job == "done"
 
 
+@pytest.mark.asyncio
+async def test_claim_commits_successor_before_poll_runs(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        await _insert_due_job(session, due=now - timedelta(seconds=1))
+        jobs = await claim_due_jobs(
+            session, now=now, owner="first", interval_seconds=300
+        )
+        assert len(jobs) == 1
+        await session.commit()
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT status, payload FROM jira_worker_job_record "
+                    "ORDER BY due_at"
+                )
+            )
+        ).all()
+        assert rows[0][0] == "claimed"
+        assert rows[1][0] == "pending"
+        assert rows[1][1]["predecessor_id"] == jobs[0].id
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                "UPDATE jira_worker_job_record SET due_at = now() - interval '1 second' "
+                "WHERE status = 'pending'"
+            )
+        )
+        await session.commit()
+    client = _FakePollClient([])
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={"acme": client},  # type: ignore[dict-item]
+    )
+    await scheduler.run_once()
+    assert client.calls == [{"project_key": "KAN", "updated_since": None}]
+
+
 class _FakePollClient:
     def __init__(self, issues: list[dict[str, Any]]) -> None:
         self._issues = issues
@@ -458,6 +504,56 @@ class _FakePollClient:
     ) -> list[dict[str, Any]]:
         self.calls.append({"project_key": project_key, "updated_since": updated_since})
         return self._issues
+
+
+@pytest.mark.asyncio
+async def test_poll_reads_all_jira_pages_before_recording_watermark(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    issues = [
+        _issue(f"KAN-{number}", "2026-10-08T01:00:00.000+0000")
+        for number in range(1, 52)
+    ]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.params.get("nextPageToken") == "page-2":
+            return httpx.Response(200, json={"issues": issues[50:], "isLast": True})
+        return httpx.Response(
+            200,
+            json={"issues": issues[:50], "nextPageToken": "page-2", "isLast": False},
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = JiraPollClient(
+        base_url="https://jira.example",
+        email="worker@example.com",
+        api_token="token",
+        client=http_client,
+    )
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={"acme": client},
+    )
+    await scheduler.run_once()
+    async with session_factory() as session:
+        count = (
+            await session.execute(text("SELECT count(*) FROM jira_worker_event_log"))
+        ).scalar_one()
+        watermark = (
+            await session.execute(
+                text(
+                    "SELECT payload->>'watermark' FROM jira_worker_job_record "
+                    "WHERE status = 'pending'"
+                )
+            )
+        ).scalar_one()
+    await http_client.aclose()
+    assert len(requests) == 2
+    assert count == 51
+    assert watermark == "2026-10-08T01:00:00.000+0000"
 
 
 def _issue(key: str, updated: str) -> dict[str, Any]:
@@ -569,7 +665,7 @@ async def test_complete_job_marks_error(
         job_id = await _insert_due_job(session, due=datetime.now(UTC))
         await session.commit()
     async with session_factory() as session:
-        jobs = await claim_due_jobs(session, owner="t")
+        jobs = await claim_due_jobs(session, owner="t", interval_seconds=300)
         assert len(jobs) == 1
         await complete_job(session, jobs[0].id, status="error", error="boom")
         await session.commit()
@@ -592,7 +688,3 @@ async def test_scheduler_start_stop(
     assert scheduler.running is True
     await scheduler.stop()
     assert scheduler.running is False
-
-
-def test_event_model_registered() -> None:
-    assert JiraWorkerEvent.__tablename__ == "jira_worker_event_log"

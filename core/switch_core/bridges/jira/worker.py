@@ -285,6 +285,7 @@ async def schedule_next_poll(
     project_key: str,
     watermark: str | None,
     interval_seconds: int,
+    predecessor_id: str,
     now: datetime | None = None,
 ) -> None:
     clock = now or datetime.now(UTC)
@@ -296,7 +297,7 @@ async def schedule_next_poll(
             project_key=project_key,
             due_at=due,
             status="pending",
-            payload={"watermark": watermark},
+            payload={"watermark": watermark, "predecessor_id": predecessor_id},
         )
     )
     await session.flush()
@@ -308,6 +309,7 @@ async def claim_due_jobs(
     now: datetime | None = None,
     limit: int = 10,
     owner: str = "scheduler",
+    interval_seconds: int,
     scopes: Sequence[tuple[str, str]] | None = None,
 ) -> Sequence[JiraWorkerJob]:
     """Claim due rows transactionally: pending → claimed in one statement.
@@ -360,7 +362,40 @@ async def claim_due_jobs(
     )
     result = await session.execute(stmt)
     await session.flush()
-    return list(result.scalars().all())
+    jobs = list(result.scalars().all())
+    for job in jobs:
+        if job.kind != POLL_JOB_KIND:
+            continue
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        watermark = payload.get("watermark")
+        await schedule_next_poll(
+            session,
+            instance=job.instance,
+            project_key=job.project_key,
+            watermark=watermark if isinstance(watermark, str) else None,
+            interval_seconds=interval_seconds,
+            predecessor_id=job.id,
+            now=clock,
+        )
+    return jobs
+
+
+async def update_next_poll_watermark(
+    session: AsyncSession,
+    *,
+    predecessor_id: str,
+    watermark: str | None,
+) -> None:
+    result = await session.execute(
+        select(JiraWorkerJob).where(
+            JiraWorkerJob.kind == POLL_JOB_KIND,
+            JiraWorkerJob.status == "pending",
+            JiraWorkerJob.payload["predecessor_id"].astext == predecessor_id,
+        )
+    )
+    job = result.scalar_one()
+    job.payload = {"watermark": watermark, "predecessor_id": predecessor_id}
+    await session.flush()
 
 
 async def complete_job(
@@ -404,19 +439,31 @@ class JiraPollClient:
         if updated_since:
             jql += f' AND updated >= "{updated_since}"'
         jql += " ORDER BY updated ASC"
-        response = await self._client.get(
-            f"{self._base_url}/rest/api/3/search/jql",
-            params={
+        issues: list[dict[str, Any]] = []
+        next_page_token: str | None = None
+        while True:
+            params: dict[str, str | int] = {
                 "jql": jql,
                 "fields": "summary,status,updated,project",
                 "maxResults": 50,
-            },
-            auth=self._auth,
-        )
-        response.raise_for_status()
-        body = response.json()
-        issues = body.get("issues", [])
-        return [issue for issue in issues if isinstance(issue, dict)]
+            }
+            if next_page_token is not None:
+                params["nextPageToken"] = next_page_token
+            response = await self._client.get(
+                f"{self._base_url}/rest/api/3/search/jql",
+                params=params,
+                auth=self._auth,
+            )
+            response.raise_for_status()
+            body = response.json()
+            page_issues = body.get("issues", [])
+            issues.extend(issue for issue in page_issues if isinstance(issue, dict))
+            page_token = body.get("nextPageToken")
+            if not isinstance(page_token, str) or not page_token:
+                if body.get("isLast") is False:
+                    raise ValueError("Jira search response omitted nextPageToken")
+                return issues
+            next_page_token = page_token
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -508,7 +555,12 @@ class JiraWorkerScheduler:
                         now=now,
                     )
             jobs = await claim_due_jobs(
-                session, now=now, limit=10, owner=self._owner, scopes=scopes
+                session,
+                now=now,
+                limit=10,
+                owner=self._owner,
+                interval_seconds=self._config.jira_worker_poll_interval_seconds,
+                scopes=scopes,
             )
             await session.commit()
         for job in jobs:
@@ -529,20 +581,6 @@ class JiraWorkerScheduler:
                         error=f"{type(exc).__name__}",
                         now=self._clock(),
                     )
-                    if job.kind == POLL_JOB_KIND:
-                        watermark = (
-                            job.payload.get("watermark")
-                            if isinstance(job.payload, dict)
-                            else None
-                        )
-                        await schedule_next_poll(
-                            session,
-                            instance=job.instance,
-                            project_key=job.project_key,
-                            watermark=watermark,
-                            interval_seconds=self._config.jira_worker_poll_interval_seconds,
-                            now=self._clock(),
-                        )
                     await session.commit()
 
     async def _handle_job(self, job: JiraWorkerJob) -> None:
@@ -593,12 +631,9 @@ class JiraWorkerScheduler:
             )
         async with self._session_factory() as session:
             await complete_job(session, job.id, status="done", now=self._clock())
-            await schedule_next_poll(
+            await update_next_poll_watermark(
                 session,
-                instance=job.instance,
-                project_key=job.project_key,
+                predecessor_id=job.id,
                 watermark=new_watermark,
-                interval_seconds=self._config.jira_worker_poll_interval_seconds,
-                now=self._clock(),
             )
             await session.commit()
