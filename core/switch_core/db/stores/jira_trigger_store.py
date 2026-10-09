@@ -26,18 +26,29 @@ class JiraTriggerStore:
     async def get(self, session: AsyncSession, trigger_id: str) -> JiraTrigger | None:
         return await session.get(JiraTrigger, trigger_id)
 
+    async def get_for_update(
+        self, session: AsyncSession, trigger_id: str
+    ) -> JiraTrigger | None:
+        result = await session.execute(
+            select(JiraTrigger).where(JiraTrigger.id == trigger_id).with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def list(
         self,
         session: AsyncSession,
         *,
         instance: str | None = None,
         enabled_only: bool = False,
+        for_update: bool = False,
     ) -> Sequence[JiraTrigger]:
         stmt = select(JiraTrigger).order_by(JiraTrigger.created_at.asc())
         if instance is not None:
             stmt = stmt.where(JiraTrigger.instance == instance)
         if enabled_only:
             stmt = stmt.where(JiraTrigger.enabled.is_(True))
+        if for_update:
+            stmt = stmt.with_for_update()
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
@@ -276,6 +287,7 @@ class JiraTriggerStore:
         *,
         instance: str | None = None,
         rule_id: str | None = None,
+        rule_ids: Sequence[str] | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> Sequence[JiraTriggerFiring]:
@@ -284,6 +296,8 @@ class JiraTriggerStore:
             stmt = stmt.where(JiraTriggerFiring.instance == instance)
         if rule_id is not None:
             stmt = stmt.where(JiraTriggerFiring.rule_id == rule_id)
+        if rule_ids is not None:
+            stmt = stmt.where(JiraTriggerFiring.rule_id.in_(rule_ids))
         stmt = stmt.offset(max(offset, 0)).limit(max(1, min(limit, 200)))
         result = await session.execute(stmt)
         return list(result.scalars().all())
