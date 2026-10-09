@@ -615,10 +615,10 @@ class TicketActivity:
                     event_id = await self._input(
                         session,
                         ticket,
-                        "ignored_input" if wrong_place else "thread_message",
+                        "thread_message",
                         f"thread:{ticket.room_id}:{message['id']}",
                         message,
-                        reporter=reporter and not wrong_place,
+                        reporter=reporter,
                         wrong_place_type="switch_approval" if wrong_place else None,
                     )
                     if event_id and wrong_place:
