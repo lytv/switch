@@ -14,13 +14,13 @@ from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from switch_core.bridges.jira.outbox import (
-    HumanChange,
+from switch_core.bridges.jira.observe import (
+    Observation,
     _stamp,
     comment_actor,
-    park_ticket,
-    read_jira_version,
+    observe_jira,
 )
+from switch_core.bridges.jira.outbox import HumanChange, park_ticket, read_jira_version
 from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
 
@@ -313,9 +313,7 @@ class TicketActivity:
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
                 park_ticket(ticket, "Ticket token limit")
-            version, switch_reporter_comments = await self._read_jira(
-                ticket, force=force_jira
-            )
+            version, observation = await self._read_jira(ticket, force=force_jira)
             fell_back = False
             if (
                 ticket.wait_channel == "switch"
@@ -348,21 +346,36 @@ class TicketActivity:
                     )
             if ticket.wait_channel == "jira_comments":
                 if version is None and fell_back:
-                    version, switch_reporter_comments = await self._read_jira(
-                        ticket, force=True
-                    )
-                for comment in version["comments"] if version is not None else []:
-                    author = comment.get("author", {}).get("accountId", "")
+                    version, observation = await self._read_jira(ticket, force=True)
+                by_id = (
+                    {
+                        str(comment.get("id", "")): comment
+                        for comment in version["comments"]
+                    }
+                    if version is not None and observation is not None
+                    else {}
+                )
+                for comment_id in sorted(
+                    observation.new_ids if observation is not None else frozenset()
+                ):
+                    comment = by_id[comment_id]
+                    actor = comment_actor(comment)
+                    if actor == ticket.jira_worker_account_id:
+                        continue
                     await self._input(
                         session,
                         ticket,
                         "jira_comment",
                         f"jira-comment:{ticket.issue_key}:{comment['id']}:{comment['updated']}",
                         comment,
-                        reporter=bool(author) and author == ticket.reporter_account_id,
+                        reporter=bool(actor) and actor == ticket.reporter_account_id,
                     )
+                if observation is not None and observation.reporter_edits:
+                    request_wake(ticket)
             else:
-                for comment in switch_reporter_comments:
+                for comment in (
+                    observation.reporter_new if observation is not None else []
+                ):
                     await self._input(
                         session,
                         ticket,
@@ -406,7 +419,7 @@ class TicketActivity:
         ticket: JiraWorkerTicket,
         *,
         force: bool,
-    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    ) -> tuple[dict[str, Any] | None, Observation | None]:
         if (
             not force
             and not self._comment_refresh_due(ticket)
@@ -414,7 +427,7 @@ class TicketActivity:
             and ticket.jira_read_updated
             and ticket.last_event_at <= _stamp(ticket.jira_read_updated)
         ):
-            return None, []
+            return None, None
         self._schedule_comment_refresh(ticket)
         client = self._clients.get(ticket.instance)
         if client is None:
@@ -432,68 +445,33 @@ class TicketActivity:
             version = await read_jira_version(client, ticket.issue_key)
         except HumanChange as exc:
             park_ticket(ticket, str(exc))
-            return None, []
-        stored_id = ticket.jira_read_changelog_id
-        if stored_id is None:
-            changes = [
-                entry
-                for entry in version["histories"]
-                if _stamp(entry["created"]) > ticket.last_event_at
-            ]
-        elif stored_id == "":
-            changes = version["histories"]
-        else:
-            baseline_index = next(
-                (
-                    i
-                    for i, entry in enumerate(version["histories"])
-                    if str(entry["id"]) == stored_id
-                ),
-                None,
-            )
-            if baseline_index is None:
-                park_ticket(ticket, "Jira changelog baseline is missing")
-                changes = version["histories"]
-            else:
-                changes = version["histories"][baseline_index + 1 :]
-        if any(
-            entry.get("author", {}).get("accountId") != account for entry in changes
-        ):
-            park_ticket(ticket, "Human Jira action")
+            return None, None
         seen_raw = ticket.jira_seen_comment_ids
-        current_ids = {str(comment.get("id", "")) for comment in version["comments"]}
-        first_observe = seen_raw is None
-        if first_observe:
-            ticket.jira_seen_comment_ids = sorted(current_ids)
-            new_ids: set[str] = set()
-        else:
-            seen = {str(item) for item in seen_raw}
-            new_ids = current_ids - seen
-            ticket.jira_seen_comment_ids = sorted(seen | current_ids)
-        by_id = {str(comment.get("id", "")): comment for comment in version["comments"]}
-        reporter_comments: list[dict[str, Any]] = []
-        for comment_id in new_ids:
-            actor = comment_actor(by_id[comment_id])
-            if actor == account:
-                continue
-            if actor and actor == ticket.reporter_account_id:
-                reporter_comments.append(by_id[comment_id])
-                continue
-            park_ticket(ticket, "Human Jira action")
-        baseline = (
-            _stamp(ticket.jira_read_updated)
-            if ticket.jira_read_updated
-            else ticket.last_event_at
+        observation = observe_jira(
+            version,
+            seen_ids=None if seen_raw is None else {str(item) for item in seen_raw},
+            changelog_id=ticket.jira_read_changelog_id,
+            base_stamp=(
+                _stamp(ticket.jira_read_updated)
+                if ticket.jira_read_updated
+                else ticket.last_event_at
+            ),
+            worker_account=account,
+            reporter_account=ticket.reporter_account_id,
         )
-        if (
-            _stamp(version["updated"]) > baseline
-            and not changes
-            and not (current_ids if first_observe else new_ids)
-        ):
-            park_ticket(ticket, "Unattributed Jira action")
+        ticket.jira_seen_comment_ids = list(observation.seen_ids)
+        ticket.jira_read_changelog_id = observation.changelog_id
         ticket.jira_read_updated = version["updated"]
-        ticket.jira_read_changelog_id = version["changelog_id"]
-        return version, reporter_comments
+        if observation.park == "changelog_missing":
+            park_ticket(ticket, "Jira changelog baseline is missing")
+        elif observation.park is not None and observation.park != "regressed":
+            park_ticket(
+                ticket,
+                "Unattributed Jira action"
+                if observation.park == "unattributed"
+                else "Human Jira action",
+            )
+        return version, observation
 
     async def _read_thread(
         self, session: AsyncSession, ticket: JiraWorkerTicket
@@ -513,9 +491,9 @@ class TicketActivity:
                     if message.get("id") == ticket.card_event_id:
                         continue
                     sender = message.get("sender")
-                    if not isinstance(sender, str) or await self._rooms.is_worker_sender(
-                        sender
-                    ):
+                    if not isinstance(
+                        sender, str
+                    ) or await self._rooms.is_worker_sender(sender):
                         continue
                     user_id = ticket.reporter_switch_user_id
                     reporter = (
@@ -617,9 +595,7 @@ class TicketActivity:
                 try:
                     loaded = await self.read_ticket(ticket_id, force_jira=True)
                 except Exception:
-                    logger.exception(
-                        "Jira ticket input read failed for %s", ticket_id
-                    )
+                    logger.exception("Jira ticket input read failed for %s", ticket_id)
                     continue
                 if not loaded:
                     continue
@@ -709,6 +685,7 @@ class TicketActivity:
                         .where(
                             JiraWorkerEvent.instance == ticket.instance,
                             JiraWorkerEvent.issue_key == ticket.issue_key,
+                            JiraWorkerEvent.event_kind.in_(INPUT_KINDS),
                             JiraWorkerEvent.consumed.is_(False),
                         )
                         .order_by(JiraWorkerEvent.received_at, JiraWorkerEvent.id)

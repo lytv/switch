@@ -575,21 +575,30 @@ async def test_new_reporter_message_during_turn_requests_another_turn(
     assert inputs[0].consumed and not inputs[1].consumed
 
 
-async def test_human_webhook_parks_immediately_not_only_at_next_poll(
+async def test_human_webhook_defers_park_to_next_observer_read(
     session_factory,
 ) -> None:
     key = await seed(session_factory)
     event = _webhook_event(status="In Progress")
     event.raw["user"] = {"accountId": "human-account"}
     async with session_factory() as session:
-        await record_webhook_event(
-            session,
-            event,
-            instance="acme",
-            enabled_projects=["KAN"],
-            webhook_identifier="human",
+        assert (
+            await record_webhook_event(
+                session,
+                event,
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier="human",
+            )
+            is True
         )
         await session.commit()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    rooms, jira = ThreadRooms(), JiraMock()
+    await activity(session_factory, jira, rooms).read_ticket(key, force_jira=True)
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    jira.change("human-account")
+    await activity(session_factory, jira, rooms).read_ticket(key, force_jira=True)
     assert (
         await ticket(session_factory, key)
     ).worker_parked_reason == "Human Jira action"
@@ -1027,23 +1036,23 @@ async def test_same_stamp_human_comment_parks_after_the_first_read(
     await reader.read_once()
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None and row.agent_state == "waiting"
-    assert len(await events(session_factory)) == 1
+    assert len(await events(session_factory)) == 0
     jira.comments.append(_same_stamp_comment("w", "worker-account", BASE))
     await reader.read_once()
     assert (await ticket(session_factory, key)).worker_parked_reason is None
-    assert len(await events(session_factory)) == 1
+    assert len(await events(session_factory)) == 0
     clock.now = NOW + timedelta(seconds=60)
     await reader.read_once()
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None and row.agent_state == "waiting"
-    assert len(await events(session_factory)) == 2
+    assert len(await events(session_factory)) == 0
     jira.comments.append(_same_stamp_comment("2", "human-account", BASE))
     clock.now = NOW + timedelta(seconds=120)
     await reader.read_once()
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason == "Human Jira action"
     assert row.agent_state == "parked" and row.tokens_used == 0
-    assert len(await events(session_factory)) == 3
+    assert len(await events(session_factory)) == 1
 
     async def fake(turn: TicketTurn) -> TurnResult:
         raise AssertionError(turn.issue_key)
@@ -1205,3 +1214,119 @@ async def test_finish_turn_after_project_disable_leaves_waiting(
             )
         )
     assert job is not None
+
+
+def _edited_later_stamp() -> str:
+    return (datetime.fromisoformat(BASE) + timedelta(seconds=100)).isoformat()
+
+
+async def test_reporter_edit_of_seen_comment_wakes_without_new_event_row(
+    session_factory,
+) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    assert len(await events(session_factory)) == 0
+    later = _edited_later_stamp()
+    jira.comments[0]["updated"] = later
+    jira.updated = later
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert row.agent_state == "wake_requested"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_worker_edit_of_seen_comment_is_ignored(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    later = _edited_later_stamp()
+    jira.comments[0]["updated"] = later
+    jira.comments[0]["updateAuthor"] = {"accountId": "worker-account"}
+    jira.updated = later
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_other_edit_of_seen_comment_parks(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    later = _edited_later_stamp()
+    jira.comments[0]["updated"] = later
+    jira.comments[0]["updateAuthor"] = {"accountId": "human-account"}
+    jira.updated = later
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_switch_channel_reporter_edit_does_not_wake(session_factory) -> None:
+    key = await seed(session_factory, mapped=True)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    assert (await ticket(session_factory, key)).agent_state == "waiting"
+    later = _edited_later_stamp()
+    jira.comments[0]["updated"] = later
+    jira.updated = later
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_claimed_turn_excludes_raw_intake_events(session_factory) -> None:
+    key = await seed(session_factory)
+    rooms, jira = ThreadRooms(), JiraMock()
+    rooms.messages = [message(1)]
+    async with session_factory() as session:
+        assert (
+            await record_webhook_event(
+                session,
+                _webhook_event(),
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier="intake-1",
+            )
+            is True
+        )
+        await session.commit()
+    assert any(
+        event.event_kind not in ("thread_message", "jira_comment", "wake_timer")
+        for event in await events(session_factory)
+    )
+    reader = activity(session_factory, jira, rooms)
+    turns: list[TicketTurn] = []
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        turns.append(turn)
+        return TurnResult(1, None)
+
+    assert await reader.run_one_turn(fake) == key
+    assert len(turns) == 1
+    assert len(turns[0].untrusted_data["events"]) == 1
+    assert all(
+        isinstance(item, dict) and "untrusted_data" in item
+        for item in turns[0].untrusted_data["events"]
+    )
+    kinds = {event.event_kind for event in await events(session_factory)}
+    assert "thread_message" in kinds
+    consumed = {
+        event.event_kind for event in await events(session_factory) if event.consumed
+    }
+    assert consumed == {"thread_message"}

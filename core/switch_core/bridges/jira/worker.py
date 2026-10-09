@@ -514,16 +514,6 @@ async def record_webhook_event(
         wait_channel=wait_channel,
         updated_at=jira_updated_at(raw),
     )
-    actor = raw.get("user", {})
-    actor_id = actor.get("accountId") if isinstance(actor, dict) else None
-    if (
-        not created
-        and actor_id
-        and actor_id != ticket.jira_worker_account_id
-        and jira_updated_at(raw) >= ticket.last_event_at
-    ):
-        if not (raw.get("comment") and actor_id == ticket.reporter_account_id):
-            park_ticket(ticket, "Human Jira action")
     await _enqueue_ticket_intake_follow_ups(
         session,
         ticket=ticket,

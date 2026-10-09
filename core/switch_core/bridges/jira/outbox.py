@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
@@ -20,6 +20,7 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
@@ -28,13 +29,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
-
-
-def _stamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("Jira updated stamp must include a timezone")
-    return parsed
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -165,90 +159,31 @@ class HumanChange(Exception):
     """A non-worker or unattributed change must park the ticket."""
 
 
-def comment_actor(comment: dict[str, Any]) -> str:
-    source = comment.get("updateAuthor", comment.get("author", {}))
-    if not isinstance(source, dict):
-        return ""
-    account = source.get("accountId", "")
-    return account if isinstance(account, str) else ""
-
-
-def fresh_comment_ids(comments: list[dict[str, Any]], known_ids: set[str]) -> set[str]:
-    return {
-        str(comment.get("id", ""))
-        for comment in comments
-        if str(comment.get("id", "")) not in known_ids
-    }
-
-
-def new_human_comment_ids(
-    comments: list[dict[str, Any]],
-    seen_ids: set[str],
-    worker_account: str,
-    reporter_account: str,
-) -> set[str]:
-    by_id = {str(comment.get("id", "")): comment for comment in comments}
-    parked: set[str] = set()
-    for comment_id in fresh_comment_ids(comments, seen_ids):
-        actor = comment_actor(by_id[comment_id])
-        if actor == worker_account:
-            continue
-        if actor and actor == reporter_account:
-            continue
-        parked.add(comment_id)
-    return parked
-
-
 def check_jira_version(
     version: dict[str, Any], payload: dict[str, Any], account_id: str
 ) -> None:
-    base = _stamp(payload["based_updated"])
-    current = _stamp(version["updated"])
-    base_id = payload["based_changelog_id"]
-    known_comments = payload.get("based_comment_ids")
     reporter = payload.get("reporter_account_id")
     if not isinstance(reporter, str):
         reporter = ""
-    if isinstance(known_comments, list):
-        seen = {str(item) for item in known_comments}
-        by_id = {str(comment.get("id", "")): comment for comment in version["comments"]}
-        for comment_id in fresh_comment_ids(version["comments"], seen):
-            actor = comment_actor(by_id[comment_id])
-            if actor == account_id:
-                continue
-            if actor and actor == reporter:
-                continue
-            raise HumanChange("A non-worker Jira action superseded the command")
-    if current == base and version["changelog_id"] == base_id:
+    known = payload.get("based_comment_ids")
+    seen = {str(item) for item in known} if isinstance(known, list) else set()
+    observation = observe_jira(
+        version,
+        seen_ids=seen,
+        changelog_id=payload["based_changelog_id"],
+        base_stamp=_stamp(payload["based_updated"]),
+        worker_account=account_id,
+        reporter_account=reporter,
+    )
+    if observation.park is None:
         return
-    if current < base:
+    if observation.park == "changelog_missing":
+        raise HumanChange("The command's changelog baseline is missing")
+    if observation.park == "regressed":
         raise HumanChange("Jira version is older than the command baseline")
-    histories = version["histories"]
-    if base_id:
-        index = next(
-            (i for i, entry in enumerate(histories) if str(entry["id"]) == base_id),
-            None,
-        )
-        if index is None:
-            raise HumanChange("The command's changelog baseline is missing")
-        histories = histories[index + 1 :]
-    changes: list[tuple[datetime, str]] = [
-        (_stamp(entry["created"]), entry.get("author", {}).get("accountId", ""))
-        for entry in histories
-    ]
-    for comment in version["comments"]:
-        created = _stamp(comment["created"])
-        edited = _stamp(comment["updated"])
-        if created > base:
-            changes.append((created, comment.get("author", {}).get("accountId", "")))
-        if edited > base:
-            changes.append(
-                (edited, comment.get("updateAuthor", {}).get("accountId", ""))
-            )
-    if not changes or any(author != account_id for _, author in changes):
-        raise HumanChange("A non-worker Jira action superseded the command")
-    if max(stamp for stamp, _ in changes) != current:
+    if observation.park == "stamp_mismatch":
         raise HumanChange("Jira updated stamp has no attributable worker change")
+    raise HumanChange("A non-worker Jira action superseded the command")
 
 
 def park_ticket(ticket: JiraWorkerTicket, reason: str) -> None:
