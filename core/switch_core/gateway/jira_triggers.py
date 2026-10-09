@@ -20,8 +20,7 @@ from switch_core.bridges.jira.parse import (
 from switch_core.bridges.jira.rooms import (
     SwitchCardUpdater,
     SwitchTicketRooms,
-    consume_reporter_invites,
-    sync_ticket_room,
+    reconcile_ticket_room,
 )
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
 from switch_core.bridges.jira.worker import (
@@ -563,16 +562,25 @@ async def put_worker_identity_mapping(
     await session.refresh(mapping)
     if ticket_rooms is not None:
         try:
-            await consume_reporter_invites(
-                session,
-                rooms=ticket_rooms,
-                cards=card_updater,
-                switch_user_id=switch_user_id,
+            result = await session.execute(
+                select(JiraWorkerTicket.issue_key).where(
+                    JiraWorkerTicket.instance == instance,
+                    JiraWorkerTicket.reporter_account_id == jira_account_id,
+                )
             )
+            for (issue_key,) in result.all():
+                await reconcile_ticket_room(
+                    session,
+                    instance=instance,
+                    issue_key=issue_key,
+                    rooms=ticket_rooms,
+                    jira_agent_name=config.jira_agent_name,
+                    cards=card_updater,
+                )
             await session.commit()
         except Exception:
             logger.exception(
-                "Jira reporter-invite consume failed for %s", switch_user_id
+                "Jira ticket room reconcile failed for %s", switch_user_id
             )
             await session.rollback()
     return _identity_mapping_response(
@@ -620,7 +628,7 @@ async def delete_worker_identity_mapping(
                 )
             )
             for (issue_key,) in result.all():
-                await sync_ticket_room(
+                await reconcile_ticket_room(
                     session,
                     instance=instance,
                     issue_key=issue_key,

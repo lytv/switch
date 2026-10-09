@@ -16,9 +16,8 @@ import switch_core.db.models  # noqa: F401 — registers every table on Base.met
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND,
     SwitchCardUpdater,
-    consume_reporter_invites,
+    reconcile_ticket_room,
     render_ticket_card,
-    sync_ticket_room,
 )
 from switch_core.bridges.jira.worker import (
     record_webhook_event,
@@ -43,6 +42,8 @@ class FakeRooms:
         self.cards: dict[str, str] = {}
         self.owner_changes: list[tuple[str, str | None]] = []
         self.archived_calls: list[tuple[str, bool]] = []
+        self.fail_create_once = False
+        self.fail_post_once = False
         self._next = 0
 
     async def create_ticket_room(
@@ -58,12 +59,18 @@ class FakeRooms:
             "agents": [],
         }
         self.created.append({"room_id": room_id, "name": name, "owner_id": owner_id})
+        if self.fail_create_once:
+            self.fail_create_once = False
+            raise RuntimeError("create committed then raised")
         return room_id
 
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         self.rooms[room_id]["agents"].append(agent_name)
 
     async def post_card(self, room_id: str, *, body: str) -> str:
+        if self.fail_post_once:
+            self.fail_post_once = False
+            raise RuntimeError("post_card raised")
         event_id = f"card-{room_id}"
         self.cards[event_id] = body
         return event_id
@@ -75,6 +82,20 @@ class FakeRooms:
     async def set_archived(self, room_id: str, *, archived: bool) -> None:
         self.rooms[room_id]["archived"] = archived
         self.archived_calls.append((room_id, archived))
+
+    async def find_ticket_room(self, *, name: str) -> str | None:
+        for room_id in reversed(list(self.rooms)):
+            if self.rooms[room_id]["name"] == name:
+                return room_id
+        return None
+
+    async def get_room_owner(self, room_id: str) -> str | None:
+        room = self.rooms.get(room_id)
+        return None if room is None else room["owner_id"]
+
+    async def get_room_description(self, room_id: str) -> str | None:
+        room = self.rooms.get(room_id)
+        return None if room is None else room["description"]
 
     async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         room = self.rooms.get(room_id)
@@ -151,7 +172,7 @@ async def _sync(
     cards: FakeCards | None = None,
 ) -> str | None:
     async with session_factory() as session:
-        room_id = await sync_ticket_room(
+        room_id = await reconcile_ticket_room(
             session,
             instance=INSTANCE,
             issue_key=issue_key,
@@ -398,9 +419,8 @@ async def test_card_created_once_then_updated_in_place(
     assert "KAN-1" in body and "First ticket" in body and "To Do" in body
     assert "unmapped reporter" in body
     assert "https://jira.example/browse/KAN-1" in body
-    assert len(updater.updates) == 1
-    assert updater.updates[0]["event_id"] == card_id
-    assert "To Do" in updater.updates[0]["body"]
+    assert provisioner.rooms[(await _ticket(session_factory, "KAN-1")).room_id]["description"] == body
+    assert len(updater.updates) == 0
 
     assert (
         await _intake(
@@ -412,10 +432,58 @@ async def test_card_created_once_then_updated_in_place(
     )
     await _sync(session_factory, "KAN-1", provisioner, updater)
     assert len(provisioner.cards) == 1
-    assert len(updater.updates) == 2
+    assert len(updater.updates) == 1
     assert updater.updates[-1]["event_id"] == card_id
     assert "In Progress" in updater.updates[-1]["body"]
     assert (await _ticket(session_factory, "KAN-1")).card_event_id == card_id
+
+
+@pytest.mark.asyncio
+async def test_create_orphan_adopted_on_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    assert await _intake(session_factory, _webhook_event()) is True
+    rooms.fail_create_once = True
+    with pytest.raises(RuntimeError, match="create committed then raised"):
+        await _sync(session_factory, "KAN-1", rooms, updater)
+    assert (await _ticket(session_factory, "KAN-1")).room_id is None
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert room_id == "room-1"
+    assert len(rooms.created) == 1
+    assert (await _ticket(session_factory, "KAN-1")).room_id == room_id
+    assert len(rooms.cards) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_card_failure_retries_without_duplicate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    assert await _intake(session_factory, _webhook_event()) is True
+    rooms.fail_post_once = True
+    with pytest.raises(RuntimeError, match="post_card raised"):
+        await _sync(session_factory, "KAN-1", rooms, updater)
+    room_id = (await _ticket(session_factory, "KAN-1")).room_id
+    assert room_id is not None
+    assert await _sync(session_factory, "KAN-1", rooms, updater) == room_id
+    assert len(rooms.created) == 1
+    assert len(rooms.cards) == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivered_event_reconcile_is_noop(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    assert await _intake(session_factory, _webhook_event()) is True
+    first = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert await _intake(session_factory, _webhook_event()) is False
+    assert await _sync(session_factory, "KAN-1", rooms, updater) == first
+    assert len(rooms.created) == 1
+    assert len(rooms.cards) == 1
+    assert updater.updates == []
+    assert rooms.owner_changes == []
 
 
 @pytest.mark.asyncio
@@ -448,11 +516,7 @@ async def test_mapping_added_later_invites_user_and_leaves_admin_cards(
             )
         ).scalar_one()
         assert invites == 1
-        done = await consume_reporter_invites(
-            session, rooms=rooms, switch_user_id="user-ada"
-        )
-        await session.commit()
-        assert done == 1
+        assert await _sync(session_factory, "KAN-1", rooms) == room_id
 
     assert rooms.rooms[room_id]["owner_id"] == "user-ada"
     assert rooms.owner_changes == [(room_id, "user-ada")]
@@ -532,7 +596,7 @@ async def test_disabled_project_unchanged(
         await session.commit()
         assert new is False
         assert (
-            await sync_ticket_room(
+            await reconcile_ticket_room(
                 session,
                 instance=INSTANCE,
                 issue_key="KAN-1",
@@ -583,7 +647,7 @@ async def test_missing_ticket_sync_returns_none(
 ) -> None:
     async with session_factory() as session:
         assert (
-            await sync_ticket_room(
+            await reconcile_ticket_room(
                 session,
                 instance=INSTANCE,
                 issue_key="KAN-404",

@@ -31,7 +31,6 @@ from switch_core.db.models import (
     JiraWorkerJob,
     JiraWorkerOutbox,
     JiraWorkerTicket,
-    Room,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,32 +249,15 @@ async def remove_identity_mapping(
     mapping = result.scalar_one_or_none()
     if mapping is None:
         raise ValueError("Jira worker identity mapping not found")
-    old_switch_user_id = mapping.switch_user_id
     await session.delete(mapping)
     await session.flush()
-    changed = await _set_open_ticket_reporter_resolution(
+    return await _set_open_ticket_reporter_resolution(
         session,
         instance=instance,
         jira_account_id=jira_account_id,
         switch_user_id=None,
         enabled_projects=enabled_projects,
     )
-    if old_switch_user_id:
-        rooms_result = await session.execute(
-            select(JiraWorkerTicket)
-            .where(
-                JiraWorkerTicket.instance == instance,
-                JiraWorkerTicket.reporter_account_id == jira_account_id,
-                JiraWorkerTicket.room_id.is_not(None),
-            )
-            .with_for_update()
-        )
-        for ticket in rooms_result.scalars().all():
-            room = await session.get(Room, ticket.room_id)
-            if room is not None and room.owner_id == old_switch_user_id:
-                room.owner_id = None
-        await session.flush()
-    return changed
 
 
 def jira_updated_at(payload: dict[str, Any]) -> datetime:
@@ -914,8 +896,7 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
-        await self.sweep_reporter_invites()
-        await self.sweep_unsynced_ticket_rooms()
+        await self.sweep_ticket_rooms()
         for job in jobs:
             try:
                 await self._handle_job(job)
@@ -937,14 +918,14 @@ class JiraWorkerScheduler:
                     await session.commit()
 
     async def sync_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
-        """Step-3 room sync for one ticket. No-op without a provisioner."""
+        """Step-3 room reconcile for one ticket. No-op without a provisioner."""
         if self._ticket_rooms is None:
             return None
-        from switch_core.bridges.jira.rooms import sync_ticket_room
+        from switch_core.bridges.jira.rooms import reconcile_ticket_room
 
         async with self._session_factory() as session:
             try:
-                room_id = await sync_ticket_room(
+                room_id = await reconcile_ticket_room(
                     session,
                     instance=instance,
                     issue_key=issue_key,
@@ -959,25 +940,8 @@ class JiraWorkerScheduler:
                 return None
             return room_id
 
-    async def sweep_reporter_invites(self) -> int:
-        """Consume pending invite follow-ups (mapping-added path, crash recovery)."""
-        if self._ticket_rooms is None:
-            return 0
-        from switch_core.bridges.jira.rooms import consume_reporter_invites
-
-        async with self._session_factory() as session:
-            try:
-                done = await consume_reporter_invites(
-                    session, rooms=self._ticket_rooms, cards=self._card_updater
-                )
-                await session.commit()
-            except Exception:
-                logger.exception("Jira reporter-invite sweep failed")
-                await session.rollback()
-                return 0
-            return done
-
-    async def sweep_unsynced_ticket_rooms(self, limit: int = 20) -> int:
+    async def sweep_ticket_rooms(self, limit: int = 20) -> int:
+        """Reconcile every ticket missing room state or with pending invites."""
         if self._ticket_rooms is None:
             return 0
         projects = self._config.jira_worker_enabled_projects
@@ -994,12 +958,20 @@ class JiraWorkerScheduler:
                     for project_key in project_keys
                 )
             )
+            pending_invites = (
+                select(JiraWorkerOutbox.payload["ticket_id"].astext).where(
+                    JiraWorkerOutbox.channel == "switch",
+                    JiraWorkerOutbox.command == "invite_ticket_reporter",
+                    JiraWorkerOutbox.status == "pending",
+                )
+            )
             stmt = (
                 select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
                 .where(
                     or_(
                         JiraWorkerTicket.room_id.is_(None),
                         JiraWorkerTicket.card_event_id.is_(None),
+                        JiraWorkerTicket.id.in_(pending_invites),
                     ),
                     scope,
                 )
@@ -1007,6 +979,19 @@ class JiraWorkerScheduler:
                 .limit(max(1, limit))
             )
             pending = list((await session.execute(stmt)).all())
+            await session.execute(
+                update(JiraWorkerOutbox)
+                .where(
+                    JiraWorkerOutbox.channel == "switch",
+                    JiraWorkerOutbox.command == "invite_ticket_reporter",
+                    JiraWorkerOutbox.status == "pending",
+                    ~JiraWorkerOutbox.payload["ticket_id"].astext.in_(
+                        select(JiraWorkerTicket.id)
+                    ),
+                )
+                .values(status="done")
+            )
+            await session.commit()
         done = 0
         for instance, issue_key in pending:
             if await self.sync_ticket_room(instance=instance, issue_key=issue_key):
@@ -1043,15 +1028,15 @@ class JiraWorkerScheduler:
                 project_key=job.project_key, updated_since=watermark
             )
             async with self._session_factory() as session:
-                new_keys: list[str] = []
                 for issue in issues:
-                    if await record_polled_issue(session, issue, instance=job.instance):
-                        key = str(issue.get("key") or "")
-                        if key:
-                            new_keys.append(key)
+                    await record_polled_issue(session, issue, instance=job.instance)
                 await session.commit()
-            for issue_key in new_keys:
-                await self.sync_ticket_room(instance=job.instance, issue_key=issue_key)
+            for issue in issues:
+                issue_key = str(issue.get("key") or "")
+                if issue_key:
+                    await self.sync_ticket_room(
+                        instance=job.instance, issue_key=issue_key
+                    )
             stamps = [
                 str(issue.get("fields", {}).get("updated") or "")
                 for issue in issues

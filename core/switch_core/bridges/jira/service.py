@@ -15,13 +15,13 @@ from switch_core.bridges.jira.matching import matching_rules
 from switch_core.bridges.jira.rooms import (
     CardUpdater,
     TicketRooms,
-    sync_ticket_room,
+    reconcile_ticket_room,
 )
 from switch_core.bridges.jira.template import render_template
 from switch_core.bridges.jira.worker import is_worker_enabled, record_webhook_event
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraTrigger, JiraWorkerTicket, Room
+from switch_core.db.models import JiraTrigger, Room
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_store import RoomStore
@@ -145,7 +145,7 @@ class JiraBridgeService:
         if not is_worker_enabled(self._config, instance, event.project):
             return
         async with self._session_factory() as session:
-            new = await record_webhook_event(
+            await record_webhook_event(
                 session,
                 event,
                 instance=instance,
@@ -157,29 +157,15 @@ class JiraBridgeService:
             await session.commit()
         if self._ticket_rooms is None:
             return
-        if new:
-            await self.sync_ticket_room(instance=instance, issue_key=event.key)
-            return
-        async with self._session_factory() as session:
-            ticket = await session.scalar(
-                select(JiraWorkerTicket).where(
-                    JiraWorkerTicket.instance == instance,
-                    JiraWorkerTicket.issue_key == event.key,
-                )
-            )
-            needs_sync = ticket is not None and (
-                ticket.room_id is None or ticket.card_event_id is None
-            )
-        if needs_sync:
-            await self.sync_ticket_room(instance=instance, issue_key=event.key)
+        await self.sync_ticket_room(instance=instance, issue_key=event.key)
 
     async def sync_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
-        """Step-3 room sync for one ticket. No-op without a provisioner."""
+        """Step-3 room reconcile for one ticket. No-op without a provisioner."""
         if self._ticket_rooms is None:
             return None
         async with self._session_factory() as session:
             try:
-                room_id = await sync_ticket_room(
+                room_id = await reconcile_ticket_room(
                     session,
                     instance=instance,
                     issue_key=issue_key,
