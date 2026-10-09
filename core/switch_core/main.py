@@ -62,6 +62,7 @@ from switch_core.bridges.collaboration.telegram.adapter import (
     TelegramConnectionConfig,
 )
 from switch_core.bridges.jira.identity import ensure_jira_system_agent
+from switch_core.bridges.jira.rooms import SwitchCardUpdater, SwitchTicketRooms
 from switch_core.bridges.jira.worker import JiraWorkerScheduler, build_poll_clients
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.admin_client import AdminClient
@@ -432,6 +433,14 @@ async def run(config: SwitchConfig) -> None:
             session_factory=session_factory,
             config=config,
             poll_clients=build_poll_clients(config),
+            ticket_rooms=SwitchTicketRooms(
+                room_service=room_service,
+                protocol=protocol,
+                session_factory=session_factory,
+                agent_store=agent_store,
+                config=config,
+            ),
+            card_updater=SwitchCardUpdater(room_service=room_service),
         )
     elif config.jira_worker_enabled_projects:
         missing = sorted(

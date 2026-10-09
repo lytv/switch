@@ -1122,6 +1122,9 @@ class JiraWorkerTicket(Base):
     )
     # Set by a later step when the ticket room exists; null until then.
     room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Transport event id of the ticket card message; null until posted.
+    # Step 3 updates the card in place rather than posting a new one.
+    card_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

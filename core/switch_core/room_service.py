@@ -108,6 +108,9 @@ class RoomCreateConfig(BaseModel):
     aliases: dict[str, str] | None = None
     acting_user_id: str | None = None
     acting_is_admin: bool = False
+    # Stored on the room row in the same insert as the room. Not copied into
+    # the agent connection prompt (that reads ``instructions`` only).
+    metadata: dict[str, Any] | None = None
 
 
 class RoomCreateResult(BaseModel):
@@ -510,6 +513,7 @@ class RoomService:
                 owner_id=config.owner_id,
                 read_visibility=config.read_visibility,
                 write_visibility=config.write_visibility,
+                metadata_=config.metadata,
             )
 
             async with self._session_factory() as session:
@@ -1118,21 +1122,38 @@ class RoomService:
         async with self._session_factory() as session:
             rooms = await self._room_store.get_all(session, include_archived=True)
         for room in rooms:
-            async with self._session_factory() as session:
-                existing = set(await self._room_store.get_client_ids(session, room.id))
-                expected = await self._room_store.get_member_agent_clients(
-                    session, room.id
-                )
-            expected.update(system_clients)
-            missing = {cid: uid for cid, uid in expected.items() if cid not in existing}
-            if not missing:
-                continue
-            await self._invite_clients(room.matrix_room_id, missing)
-            async with self._session_factory() as session:
-                for client_id in missing:
-                    await self._room_store.add_client(session, client_id, room.id)
-                await session.commit()
-            logger.info("Reconciled %d client(s) into room %s", len(missing), room.id)
+            await self._invite_missing_member_clients(room, system_clients)
+
+    async def invite_missing_member_clients(self, room_id: str) -> None:
+        """Invite member clients that have no ``room_clients`` row.
+
+        ``add_agents_to_room`` returns without inviting when the agent row is
+        already there, which is the state left when ``create_room`` commits the
+        room and then raises before ``_invite_clients``. Same repair as one
+        pass of ``reconcile_room_clients``, for this room only.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+        if room is None:
+            return
+        await self._invite_missing_member_clients(room, self._resolve_system_clients())
+
+    async def _invite_missing_member_clients(
+        self, room: Room, system_clients: dict[str, str]
+    ) -> None:
+        async with self._session_factory() as session:
+            existing = set(await self._room_store.get_client_ids(session, room.id))
+            expected = await self._room_store.get_member_agent_clients(session, room.id)
+        expected.update(system_clients)
+        missing = {cid: uid for cid, uid in expected.items() if cid not in existing}
+        if not missing:
+            return
+        await self._invite_clients(room.matrix_room_id, missing)
+        async with self._session_factory() as session:
+            for client_id in missing:
+                await self._room_store.add_client(session, client_id, room.id)
+            await session.commit()
+        logger.info("Reconciled %d client(s) into room %s", len(missing), room.id)
 
     async def ensure_client_in_room(self, room_id: str, client_id: str) -> None:
         """Invite a single running client to the room (it auto-joins) and record

@@ -1,8 +1,9 @@
-"""Jira ticket worker, step 1: intake only.
+"""Jira ticket worker: intake, identity mapping, and ticket-room scheduling.
 
 One module inside the Jira bridge (option C). It records webhook and poll
-events into the worker tables and runs the scheduler skeleton. Jira writes,
-rooms, the orchestrator, and the outbox sender are later steps.
+events into the worker tables, resolves reporter identity, schedules ticket
+room reconciliation, and runs the worker scheduler. Jira writes, the intake
+orchestrator, and the outbox sender are later steps.
 
 With no project enabled (the default) the intake hook returns immediately and
 the existing Jira bridge behaves exactly as today.
@@ -16,7 +17,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from sqlalchemy import and_, func, or_, select, true, update
@@ -35,11 +36,21 @@ from switch_core.db.models import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from switch_core.bridges.jira.rooms import CardUpdater, TicketRooms
+
 POLL_JOB_KIND = "watermark_poll"
 SWITCH_WAIT_CHANNEL = "switch"
 JIRA_COMMENTS_WAIT_CHANNEL = "jira_comments"
+SYNC_TICKET_ROOM_COMMAND = "sync_ticket_room"
 
 _TERMINAL_TICKET_STATUSES = ("done", "cancelled", "canceled")
+
+
+def is_terminal_ticket_status(status: str) -> bool:
+    """Whether a Jira status ends the v1 ticket flow (Done, or cancelled)."""
+    return status.strip().casefold() in _TERMINAL_TICKET_STATUSES
+
 
 SleepFn = Callable[[float], Awaitable[None]]
 ClockFn = Callable[[], datetime]
@@ -134,6 +145,42 @@ async def _enqueue_switch_follow_up(
     await session.flush()
 
 
+async def _enqueue_room_sync(session: AsyncSession, ticket: JiraWorkerTicket) -> None:
+    """Leave a pending row until room reconcile finishes."""
+    await _enqueue_switch_follow_up(
+        session,
+        command=SYNC_TICKET_ROOM_COMMAND,
+        ticket=ticket,
+        switch_user_id=ticket.reporter_switch_user_id,
+    )
+
+
+async def _enqueue_room_sync_for_reporter(
+    session: AsyncSession,
+    *,
+    instance: str,
+    jira_account_id: str,
+    enabled_projects: Sequence[str],
+) -> None:
+    """Queue reconcile for every ticket of this reporter in enabled projects.
+
+    Includes Done and cancelled tickets. Step 2 does not rewrite their
+    reporter column, but the room owner still has to follow the mapping.
+    A project that is off is left unchanged.
+    """
+    if not enabled_projects:
+        return
+    result = await session.execute(
+        select(JiraWorkerTicket).where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.project_key.in_(enabled_projects),
+            JiraWorkerTicket.reporter_account_id == jira_account_id,
+        )
+    )
+    for ticket in result.scalars().all():
+        await _enqueue_room_sync(session, ticket)
+
+
 async def _set_open_ticket_reporter_resolution(
     session: AsyncSession,
     *,
@@ -218,6 +265,12 @@ async def set_identity_mapping(
         switch_user_id=switch_user_id,
         enabled_projects=enabled_projects,
     )
+    await _enqueue_room_sync_for_reporter(
+        session,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        enabled_projects=enabled_projects,
+    )
     return mapping, updated_tickets
 
 
@@ -242,13 +295,20 @@ async def remove_identity_mapping(
         raise ValueError("Jira worker identity mapping not found")
     await session.delete(mapping)
     await session.flush()
-    return await _set_open_ticket_reporter_resolution(
+    updated = await _set_open_ticket_reporter_resolution(
         session,
         instance=instance,
         jira_account_id=jira_account_id,
         switch_user_id=None,
         enabled_projects=enabled_projects,
     )
+    await _enqueue_room_sync_for_reporter(
+        session,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        enabled_projects=enabled_projects,
+    )
+    return updated
 
 
 def jira_updated_at(payload: dict[str, Any]) -> datetime:
@@ -341,6 +401,7 @@ async def upsert_ticket(
     ticket = result.scalar_one_or_none()
     if ticket is not None:
         await session.flush()
+        await _enqueue_room_sync(session, ticket)
         return ticket, True, False
 
     ticket = await session.scalar(
@@ -373,6 +434,7 @@ async def upsert_ticket(
     ticket.wait_channel = wait_channel
     ticket.last_event_at = updated_at
     await session.flush()
+    await _enqueue_room_sync(session, ticket)
     return ticket, False, reporter_resolution_changed
 
 
@@ -812,6 +874,8 @@ class JiraWorkerScheduler:
         clock: ClockFn | None = None,
         sleep: SleepFn | None = None,
         owner: str = "scheduler",
+        ticket_rooms: TicketRooms | None = None,
+        card_updater: CardUpdater | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._config = config
@@ -819,6 +883,8 @@ class JiraWorkerScheduler:
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._owner = owner
+        self._ticket_rooms = ticket_rooms
+        self._card_updater = card_updater
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -883,6 +949,7 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
+        await self.sweep_ticket_rooms()
         for job in jobs:
             try:
                 await self._handle_job(job)
@@ -902,6 +969,74 @@ class JiraWorkerScheduler:
                         now=self._clock(),
                     )
                     await session.commit()
+
+    async def sweep_ticket_rooms(self, limit: int = 20) -> int:
+        """Reconcile tickets missing room state or with a pending room sync."""
+        if self._ticket_rooms is None:
+            return 0
+        projects = self._config.jira_worker_enabled_projects
+        if not projects:
+            return 0
+        from switch_core.bridges.jira.rooms import sync_ticket_room
+
+        follow_up_commands = ("invite_ticket_reporter", SYNC_TICKET_ROOM_COMMAND)
+        async with self._session_factory() as session:
+            scope = or_(
+                *(
+                    and_(
+                        JiraWorkerTicket.instance == instance,
+                        JiraWorkerTicket.project_key == project_key,
+                    )
+                    for instance, project_keys in projects.items()
+                    for project_key in project_keys
+                )
+            )
+            pending_follow_ups = select(
+                JiraWorkerOutbox.payload["ticket_id"].astext
+            ).where(
+                JiraWorkerOutbox.channel == "switch",
+                JiraWorkerOutbox.command.in_(follow_up_commands),
+                JiraWorkerOutbox.status == "pending",
+            )
+            stmt = (
+                select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
+                .where(
+                    or_(
+                        JiraWorkerTicket.room_id.is_(None),
+                        JiraWorkerTicket.card_event_id.is_(None),
+                        JiraWorkerTicket.id.in_(pending_follow_ups),
+                    ),
+                    scope,
+                )
+                .order_by(JiraWorkerTicket.last_event_at.asc())
+                .limit(max(1, limit))
+            )
+            pending = list((await session.execute(stmt)).all())
+            await session.execute(
+                update(JiraWorkerOutbox)
+                .where(
+                    JiraWorkerOutbox.channel == "switch",
+                    JiraWorkerOutbox.command.in_(follow_up_commands),
+                    JiraWorkerOutbox.status == "pending",
+                    ~JiraWorkerOutbox.payload["ticket_id"].astext.in_(
+                        select(JiraWorkerTicket.id)
+                    ),
+                )
+                .values(status="done")
+            )
+            await session.commit()
+        done = 0
+        for instance, issue_key in pending:
+            if await sync_ticket_room(
+                self._session_factory,
+                instance=instance,
+                issue_key=issue_key,
+                rooms=self._ticket_rooms,
+                jira_agent_name=self._config.jira_agent_name,
+                cards=self._card_updater,
+            ):
+                done += 1
+        return done
 
     async def _handle_job(self, job: JiraWorkerJob) -> None:
         if job.kind != POLL_JOB_KIND:
@@ -936,6 +1071,19 @@ class JiraWorkerScheduler:
                 for issue in issues:
                     await record_polled_issue(session, issue, instance=job.instance)
                 await session.commit()
+            from switch_core.bridges.jira.rooms import sync_ticket_room
+
+            for issue in issues:
+                issue_key = str(issue.get("key") or "")
+                if issue_key:
+                    await sync_ticket_room(
+                        self._session_factory,
+                        instance=job.instance,
+                        issue_key=issue_key,
+                        rooms=self._ticket_rooms,
+                        jira_agent_name=self._config.jira_agent_name,
+                        cards=self._card_updater,
+                    )
             stamps = [
                 str(issue.get("fields", {}).get("updated") or "")
                 for issue in issues
