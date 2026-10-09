@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.jira.worker import is_terminal_ticket_status
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket, Room, User
+from switch_core.db.models import JiraWorkerIdentity, JiraWorkerOutbox, JiraWorkerTicket, Room, User
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.room_service import RoomCreateConfig, RoomService
 
@@ -62,8 +62,8 @@ class TicketRooms(Protocol):
 
     async def set_archived(self, room_id: str, *, archived: bool) -> None: ...
 
-    async def set_room_owner(self, room_id: str, *, owner_id: str) -> bool:
-        """Transfer room ownership. Returns False when the room is gone."""
+    async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
+        """Set room ownership. Returns False when the room is gone."""
         ...
 
     async def reporter_display_name(self, switch_user_id: str) -> str | None: ...
@@ -111,6 +111,21 @@ async def _reporter_label(
     return "unmapped reporter (admins only)"
 
 
+async def _effective_reporter(
+    session: AsyncSession, ticket: JiraWorkerTicket
+) -> str | None:
+    uid = ticket.reporter_switch_user_id
+    if not uid:
+        return None
+    mapped = await session.scalar(
+        select(JiraWorkerIdentity.switch_user_id).where(
+            JiraWorkerIdentity.instance == ticket.instance,
+            JiraWorkerIdentity.jira_account_id == ticket.reporter_account_id,
+        )
+    )
+    return uid if mapped == uid else None
+
+
 async def sync_ticket_room(
     session: AsyncSession,
     *,
@@ -151,18 +166,34 @@ async def sync_ticket_room(
             ticket.card_event_id = None
             await session.flush()
 
-    body = render_ticket_card(
-        issue_key=ticket.issue_key,
-        summary=ticket.summary,
-        status=ticket.status,
-        reporter_label=await _reporter_label(session, rooms, ticket),
-        issue_url=rooms.issue_url(instance=ticket.instance, issue_key=ticket.issue_key),
-    )
+    if ticket.room_id is not None:
+        effective = await _effective_reporter(session, ticket)
+        if not await rooms.set_room_owner(ticket.room_id, owner_id=effective):
+            logger.warning(
+                "Jira ticket room %s for %s is gone; creating a replacement",
+                ticket.room_id,
+                ticket.issue_key,
+            )
+            ticket.room_id = None
+            ticket.card_event_id = None
+            archived = None
+            await session.flush()
+
     if ticket.room_id is None:
+        effective = await _effective_reporter(session, ticket)
+        body = render_ticket_card(
+            issue_key=ticket.issue_key,
+            summary=ticket.summary,
+            status=ticket.status,
+            reporter_label=await _reporter_label(session, rooms, ticket),
+            issue_url=rooms.issue_url(
+                instance=ticket.instance, issue_key=ticket.issue_key
+            ),
+        )
         room_id = await rooms.create_ticket_room(
             name=ticket.issue_key,
             description=body,
-            owner_id=ticket.reporter_switch_user_id,
+            owner_id=effective,
         )
         ticket.room_id = room_id
         await session.commit()
@@ -177,8 +208,26 @@ async def sync_ticket_room(
         if ticket is None:
             return room_id
         await rooms.ensure_agent_member(room_id, agent_name=jira_agent_name)
+        body = render_ticket_card(
+            issue_key=ticket.issue_key,
+            summary=ticket.summary,
+            status=ticket.status,
+            reporter_label=await _reporter_label(session, rooms, ticket),
+            issue_url=rooms.issue_url(
+                instance=ticket.instance, issue_key=ticket.issue_key
+            ),
+        )
     else:
         room_id = ticket.room_id
+        body = render_ticket_card(
+            issue_key=ticket.issue_key,
+            summary=ticket.summary,
+            status=ticket.status,
+            reporter_label=await _reporter_label(session, rooms, ticket),
+            issue_url=rooms.issue_url(
+                instance=ticket.instance, issue_key=ticket.issue_key
+            ),
+        )
 
     if ticket.card_event_id is None:
         ticket.card_event_id = await rooms.post_card(room_id, body=body)
@@ -193,6 +242,17 @@ async def sync_ticket_room(
         )
         if ticket is None:
             return room_id
+        body = render_ticket_card(
+            issue_key=ticket.issue_key,
+            summary=ticket.summary,
+            status=ticket.status,
+            reporter_label=await _reporter_label(session, rooms, ticket),
+            issue_url=rooms.issue_url(
+                instance=ticket.instance, issue_key=ticket.issue_key
+            ),
+        )
+        if cards is not None:
+            await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
     elif cards is not None:
         await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
 
@@ -276,7 +336,8 @@ async def consume_reporter_invites(
             continue
         if ticket.room_id is None:
             continue
-        if ticket.reporter_switch_user_id != row_user_id:
+        effective = await _effective_reporter(session, ticket)
+        if effective is None or effective != row_user_id:
             row.status = "done"
             done += 1
             continue
@@ -386,7 +447,7 @@ class SwitchTicketRooms:
     async def set_archived(self, room_id: str, *, archived: bool) -> None:
         await self._rooms.set_room_archived(room_id, archived)
 
-    async def set_room_owner(self, room_id: str, *, owner_id: str) -> bool:
+    async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         async with self._sessions() as session:
             done = await set_ticket_room_owner(
                 session, room_id=room_id, owner_id=owner_id

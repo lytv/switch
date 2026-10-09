@@ -41,7 +41,7 @@ class FakeRooms:
         self.rooms: dict[str, dict[str, Any]] = {}
         self.created: list[dict[str, Any]] = []
         self.cards: dict[str, str] = {}
-        self.owner_changes: list[tuple[str, str]] = []
+        self.owner_changes: list[tuple[str, str | None]] = []
         self.archived_calls: list[tuple[str, bool]] = []
         self._next = 0
 
@@ -76,7 +76,7 @@ class FakeRooms:
         self.rooms[room_id]["archived"] = archived
         self.archived_calls.append((room_id, archived))
 
-    async def set_room_owner(self, room_id: str, *, owner_id: str) -> bool:
+    async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         room = self.rooms.get(room_id)
         if room is None:
             return False
@@ -324,6 +324,56 @@ async def test_mapped_reporter_owns_room_unmapped_is_admins_only(
     await _sync(session_factory, "KAN-1", rooms)
     assert rooms.created[0]["owner_id"] == "user-ada"
 
+
+@pytest.mark.asyncio
+async def test_reporter_changed_to_unmapped_clears_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            switch_user_id="user-ada",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+
+    def _event(account_id: str, updated_ms: int, event_id: str) -> Any:
+        return NormalizedTriggerEvent(
+            event_kind="updated",
+            webhook_event="jira:issue_updated",
+            key="KAN-1",
+            summary="Mapped ticket",
+            issue_type="Task",
+            project=PROJECT,
+            status="To Do",
+            assignee="",
+            priority="",
+            reporter="",
+            url="",
+            raw={
+                "webhookEvent": "jira:issue_updated",
+                "timestamp": updated_ms,
+                "issue": {
+                    "id": "10001",
+                    "key": "KAN-1",
+                    "fields": {"reporter": {"accountId": account_id}},
+                },
+                "changelog": {"id": event_id},
+            },
+        )
+
+    assert await _intake(session_factory, _event("acct-ada", 1791443000000, "m-1")) is True
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert rooms.rooms[room_id]["owner_id"] == "user-ada"
+
+    assert await _intake(session_factory, _event("acct-bob", 1791443999000, "m-2")) is True
+    assert await _sync(session_factory, "KAN-1", rooms, updater) == room_id
+    assert rooms.rooms[room_id]["owner_id"] is None
+    assert "unmapped reporter" in updater.updates[-1]["body"]
+
     assert (
         await _intake(
             session_factory, _webhook_event("KAN-2"), webhook_identifier="m-2"
@@ -348,6 +398,9 @@ async def test_card_created_once_then_updated_in_place(
     assert "KAN-1" in body and "First ticket" in body and "To Do" in body
     assert "unmapped reporter" in body
     assert "https://jira.example/browse/KAN-1" in body
+    assert len(updater.updates) == 1
+    assert updater.updates[0]["event_id"] == card_id
+    assert "To Do" in updater.updates[0]["body"]
 
     assert (
         await _intake(
@@ -359,9 +412,9 @@ async def test_card_created_once_then_updated_in_place(
     )
     await _sync(session_factory, "KAN-1", provisioner, updater)
     assert len(provisioner.cards) == 1
-    assert len(updater.updates) == 1
-    assert updater.updates[0]["event_id"] == card_id
-    assert "In Progress" in updater.updates[0]["body"]
+    assert len(updater.updates) == 2
+    assert updater.updates[-1]["event_id"] == card_id
+    assert "In Progress" in updater.updates[-1]["body"]
     assert (await _ticket(session_factory, "KAN-1")).card_event_id == card_id
 
 

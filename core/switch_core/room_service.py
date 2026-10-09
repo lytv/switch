@@ -581,16 +581,24 @@ class RoomService:
                 room.id, matrix_room_id, config.user_names
             )
 
-        agent_clients = self._resolve_agent_clients(agent_ids)
-        system_clients = self._resolve_system_clients()
-        all_clients = {**agent_clients, **system_clients}
+        try:
+            agent_clients = self._resolve_agent_clients(agent_ids)
+            system_clients = self._resolve_system_clients()
+            all_clients = {**agent_clients, **system_clients}
 
-        await self._invite_clients(matrix_room_id, all_clients)
+            await self._invite_clients(matrix_room_id, all_clients)
 
-        async with self._session_factory() as session:
-            for client_id in all_clients:
-                await self._room_store.add_client(session, client_id, room.id)
-            await session.commit()
+            async with self._session_factory() as session:
+                for client_id in all_clients:
+                    await self._room_store.add_client(session, client_id, room.id)
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Room %s created but client invites failed; reconcile will repair",
+                room.id,
+                exc_info=True,
+            )
+            agent_clients = {}
 
         logger.info(
             "Created room %s (%s) with %d agents and %d system clients",
