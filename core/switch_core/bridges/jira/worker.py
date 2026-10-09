@@ -1,9 +1,8 @@
-"""Jira ticket worker: intake, identity mapping, and ticket-room scheduling.
+"""Jira ticket worker: intake, identity mapping, rooms, and durable Jira writes.
 
 One module inside the Jira bridge (option C). It records webhook and poll
-events into the worker tables, resolves reporter identity, schedules ticket
-room reconciliation, and runs the worker scheduler. Jira writes, the intake
-orchestrator, and the outbox sender are later steps.
+events, reconciles ticket rooms, and sends Jira commands through the outbox.
+The intake orchestrator is a later step.
 
 With no project enabled (the default) the intake hook returns immediately and
 the existing Jira bridge behaves exactly as today.
@@ -24,6 +23,7 @@ from sqlalchemy import and_, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import (
@@ -793,7 +793,7 @@ async def complete_job(
 
 
 class JiraPollClient:
-    """Read-only Jira REST client for the watermark poll (search only)."""
+    """Jira REST transport shared by the watermark poll and worker outbox."""
 
     def __init__(
         self,
@@ -807,6 +807,13 @@ class JiraPollClient:
         self._auth = (email, api_token)
         self._client = client or httpx.AsyncClient(timeout=30.0)
         self._owns_client = client is None
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        response = await self._client.request(
+            method, f"{self._base_url}{path}", auth=self._auth, **kwargs
+        )
+        response.raise_for_status()
+        return response
 
     async def search_updated(
         self, *, project_key: str, updated_since: str | None
@@ -847,7 +854,7 @@ class JiraPollClient:
 
 
 def build_poll_clients(config: SwitchConfig) -> dict[str, JiraPollClient]:
-    """Build read-only poll clients for configured Jira instances."""
+    """Build Jira clients for configured worker instances."""
     return {
         instance: JiraPollClient(
             base_url=credentials.base_url,
@@ -859,7 +866,7 @@ def build_poll_clients(config: SwitchConfig) -> dict[str, JiraPollClient]:
 
 
 class JiraWorkerScheduler:
-    """Single-process scheduler loop: claims due rows, runs the watermark poll.
+    """Claim due work, send Jira commands, and reconcile ticket rooms.
 
     Startup re-reads overdue rows on the first pass (they are just pending rows
     with ``due_at`` in the past). ``stop()`` cancels the loop cleanly.
@@ -883,6 +890,12 @@ class JiraWorkerScheduler:
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._owner = owner
+        self._outbox = JiraOutboxSender(
+            session_factory=session_factory,
+            config=config,
+            clients=self._poll_clients,
+            clock=self._clock,
+        )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
         self._task: asyncio.Task[None] | None = None
@@ -907,13 +920,13 @@ class JiraWorkerScheduler:
             pass
 
     async def _run(self) -> None:
-        interval = max(1, self._config.jira_worker_poll_interval_seconds)
+        interval = max(1, min(5, self._config.jira_worker_poll_interval_seconds))
         while True:
             await self.run_once()
             await self._sleep(interval)
 
     async def run_once(self) -> None:
-        """One scheduler pass: seed poll jobs, claim due rows, handle them."""
+        """Seed poll jobs, send due Jira commands, reconcile rooms, and poll."""
         now = self._clock()
         projects = self._config.jira_worker_enabled_projects
         scopes = [
@@ -949,6 +962,7 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
+        await self._outbox.run_once()
         await self.sweep_ticket_rooms()
         for job in jobs:
             try:
