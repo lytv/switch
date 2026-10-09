@@ -799,3 +799,33 @@ def test_invalid_config_fails_before_sending() -> None:
         JiraWorkerStatuses(blocked=" ")
     with pytest.raises(ValueError):
         _config(jira_worker_write_backoff_seconds=-1)
+
+
+async def test_same_stamp_reporter_comment_does_not_block_a_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    await enqueue(session_factory)
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "reporter-account"},
+            "updateAuthor": {"accountId": "reporter-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None

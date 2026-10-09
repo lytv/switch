@@ -1132,6 +1132,7 @@ class JiraWorkerTicket(Base):
     jira_read_updated: Mapped[str | None] = mapped_column(Text)
     jira_read_changelog_id: Mapped[str | None] = mapped_column(Text)
     jira_worker_account_id: Mapped[str | None] = mapped_column(Text)
+    jira_seen_comment_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # Set by a later step when the ticket room exists; null until then.
     room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Transport event id of the ticket card message; null until posted.

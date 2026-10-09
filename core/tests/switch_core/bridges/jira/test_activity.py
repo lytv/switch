@@ -742,9 +742,7 @@ async def test_room_read_keeps_every_human_message_except_worker_and_card(
         "thread:room-1:other-reply",
     }
     assert {
-        event.idempotency_key
-        for event in inputs
-        if event.payload["reporter_input"]
+        event.idempotency_key for event in inputs if event.payload["reporter_input"]
     } == {
         "thread:room-1:reply-reporter",
         "thread:room-1:other-reply",
@@ -802,9 +800,10 @@ async def test_older_unlabeled_ticket_is_admitted_before_a_newer_one(
     rooms = ThreadRooms()
     limits = JiraWorkerLimits(open_rooms=1)
     scope = {"acme": ["KAN"]}
-    assert await reconcile(
-        session_factory, "KAN-2", rooms, limits, enabled_projects=scope
-    ) is None
+    assert (
+        await reconcile(session_factory, "KAN-2", rooms, limits, enabled_projects=scope)
+        is None
+    )
     assert not (await ticket(session_factory, newer)).room_claimed
     assert (await ticket(session_factory, newer)).queue_reason
     assert await reconcile(
@@ -1120,3 +1119,89 @@ async def test_off_project_claimed_turn_does_not_hold_a_session(
     assert web_row is not None
     assert web_row.agent_state == "live" and web_row.worker_parked_reason is None
     assert (await ticket(session_factory, key)).tokens_used == 1
+
+
+async def test_switch_channel_old_comment_is_baseline_across_reads(
+    session_factory,
+) -> None:
+    key = await seed(session_factory, mapped=True)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "human-account", BASE))
+    rooms = ThreadRooms()
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert sorted(row.jira_seen_comment_ids or []) == ["1"]
+    await reader.read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    assert await reader.read_ticket(key, force_jira=True)
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    jira.comments.append(_same_stamp_comment("2", "reporter-account", BASE))
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.event_kind == "jira_comment"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["reporter_input"] is False
+    jira.comments.append(_same_stamp_comment("3", "human-account", BASE))
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked"
+
+
+async def test_same_stamp_reporter_wakes_while_human_parks(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    reader = activity(session_factory, jira, ThreadRooms())
+    await reader.read_once()
+    assert (await ticket(session_factory, key)).jira_seen_comment_ids == []
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert row.agent_state == "wake_requested"
+    async with session_factory() as session:
+        current = await session.get(JiraWorkerTicket, key)
+        assert current is not None
+        current.agent_state = "waiting"
+        await session.commit()
+    jira.comments.append(_same_stamp_comment("2", "human-account", BASE))
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked"
+
+
+async def test_finish_turn_after_project_disable_leaves_waiting(
+    session_factory,
+) -> None:
+    key = await seed(session_factory)
+    rooms = ThreadRooms()
+    rooms.messages = [message(1)]
+    reader = activity(session_factory, JiraMock(), rooms)
+    await reader.read_once()
+    assert (await ticket(session_factory, key)).agent_state == "wake_requested"
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        reader._config.jira_worker_enabled_projects = {}
+        return TurnResult(4, None)
+
+    assert await reader.run_one_turn(fake) == key
+    row = await ticket(session_factory, key)
+    assert row.agent_state == "waiting"
+    assert row.tokens_used == 4
+    assert row.worker_parked_reason is None
+    async with session_factory() as session:
+        job = await session.scalar(
+            select(JiraWorkerJob).where(
+                JiraWorkerJob.kind == "orchestrator_turn",
+                JiraWorkerJob.status == "done",
+            )
+        )
+    assert job is not None

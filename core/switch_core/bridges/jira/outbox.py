@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerOutbox, JiraWorkerTicket
+from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
 if TYPE_CHECKING:
     from switch_core.bridges.jira.worker import ClockFn, JiraPollClient
@@ -76,12 +76,13 @@ async def enqueue_jira_command(
     _validate_command(command, data)
     _stamp(based_updated)
     if based_comment_ids is None:
-        based_comment_ids = sorted(await stored_comment_ids(session, ticket))
+        based_comment_ids = sorted(set(ticket.jira_seen_comment_ids or []))
     payload = {
         "data": data,
         "based_updated": based_updated,
         "based_changelog_id": based_changelog_id,
         "based_comment_ids": based_comment_ids,
+        "reporter_account_id": ticket.reporter_account_id,
     }
     result = await session.execute(
         insert(JiraWorkerOutbox)
@@ -180,26 +181,22 @@ def fresh_comment_ids(comments: list[dict[str, Any]], known_ids: set[str]) -> se
     }
 
 
-async def stored_comment_ids(
-    session: AsyncSession, ticket: JiraWorkerTicket
+def new_human_comment_ids(
+    comments: list[dict[str, Any]],
+    seen_ids: set[str],
+    worker_account: str,
+    reporter_account: str,
 ) -> set[str]:
-    payloads = (
-        await session.scalars(
-            select(JiraWorkerEvent.payload).where(
-                JiraWorkerEvent.instance == ticket.instance,
-                JiraWorkerEvent.issue_key == ticket.issue_key,
-                JiraWorkerEvent.event_kind == "jira_comment",
-            )
-        )
-    ).all()
-    ids: set[str] = set()
-    for payload in payloads:
-        if not isinstance(payload, dict):
+    by_id = {str(comment.get("id", "")): comment for comment in comments}
+    parked: set[str] = set()
+    for comment_id in fresh_comment_ids(comments, seen_ids):
+        actor = comment_actor(by_id[comment_id])
+        if actor == worker_account:
             continue
-        data = payload.get("untrusted_data")
-        if isinstance(data, dict) and data.get("id") is not None:
-            ids.add(str(data["id"]))
-    return ids
+        if actor and actor == reporter_account:
+            continue
+        parked.add(comment_id)
+    return parked
 
 
 def check_jira_version(
@@ -209,15 +206,18 @@ def check_jira_version(
     current = _stamp(version["updated"])
     base_id = payload["based_changelog_id"]
     known_comments = payload.get("based_comment_ids")
+    reporter = payload.get("reporter_account_id")
+    if not isinstance(reporter, str):
+        reporter = ""
     if isinstance(known_comments, list):
-        fresh = fresh_comment_ids(
-            version["comments"], {str(item) for item in known_comments}
-        )
-        if any(
-            comment_actor(comment) != account_id
-            for comment in version["comments"]
-            if str(comment.get("id", "")) in fresh
-        ):
+        seen = {str(item) for item in known_comments}
+        by_id = {str(comment.get("id", "")): comment for comment in version["comments"]}
+        for comment_id in fresh_comment_ids(version["comments"], seen):
+            actor = comment_actor(by_id[comment_id])
+            if actor == account_id:
+                continue
+            if actor and actor == reporter:
+                continue
             raise HumanChange("A non-worker Jira action superseded the command")
     if current == base and version["changelog_id"] == base_id:
         return
