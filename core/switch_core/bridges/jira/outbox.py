@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
+from switch_core.db.models import JiraWorkerEvent, JiraWorkerOutbox, JiraWorkerTicket
 
 if TYPE_CHECKING:
     from switch_core.bridges.jira.worker import ClockFn, JiraPollClient
@@ -64,6 +64,7 @@ async def enqueue_jira_command(
     data: Any,
     based_updated: str,
     based_changelog_id: str,
+    based_comment_ids: list[str] | None = None,
 ) -> str | None:
     """Enqueue once per instance/key, in the caller's transaction."""
     if ticket.project_key not in config.jira_worker_enabled_projects.get(
@@ -74,10 +75,13 @@ async def enqueue_jira_command(
         raise ValueError("Jira command key is required")
     _validate_command(command, data)
     _stamp(based_updated)
+    if based_comment_ids is None:
+        based_comment_ids = sorted(await stored_comment_ids(session, ticket))
     payload = {
         "data": data,
         "based_updated": based_updated,
         "based_changelog_id": based_changelog_id,
+        "based_comment_ids": based_comment_ids,
     }
     result = await session.execute(
         insert(JiraWorkerOutbox)
@@ -160,12 +164,61 @@ class HumanChange(Exception):
     """A non-worker or unattributed change must park the ticket."""
 
 
+def comment_actor(comment: dict[str, Any]) -> str:
+    source = comment.get("updateAuthor", comment.get("author", {}))
+    if not isinstance(source, dict):
+        return ""
+    account = source.get("accountId", "")
+    return account if isinstance(account, str) else ""
+
+
+def fresh_comment_ids(comments: list[dict[str, Any]], known_ids: set[str]) -> set[str]:
+    return {
+        str(comment.get("id", ""))
+        for comment in comments
+        if str(comment.get("id", "")) not in known_ids
+    }
+
+
+async def stored_comment_ids(
+    session: AsyncSession, ticket: JiraWorkerTicket
+) -> set[str]:
+    payloads = (
+        await session.scalars(
+            select(JiraWorkerEvent.payload).where(
+                JiraWorkerEvent.instance == ticket.instance,
+                JiraWorkerEvent.issue_key == ticket.issue_key,
+                JiraWorkerEvent.event_kind == "jira_comment",
+            )
+        )
+    ).all()
+    ids: set[str] = set()
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        data = payload.get("untrusted_data")
+        if isinstance(data, dict) and data.get("id") is not None:
+            ids.add(str(data["id"]))
+    return ids
+
+
 def check_jira_version(
     version: dict[str, Any], payload: dict[str, Any], account_id: str
 ) -> None:
     base = _stamp(payload["based_updated"])
     current = _stamp(version["updated"])
     base_id = payload["based_changelog_id"]
+    known_comments = payload.get("based_comment_ids")
+    if isinstance(known_comments, list):
+        fresh = fresh_comment_ids(
+            version["comments"], {str(item) for item in known_comments}
+        )
+        if any(
+            comment_actor(comment) != account_id
+            for comment in version["comments"]
+            if str(comment.get("id", "")) in fresh
+        ):
+            raise HumanChange("A non-worker Jira action superseded the command")
     if current == base and version["changelog_id"] == base_id:
         return
     if current < base:
@@ -487,6 +540,11 @@ class JiraOutboxSender:
                 data=data,
                 based_updated=payload["based_updated"],
                 based_changelog_id=payload["based_changelog_id"],
+                based_comment_ids=(
+                    payload["based_comment_ids"]
+                    if isinstance(payload.get("based_comment_ids"), list)
+                    else None
+                ),
             )
             child = await session.get(JiraWorkerOutbox, command_id)
             assert child is not None

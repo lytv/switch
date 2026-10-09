@@ -7,7 +7,7 @@ positive integer values:
 | Key | Default | Scope |
 | --- | ---: | --- |
 | `open_rooms` | 50 | Open rooms of enabled projects. Done, cancelled, and archived rooms do not count, and a project that is off does not hold a slot |
-| `live_sessions` | 5 | All claimed orchestrator turns |
+| `live_sessions` | 5 | Claimed orchestrator turns of enabled projects. A project that is off does not hold a session |
 | `room_creates_per_hour` | 20 | Create attempts in the previous rolling hour |
 | `tokens_per_ticket` | 50000 | Cumulative reported usage for one ticket |
 
@@ -31,6 +31,7 @@ and selects Jira comments for that ticket. Ordinary Jira reads follow the existi
 webhook and watermark intake. While a ticket waits on Jira comments, the worker
 also reads comments on the poll interval when the issue timestamp has not moved.
 Comment event ids keep that repeat read from recording the same comment twice.
+After a completed read, a new comment from anyone except the worker and the reporter parks the ticket even when the issue timestamp has not moved. Comments stored on the first read do not.
 The worker also checks Jira immediately before each orchestrator turn. It uses
 the existing paginated history and comment read path.
 

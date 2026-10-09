@@ -998,3 +998,125 @@ async def test_jira_comment_refresh_reads_unchanged_issue_metadata(
         )
         == 2
     )
+
+
+def _same_stamp_comment(comment_id: str, author: str, stamp: str) -> dict[str, Any]:
+    actor = {"accountId": author}
+    return {
+        "id": comment_id,
+        "author": actor,
+        "updateAuthor": actor,
+        "created": stamp,
+        "updated": stamp,
+    }
+
+
+async def test_same_stamp_human_comment_parks_after_the_first_read(
+    session_factory,
+) -> None:
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "human-account", BASE))
+    clock = MovingClock()
+    reader = activity(
+        session_factory,
+        jira,
+        ThreadRooms(),
+        clock=clock,
+        jira_worker_poll_interval_seconds=60,
+    )
+    await reader.read_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    assert len(await events(session_factory)) == 1
+    jira.comments.append(_same_stamp_comment("w", "worker-account", BASE))
+    await reader.read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    assert len(await events(session_factory)) == 1
+    clock.now = NOW + timedelta(seconds=60)
+    await reader.read_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None and row.agent_state == "waiting"
+    assert len(await events(session_factory)) == 2
+    jira.comments.append(_same_stamp_comment("2", "human-account", BASE))
+    clock.now = NOW + timedelta(seconds=120)
+    await reader.read_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked" and row.tokens_used == 0
+    assert len(await events(session_factory)) == 3
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        raise AssertionError(turn.issue_key)
+
+    assert await reader.run_one_turn(fake) is None
+    async with session_factory() as session:
+        claimed = await session.scalar(
+            select(JiraWorkerJob).where(
+                JiraWorkerJob.kind == "orchestrator_turn",
+                JiraWorkerJob.status == "claimed",
+            )
+        )
+    assert claimed is None
+    assert (await ticket(session_factory, key)).worker_parked_reason == (
+        "Human Jira action"
+    )
+
+
+async def test_off_project_claimed_turn_does_not_hold_a_session(
+    session_factory,
+) -> None:
+    key = await seed(session_factory)
+    rooms = ThreadRooms()
+    rooms.messages = [message(1)]
+    async with session_factory() as session:
+        web = JiraWorkerTicket(
+            instance="acme",
+            project_key="WEB",
+            issue_key="WEB-1",
+            summary="Off project",
+            status="In Progress",
+            reporter_account_id="reporter-account",
+            wait_channel="jira_comments",
+            room_id="room-web",
+            card_event_id="card-room-web",
+            room_claimed=True,
+            first_seen_at=NOW,
+            last_event_at=datetime.fromisoformat(BASE),
+            agent_state="live",
+        )
+        session.add(web)
+        await session.flush()
+        session.add(
+            JiraWorkerJob(
+                kind="orchestrator_turn",
+                instance="acme",
+                project_key="WEB",
+                due_at=NOW,
+                status="claimed",
+                payload={"ticket_id": web.id},
+            )
+        )
+        await session.commit()
+        web_id = web.id
+    reader = activity(
+        session_factory,
+        JiraMock(),
+        rooms,
+        jira_worker_limits=JiraWorkerLimits(live_sessions=1),
+    )
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        assert turn.issue_key == "KAN-1"
+        return TurnResult(1, None)
+
+    assert await reader.run_one_turn(fake) == key
+    async with session_factory() as session:
+        job = await session.scalar(
+            select(JiraWorkerJob).where(JiraWorkerJob.project_key == "WEB")
+        )
+        web_row = await session.get(JiraWorkerTicket, web_id)
+    assert job is not None and job.status == "claimed" and job.error is None
+    assert web_row is not None
+    assert web_row.agent_state == "live" and web_row.worker_parked_reason is None
+    assert (await ticket(session_factory, key)).tokens_used == 1

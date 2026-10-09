@@ -723,6 +723,77 @@ async def test_unverifiable_changes_park(scenario: str) -> None:
         check_jira_version(version, payload, "worker-account")
 
 
+async def test_comment_from_the_first_read_does_not_block_a_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    await enqueue(session_factory)
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+async def test_new_same_stamp_human_comment_blocks_the_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    await enqueue(session_factory)
+    jira.comments.append(
+        {
+            "id": "2",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await sender_for(session_factory, jira).run_once()
+    assert not jira.writes
+    row = (await rows(session_factory))[0]
+    assert row.status == "parked" and row.error
+    assert "non-worker" in row.error
+    parked = await ticket(session_factory, key)
+    assert parked.worker_parked_reason == row.error
+
+
 def test_invalid_config_fails_before_sending() -> None:
     with pytest.raises(ValueError):
         JiraWorkerStatuses(blocked=" ")

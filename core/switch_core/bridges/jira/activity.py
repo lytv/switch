@@ -17,8 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from switch_core.bridges.jira.outbox import (
     HumanChange,
     _stamp,
+    comment_actor,
+    fresh_comment_ids,
     park_ticket,
     read_jira_version,
+    stored_comment_ids,
 )
 from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
@@ -312,7 +315,14 @@ class TicketActivity:
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
                 park_ticket(ticket, "Ticket token limit")
-            version = await self._read_jira(ticket, force=force_jira)
+            known_comment_ids = (
+                await stored_comment_ids(session, ticket)
+                if ticket.jira_read_changelog_id is not None
+                else None
+            )
+            version = await self._read_jira(
+                ticket, force=force_jira, known_comment_ids=known_comment_ids
+            )
             fell_back = False
             if (
                 ticket.wait_channel == "switch"
@@ -345,7 +355,9 @@ class TicketActivity:
                     )
             if ticket.wait_channel == "jira_comments":
                 if version is None and fell_back:
-                    version = await self._read_jira(ticket, force=True)
+                    version = await self._read_jira(
+                        ticket, force=True, known_comment_ids=known_comment_ids
+                    )
                 for comment in version["comments"] if version is not None else []:
                     author = comment.get("author", {}).get("accountId", "")
                     await self._input(
@@ -387,7 +399,11 @@ class TicketActivity:
         )
 
     async def _read_jira(
-        self, ticket: JiraWorkerTicket, *, force: bool
+        self,
+        ticket: JiraWorkerTicket,
+        *,
+        force: bool,
+        known_comment_ids: set[str] | None,
     ) -> dict[str, Any] | None:
         if (
             not force
@@ -444,15 +460,19 @@ class TicketActivity:
             entry.get("author", {}).get("accountId") != account for entry in changes
         ):
             park_ticket(ticket, "Human Jira action")
+        fresh = (
+            fresh_comment_ids(version["comments"], known_comment_ids)
+            if known_comment_ids is not None
+            else set()
+        )
         comment_changes = [
             comment
             for comment in version["comments"]
             if _stamp(comment["updated"]) > baseline
+            or str(comment.get("id", "")) in fresh
         ]
         for comment in comment_changes:
-            author = comment.get("updateAuthor", comment.get("author", {})).get(
-                "accountId", ""
-            )
+            author = comment_actor(comment)
             if author not in (account, ticket.reporter_account_id) or not author:
                 park_ticket(ticket, "Human Jira action")
         if (
@@ -656,7 +676,15 @@ class TicketActivity:
             live = await session.scalar(
                 select(func.count())
                 .select_from(JiraWorkerJob)
-                .where(JiraWorkerJob.kind == TURN, JiraWorkerJob.status == "claimed")
+                .outerjoin(
+                    JiraWorkerTicket,
+                    JiraWorkerJob.payload["ticket_id"].astext == JiraWorkerTicket.id,
+                )
+                .where(
+                    JiraWorkerJob.kind == TURN,
+                    JiraWorkerJob.status == "claimed",
+                    or_(JiraWorkerTicket.id.is_(None), self._scope()),
+                )
             )
             assert live is not None
             if live >= self._config.jira_worker_limits.live_sessions:
