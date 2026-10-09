@@ -1138,7 +1138,7 @@ class JiraWorkerJob(Base):
 
     ``due_at`` is the timer; the scheduler claims due rows transactionally
     (``pending`` → ``claimed`` in one statement) so a timer never runs twice
-    across restarts or overlaps. Step 1 only runs the watermark poll job."""
+    across restarts or overlaps. Job rows schedule watermark polling."""
 
     __tablename__ = "jira_worker_job_record"
     __table_args__ = (Index("ix_jira_worker_job_record_due", "status", "due_at"),)
@@ -1187,7 +1187,7 @@ class JiraWorkerEvent(Base):
 
 
 class JiraWorkerOutbox(Base):
-    """Durable Jira and Switch commands, including visible failed writes."""
+    """Durable Jira and Switch commands, including failed and uncertain writes."""
 
     __tablename__ = "jira_worker_outbox"
     __table_args__ = (

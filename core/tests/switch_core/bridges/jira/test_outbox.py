@@ -459,7 +459,9 @@ async def test_applied_write_http_500_stays_uncertain_across_restart(
     stored = await rows(session_factory)
     assert [item.status for item in stored] == ["uncertain"]
     assert stored[0].attempts == 1 and len(jira.writes) == 1
-    assert jira.status != "BLOCKED" and len(jira.comments) == (1 if command == "comment" else 0)
+    assert jira.status != "BLOCKED" and len(jira.comments) == (
+        1 if command == "comment" else 0
+    )
     if command == "transition":
         assert jira.status == "In Progress"
     async with session_factory() as session:
