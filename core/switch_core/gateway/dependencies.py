@@ -13,7 +13,7 @@ from switch_core.bridges.agent.server_connectors.lifecycle import (
 from switch_core.bridges.collaboration.lifecycle_service import (
     CollaborationBridgeLifecycleService,
 )
-from switch_core.bridges.jira.rooms import SwitchTicketRooms
+from switch_core.bridges.jira.rooms import SwitchCardUpdater, SwitchTicketRooms
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.client_lifecycle_service import ClientLifecycleService
 from switch_core.config import SwitchConfig
@@ -168,6 +168,10 @@ def get_ticket_rooms() -> SwitchTicketRooms:
         agent_store=_state["agent_store"],
         config=_state["config"],
     )
+
+
+def get_card_updater() -> SwitchCardUpdater:
+    return SwitchCardUpdater(room_service=_state["room_service"])
 
 
 def get_resource_service() -> ResourceService:

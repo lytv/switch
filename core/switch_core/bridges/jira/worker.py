@@ -31,6 +31,7 @@ from switch_core.db.models import (
     JiraWorkerJob,
     JiraWorkerOutbox,
     JiraWorkerTicket,
+    Room,
 )
 
 logger = logging.getLogger(__name__)
@@ -249,15 +250,32 @@ async def remove_identity_mapping(
     mapping = result.scalar_one_or_none()
     if mapping is None:
         raise ValueError("Jira worker identity mapping not found")
+    old_switch_user_id = mapping.switch_user_id
     await session.delete(mapping)
     await session.flush()
-    return await _set_open_ticket_reporter_resolution(
+    changed = await _set_open_ticket_reporter_resolution(
         session,
         instance=instance,
         jira_account_id=jira_account_id,
         switch_user_id=None,
         enabled_projects=enabled_projects,
     )
+    if old_switch_user_id:
+        rooms_result = await session.execute(
+            select(JiraWorkerTicket)
+            .where(
+                JiraWorkerTicket.instance == instance,
+                JiraWorkerTicket.reporter_account_id == jira_account_id,
+                JiraWorkerTicket.room_id.is_not(None),
+            )
+            .with_for_update()
+        )
+        for ticket in rooms_result.scalars().all():
+            room = await session.get(Room, ticket.room_id)
+            if room is not None and room.owner_id == old_switch_user_id:
+                room.owner_id = None
+        await session.flush()
+    return changed
 
 
 def jira_updated_at(payload: dict[str, Any]) -> datetime:
@@ -897,6 +915,7 @@ class JiraWorkerScheduler:
             )
             await session.commit()
         await self.sweep_reporter_invites()
+        await self.sweep_unsynced_ticket_rooms()
         for job in jobs:
             try:
                 await self._handle_job(job)
@@ -948,13 +967,51 @@ class JiraWorkerScheduler:
 
         async with self._session_factory() as session:
             try:
-                done = await consume_reporter_invites(session, rooms=self._ticket_rooms)
+                done = await consume_reporter_invites(
+                    session, rooms=self._ticket_rooms, cards=self._card_updater
+                )
                 await session.commit()
             except Exception:
                 logger.exception("Jira reporter-invite sweep failed")
                 await session.rollback()
                 return 0
             return done
+
+    async def sweep_unsynced_ticket_rooms(self, limit: int = 20) -> int:
+        if self._ticket_rooms is None:
+            return 0
+        projects = self._config.jira_worker_enabled_projects
+        if not projects:
+            return 0
+        async with self._session_factory() as session:
+            scope = or_(
+                *(
+                    and_(
+                        JiraWorkerTicket.instance == instance,
+                        JiraWorkerTicket.project_key == project_key,
+                    )
+                    for instance, project_keys in projects.items()
+                    for project_key in project_keys
+                )
+            )
+            stmt = (
+                select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
+                .where(
+                    or_(
+                        JiraWorkerTicket.room_id.is_(None),
+                        JiraWorkerTicket.card_event_id.is_(None),
+                    ),
+                    scope,
+                )
+                .order_by(JiraWorkerTicket.last_event_at.asc())
+                .limit(max(1, limit))
+            )
+            pending = list((await session.execute(stmt)).all())
+        done = 0
+        for instance, issue_key in pending:
+            if await self.sync_ticket_room(instance=instance, issue_key=issue_key):
+                done += 1
+        return done
 
     async def _handle_job(self, job: JiraWorkerJob) -> None:
         if job.kind != POLL_JOB_KIND:

@@ -17,7 +17,12 @@ from switch_core.bridges.jira.parse import (
     StatusTransition,
     parse_jira_payload,
 )
-from switch_core.bridges.jira.rooms import SwitchTicketRooms, consume_reporter_invites
+from switch_core.bridges.jira.rooms import (
+    SwitchCardUpdater,
+    SwitchTicketRooms,
+    consume_reporter_invites,
+    sync_ticket_room,
+)
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
 from switch_core.bridges.jira.worker import (
     list_identity_mappings,
@@ -25,7 +30,14 @@ from switch_core.bridges.jira.worker import (
     set_identity_mapping,
 )
 from switch_core.config import SwitchConfig
-from switch_core.db.models import Agent, JiraTrigger, JiraWorkerIdentity, Room, User
+from switch_core.db.models import (
+    Agent,
+    JiraTrigger,
+    JiraWorkerIdentity,
+    JiraWorkerTicket,
+    Room,
+    User,
+)
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
@@ -33,6 +45,7 @@ from switch_core.db.stores.room_store import RoomStore
 from switch_core.gateway.auth import require_admin
 from switch_core.gateway.dependencies import (
     get_agent_store,
+    get_card_updater,
     get_config,
     get_jira_trigger_store,
     get_room_group_store,
@@ -524,6 +537,9 @@ async def put_worker_identity_mapping(
     ticket_rooms: Annotated[SwitchTicketRooms | None, Depends(get_ticket_rooms)] = (
         None
     ),
+    card_updater: Annotated[SwitchCardUpdater | None, Depends(get_card_updater)] = (
+        None
+    ),
 ) -> JiraWorkerIdentityMappingResponse:
     instance = instance.strip()
     jira_account_id = jira_account_id.strip()
@@ -548,7 +564,10 @@ async def put_worker_identity_mapping(
     if ticket_rooms is not None:
         try:
             await consume_reporter_invites(
-                session, rooms=ticket_rooms, switch_user_id=switch_user_id
+                session,
+                rooms=ticket_rooms,
+                cards=card_updater,
+                switch_user_id=switch_user_id,
             )
             await session.commit()
         except Exception:
@@ -568,6 +587,12 @@ async def delete_worker_identity_mapping(
     session: Annotated[AsyncSession, Depends(get_session)],
     config: Annotated[SwitchConfig, Depends(get_config)],
     _admin: Annotated[User, Depends(require_admin)],
+    ticket_rooms: Annotated[SwitchTicketRooms | None, Depends(get_ticket_rooms)] = (
+        None
+    ),
+    card_updater: Annotated[SwitchCardUpdater | None, Depends(get_card_updater)] = (
+        None
+    ),
 ) -> Response:
     instance = instance.strip()
     jira_account_id = jira_account_id.strip()
@@ -585,6 +610,30 @@ async def delete_worker_identity_mapping(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await session.commit()
+    if ticket_rooms is not None:
+        try:
+            result = await session.execute(
+                select(JiraWorkerTicket.issue_key).where(
+                    JiraWorkerTicket.instance == instance,
+                    JiraWorkerTicket.reporter_account_id == jira_account_id,
+                    JiraWorkerTicket.room_id.is_not(None),
+                )
+            )
+            for (issue_key,) in result.all():
+                await sync_ticket_room(
+                    session,
+                    instance=instance,
+                    issue_key=issue_key,
+                    rooms=ticket_rooms,
+                    jira_agent_name=config.jira_agent_name,
+                    cards=card_updater,
+                )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "Jira ticket card refresh failed after unmap for %s", jira_account_id
+            )
+            await session.rollback()
     return Response(status_code=204)
 
 

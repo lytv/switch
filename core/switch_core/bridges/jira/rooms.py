@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -123,8 +123,9 @@ async def sync_ticket_room(
     """Ensure the ticket room, card, and archive state for one ticket.
 
     Idempotent: safe across webhook/poll duplicates and restarts, because the
-    room is found through ``ticket.room_id`` under a row lock. The caller
-    commits. Returns the room id, or None when the ticket row is missing.
+    room is found through ``ticket.room_id`` under a row lock. The room id
+    and card id commit before later side effects; the caller commits the
+    remainder. Returns the room id, or None when the ticket row is missing.
     """
     ticket = await session.scalar(
         select(JiraWorkerTicket)
@@ -148,18 +149,7 @@ async def sync_ticket_room(
             )
             ticket.room_id = None
             ticket.card_event_id = None
-
-    if ticket.room_id is None:
-        room_id = await rooms.create_ticket_room(
-            name=ticket.issue_key,
-            description=ticket.summary or ticket.issue_key,
-            owner_id=ticket.reporter_switch_user_id,
-        )
-        ticket.room_id = room_id
-        await session.flush()
-        await rooms.ensure_agent_member(room_id, agent_name=jira_agent_name)
-    else:
-        room_id = ticket.room_id
+            await session.flush()
 
     body = render_ticket_card(
         issue_key=ticket.issue_key,
@@ -168,9 +158,41 @@ async def sync_ticket_room(
         reporter_label=await _reporter_label(session, rooms, ticket),
         issue_url=rooms.issue_url(instance=ticket.instance, issue_key=ticket.issue_key),
     )
+    if ticket.room_id is None:
+        room_id = await rooms.create_ticket_room(
+            name=ticket.issue_key,
+            description=body,
+            owner_id=ticket.reporter_switch_user_id,
+        )
+        ticket.room_id = room_id
+        await session.commit()
+        ticket = await session.scalar(
+            select(JiraWorkerTicket)
+            .where(
+                JiraWorkerTicket.instance == instance,
+                JiraWorkerTicket.issue_key == issue_key,
+            )
+            .with_for_update()
+        )
+        if ticket is None:
+            return room_id
+        await rooms.ensure_agent_member(room_id, agent_name=jira_agent_name)
+    else:
+        room_id = ticket.room_id
+
     if ticket.card_event_id is None:
         ticket.card_event_id = await rooms.post_card(room_id, body=body)
-        await session.flush()
+        await session.commit()
+        ticket = await session.scalar(
+            select(JiraWorkerTicket)
+            .where(
+                JiraWorkerTicket.instance == instance,
+                JiraWorkerTicket.issue_key == issue_key,
+            )
+            .with_for_update()
+        )
+        if ticket is None:
+            return room_id
     elif cards is not None:
         await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
 
@@ -181,7 +203,7 @@ async def sync_ticket_room(
             await rooms.set_archived(room_id, archived=True)
     elif archived:
         await rooms.set_archived(room_id, archived=False)
-    await consume_reporter_invites(session, rooms=rooms, ticket_id=ticket.id)
+    await consume_reporter_invites(session, rooms=rooms, cards=cards, ticket_id=ticket.id)
     await session.flush()
     return room_id
 
@@ -190,6 +212,7 @@ async def consume_reporter_invites(
     session: AsyncSession,
     *,
     rooms: TicketRooms,
+    cards: CardUpdater | None = None,
     ticket_id: str | None = None,
     switch_user_id: str | None = None,
     limit: int = 50,
@@ -197,18 +220,47 @@ async def consume_reporter_invites(
     """Invite newly mapped reporters by transferring ticket-room ownership.
 
     Consumes pending ``invite_ticket_reporter`` rows (step 2 follow-ups) and
-    marks each done. Admin-card rows are left for step 7. Rows whose room does
-    not exist yet stay pending for a later pass. The caller commits.
+    marks each done. Admin-card rows are left for step 7. Only invites whose
+    ticket already has a room are selected; stale invites whose user is no
+    longer the ticket reporter are dropped. The caller commits.
     """
-    stmt = (
-        select(JiraWorkerOutbox)
+    id_stmt = (
+        select(JiraWorkerOutbox.id)
+        .outerjoin(
+            JiraWorkerTicket,
+            JiraWorkerTicket.id == JiraWorkerOutbox.payload["ticket_id"].astext,
+        )
         .where(
             JiraWorkerOutbox.channel == "switch",
             JiraWorkerOutbox.command == INVITE_REPORTER_COMMAND,
             JiraWorkerOutbox.status == "pending",
         )
+    )
+    if ticket_id is not None:
+        id_stmt = id_stmt.where(
+            JiraWorkerOutbox.payload["ticket_id"].astext == ticket_id
+        )
+    if switch_user_id is not None:
+        id_stmt = id_stmt.where(
+            JiraWorkerOutbox.payload["switch_user_id"].astext == switch_user_id
+        )
+    id_stmt = (
+        id_stmt.where(
+            or_(
+                JiraWorkerTicket.id.is_(None),
+                JiraWorkerTicket.room_id.is_not(None),
+            )
+        )
         .order_by(JiraWorkerOutbox.created_at.asc())
         .limit(max(1, limit))
+    )
+    ids = list((await session.execute(id_stmt)).scalars().all())
+    if not ids:
+        return 0
+    stmt = (
+        select(JiraWorkerOutbox)
+        .where(JiraWorkerOutbox.id.in_(ids))
+        .order_by(JiraWorkerOutbox.created_at.asc())
         .with_for_update(skip_locked=True)
     )
     rows = list((await session.execute(stmt)).scalars().all())
@@ -217,10 +269,6 @@ async def consume_reporter_invites(
         payload = row.payload if isinstance(row.payload, dict) else {}
         row_ticket_id = payload.get("ticket_id")
         row_user_id = payload.get("switch_user_id")
-        if ticket_id is not None and row_ticket_id != ticket_id:
-            continue
-        if switch_user_id is not None and row_user_id != switch_user_id:
-            continue
         ticket = await session.get(JiraWorkerTicket, row_ticket_id)
         if ticket is None or not isinstance(row_user_id, str) or not row_user_id:
             row.status = "done"
@@ -228,12 +276,29 @@ async def consume_reporter_invites(
             continue
         if ticket.room_id is None:
             continue
+        if ticket.reporter_switch_user_id != row_user_id:
+            row.status = "done"
+            done += 1
+            continue
         if not await rooms.set_room_owner(ticket.room_id, owner_id=row_user_id):
             logger.warning(
                 "Jira ticket room %s for %s is gone; dropping invite for %s",
                 ticket.room_id,
                 ticket.issue_key,
                 row_user_id,
+            )
+        elif cards is not None and ticket.card_event_id is not None:
+            body = render_ticket_card(
+                issue_key=ticket.issue_key,
+                summary=ticket.summary,
+                status=ticket.status,
+                reporter_label=await _reporter_label(session, rooms, ticket),
+                issue_url=rooms.issue_url(
+                    instance=ticket.instance, issue_key=ticket.issue_key
+                ),
+            )
+            await cards.update_card(
+                ticket.room_id, event_id=ticket.card_event_id, body=body
             )
         row.status = "done"
         done += 1
