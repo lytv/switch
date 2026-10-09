@@ -24,8 +24,11 @@ from switch_core.bridges.jira.worker import (
     complete_job,
     ensure_poll_job,
     is_worker_enabled,
+    lookup_identity,
     record_event,
     record_webhook_event,
+    remove_identity_mapping,
+    set_identity_mapping,
     webhook_idempotency_key,
 )
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
@@ -360,6 +363,228 @@ async def test_instances_with_same_project_and_issue_key_stay_separate(
             )
         ).all()
         assert rows == [("acme", "KAN-1"), ("other", "KAN-1")]
+
+
+@pytest.mark.asyncio
+async def test_identity_mapping_is_exact_and_scoped_per_instance(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        first, _ = await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-1",
+            enabled_projects=["KAN"],
+        )
+        second, _ = await set_identity_mapping(
+            session,
+            instance="other",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-2",
+            enabled_projects=["KAN"],
+        )
+        await session.commit()
+        assert first.instance == "acme"
+        assert second.instance == "other"
+
+    async with session_factory() as session:
+        assert (
+            await lookup_identity(
+                session, instance="acme", jira_account_id="jira-account-1"
+            )
+            == "switch-user-1"
+        )
+        assert (
+            await lookup_identity(
+                session, instance="other", jira_account_id="jira-account-1"
+            )
+            == "switch-user-2"
+        )
+        assert (
+            await lookup_identity(session, instance="acme", jira_account_id="missing")
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_identity_mapping_never_guesses_reporter_name_or_email(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    event = _webhook_event()
+    event.raw["issue"]["fields"] = {
+        "reporter": {
+            "accountId": "jira-account-unknown",
+            "displayName": "Switch User",
+            "emailAddress": "switch-user@example.invalid",
+        }
+    }
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-known",
+            switch_user_id="switch-user-1",
+            enabled_projects=["KAN"],
+        )
+        assert await record_webhook_event(
+            session,
+            event,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT reporter_switch_user_id, wait_channel "
+                    "FROM jira_worker_ticket_map WHERE instance = 'acme'"
+                )
+            )
+        ).one()
+        assert row == (None, "jira_comments")
+
+
+@pytest.mark.asyncio
+async def test_unmapped_reporter_uses_jira_comments_then_mapping_wakes_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    event = _webhook_event()
+    event.raw["issue"]["fields"] = {
+        "reporter": {"accountId": "jira-account-1", "displayName": "Ignored"}
+    }
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session,
+            event,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        initial = (
+            await session.execute(
+                text(
+                    "SELECT reporter_account_id, reporter_switch_user_id, wait_channel "
+                    "FROM jira_worker_ticket_map"
+                )
+            )
+        ).one()
+        assert initial == ("jira-account-1", None, "jira_comments")
+        mapping, updated_ticket_count = await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-1",
+            enabled_projects=["KAN"],
+        )
+        assert mapping.switch_user_id == "switch-user-1"
+        assert updated_ticket_count == 1
+        await session.commit()
+
+    async with session_factory() as session:
+        resolved = (
+            await session.execute(
+                text(
+                    "SELECT reporter_switch_user_id, wait_channel "
+                    "FROM jira_worker_ticket_map"
+                )
+            )
+        ).one()
+        assert resolved == ("switch-user-1", "switch")
+        outbox = (
+            await session.execute(
+                text(
+                    "SELECT command, payload->>'switch_user_id' FROM jira_worker_outbox"
+                )
+            )
+        ).all()
+        assert outbox == [
+            ("upsert_ticket_admin_card", None),
+            ("invite_ticket_reporter", "switch-user-1"),
+            ("upsert_ticket_admin_card", "switch-user-1"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_mapping_change_leaves_disabled_project_ticket_unchanged(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    event = _webhook_event()
+    event.raw["issue"]["fields"] = {"reporter": {"accountId": "jira-account-1"}}
+    async with session_factory() as session:
+        assert await record_webhook_event(
+            session,
+            event,
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier=None,
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        _, updated_ticket_count = await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-1",
+            enabled_projects=[],
+        )
+        assert updated_ticket_count == 0
+        await session.commit()
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT reporter_switch_user_id, wait_channel "
+                    "FROM jira_worker_ticket_map"
+                )
+            )
+        ).one()
+        assert row == (None, "jira_comments")
+
+
+@pytest.mark.asyncio
+async def test_identity_mapping_update_and_remove(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-1",
+            enabled_projects=["KAN"],
+        )
+        updated, _ = await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            switch_user_id="switch-user-2",
+            enabled_projects=["KAN"],
+        )
+        assert updated.switch_user_id == "switch-user-2"
+        await remove_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="jira-account-1",
+            enabled_projects=["KAN"],
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        assert (
+            await lookup_identity(
+                session, instance="acme", jira_account_id="jira-account-1"
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio

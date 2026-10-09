@@ -19,17 +19,27 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import and_, or_, select, true, update
+from sqlalchemy import and_, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerEvent,
+    JiraWorkerIdentity,
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+)
 
 logger = logging.getLogger(__name__)
 
 POLL_JOB_KIND = "watermark_poll"
+SWITCH_WAIT_CHANNEL = "switch"
+JIRA_COMMENTS_WAIT_CHANNEL = "jira_comments"
+
+_TERMINAL_TICKET_STATUSES = ("done", "cancelled", "canceled")
 
 SleepFn = Callable[[float], Awaitable[None]]
 ClockFn = Callable[[], datetime]
@@ -64,6 +74,184 @@ def webhook_idempotency_key(payload: dict[str, Any], issue_key: str) -> str:
 
 def poll_idempotency_key(issue_key: str, updated: str) -> str:
     return f"poll|{issue_key}|{updated}"
+
+
+def jira_reporter_account_id(payload: dict[str, Any]) -> str:
+    """Return only Jira's immutable reporter account identifier."""
+    issue = payload.get("issue")
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    reporter = fields.get("reporter") if isinstance(fields, dict) else None
+    account_id = reporter.get("accountId") if isinstance(reporter, dict) else None
+    return str(account_id).strip() if account_id is not None else ""
+
+
+async def lookup_identity(
+    session: AsyncSession, *, instance: str, jira_account_id: str
+) -> str | None:
+    """Resolve a manual Jira account mapping without name or email matching."""
+    if not jira_account_id:
+        return None
+    result = await session.execute(
+        select(JiraWorkerIdentity.switch_user_id).where(
+            JiraWorkerIdentity.instance == instance,
+            JiraWorkerIdentity.jira_account_id == jira_account_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_identity_mappings(
+    session: AsyncSession, *, instance: str
+) -> list[JiraWorkerIdentity]:
+    result = await session.execute(
+        select(JiraWorkerIdentity)
+        .where(JiraWorkerIdentity.instance == instance)
+        .order_by(JiraWorkerIdentity.jira_account_id)
+    )
+    return list(result.scalars().all())
+
+
+async def _enqueue_switch_follow_up(
+    session: AsyncSession,
+    *,
+    command: str,
+    ticket: JiraWorkerTicket,
+    switch_user_id: str | None,
+) -> None:
+    session.add(
+        JiraWorkerOutbox(
+            channel="switch",
+            command=command,
+            issue_key=ticket.issue_key,
+            payload={
+                "instance": ticket.instance,
+                "project_key": ticket.project_key,
+                "ticket_id": ticket.id,
+                "switch_user_id": switch_user_id,
+            },
+        )
+    )
+    await session.flush()
+
+
+async def _set_open_ticket_reporter_resolution(
+    session: AsyncSession,
+    *,
+    instance: str,
+    jira_account_id: str,
+    switch_user_id: str | None,
+    enabled_projects: Sequence[str],
+) -> int:
+    if not enabled_projects:
+        return 0
+    result = await session.execute(
+        select(JiraWorkerTicket)
+        .where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.project_key.in_(enabled_projects),
+            JiraWorkerTicket.reporter_account_id == jira_account_id,
+            func.lower(JiraWorkerTicket.status).not_in(_TERMINAL_TICKET_STATUSES),
+        )
+        .with_for_update()
+    )
+    tickets = list(result.scalars().all())
+    wait_channel = SWITCH_WAIT_CHANNEL if switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
+    changed = 0
+    for ticket in tickets:
+        if (
+            ticket.reporter_switch_user_id == switch_user_id
+            and ticket.wait_channel == wait_channel
+        ):
+            continue
+        ticket.reporter_switch_user_id = switch_user_id
+        ticket.wait_channel = wait_channel
+        if switch_user_id:
+            await _enqueue_switch_follow_up(
+                session,
+                command="invite_ticket_reporter",
+                ticket=ticket,
+                switch_user_id=switch_user_id,
+            )
+        await _enqueue_switch_follow_up(
+            session,
+            command="upsert_ticket_admin_card",
+            ticket=ticket,
+            switch_user_id=switch_user_id,
+        )
+        changed += 1
+    await session.flush()
+    return changed
+
+
+async def set_identity_mapping(
+    session: AsyncSession,
+    *,
+    instance: str,
+    jira_account_id: str,
+    switch_user_id: str,
+    enabled_projects: Sequence[str],
+) -> tuple[JiraWorkerIdentity, int]:
+    """Create or update a manual mapping and wake matching open tickets."""
+    result = await session.execute(
+        select(JiraWorkerIdentity)
+        .where(
+            JiraWorkerIdentity.instance == instance,
+            JiraWorkerIdentity.jira_account_id == jira_account_id,
+        )
+        .with_for_update()
+    )
+    mapping = result.scalar_one_or_none()
+    changed = mapping is None or mapping.switch_user_id != switch_user_id
+    if mapping is None:
+        mapping = JiraWorkerIdentity(
+            instance=instance,
+            jira_account_id=jira_account_id,
+            switch_user_id=switch_user_id,
+        )
+        session.add(mapping)
+    else:
+        mapping.switch_user_id = switch_user_id
+    await session.flush()
+    updated_tickets = 0
+    if changed:
+        updated_tickets = await _set_open_ticket_reporter_resolution(
+            session,
+            instance=instance,
+            jira_account_id=jira_account_id,
+            switch_user_id=switch_user_id,
+            enabled_projects=enabled_projects,
+        )
+    return mapping, updated_tickets
+
+
+async def remove_identity_mapping(
+    session: AsyncSession,
+    *,
+    instance: str,
+    jira_account_id: str,
+    enabled_projects: Sequence[str],
+) -> int:
+    """Remove a mapping and return matching open tickets to Jira comments."""
+    result = await session.execute(
+        select(JiraWorkerIdentity)
+        .where(
+            JiraWorkerIdentity.instance == instance,
+            JiraWorkerIdentity.jira_account_id == jira_account_id,
+        )
+        .with_for_update()
+    )
+    mapping = result.scalar_one_or_none()
+    if mapping is None:
+        raise ValueError("Jira worker identity mapping not found")
+    await session.delete(mapping)
+    await session.flush()
+    return await _set_open_ticket_reporter_resolution(
+        session,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        switch_user_id=None,
+        enabled_projects=enabled_projects,
+    )
 
 
 def jira_updated_at(payload: dict[str, Any]) -> datetime:
@@ -126,11 +314,14 @@ async def upsert_ticket(
     *,
     instance: str,
     issue_key: str,
+    reporter_account_id: str,
+    reporter_switch_user_id: str | None,
+    wait_channel: str,
+    updated_at: datetime,
     issue_id: str = "",
     project_key: str = "",
     summary: str = "",
     status: str = "",
-    updated_at: datetime,
 ) -> None:
     stmt = insert(JiraWorkerTicket).values(
         id=str(uuid.uuid4()),
@@ -140,6 +331,9 @@ async def upsert_ticket(
         project_key=project_key,
         summary=summary,
         status=status,
+        reporter_account_id=reporter_account_id,
+        reporter_switch_user_id=reporter_switch_user_id,
+        wait_channel=wait_channel,
         last_event_at=updated_at,
     )
     stmt = stmt.on_conflict_do_update(
@@ -149,6 +343,9 @@ async def upsert_ticket(
             "project_key": stmt.excluded.project_key,
             "summary": stmt.excluded.summary,
             "status": stmt.excluded.status,
+            "reporter_account_id": stmt.excluded.reporter_account_id,
+            "reporter_switch_user_id": stmt.excluded.reporter_switch_user_id,
+            "wait_channel": stmt.excluded.wait_channel,
             "last_event_at": stmt.excluded.last_event_at,
         },
         where=JiraWorkerTicket.last_event_at <= stmt.excluded.last_event_at,
@@ -186,6 +383,21 @@ async def record_webhook_event(
     )
     if inserted is None:
         return False
+    reporter_account_id = jira_reporter_account_id(raw)
+    reporter_switch_user_id = await lookup_identity(
+        session,
+        instance=instance,
+        jira_account_id=reporter_account_id,
+    )
+    wait_channel = (
+        SWITCH_WAIT_CHANNEL if reporter_switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
+    )
+    previous_ticket = await session.scalar(
+        select(JiraWorkerTicket).where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.issue_key == event.key,
+        )
+    )
     issue_id = ""
     if isinstance(raw.get("issue"), dict):
         issue_id = str(raw["issue"].get("id") or "")
@@ -197,8 +409,33 @@ async def record_webhook_event(
         project_key=event.project,
         summary=event.summary,
         status=event.status,
+        reporter_account_id=reporter_account_id,
+        reporter_switch_user_id=reporter_switch_user_id,
+        wait_channel=wait_channel,
         updated_at=jira_updated_at(raw),
     )
+    if previous_ticket is None:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(
+                JiraWorkerTicket.instance == instance,
+                JiraWorkerTicket.issue_key == event.key,
+            )
+        )
+        assert ticket is not None
+        if reporter_switch_user_id:
+            await _enqueue_switch_follow_up(
+                session,
+                command="invite_ticket_reporter",
+                ticket=ticket,
+                switch_user_id=reporter_switch_user_id,
+            )
+        else:
+            await _enqueue_switch_follow_up(
+                session,
+                command="upsert_ticket_admin_card",
+                ticket=ticket,
+                switch_user_id=None,
+            )
     return True
 
 
@@ -240,6 +477,26 @@ async def record_polled_issue(
     )
     if inserted is None:
         return False
+    reporter = fields.get("reporter")
+    reporter_account_id = (
+        str(reporter.get("accountId")).strip()
+        if isinstance(reporter, dict) and reporter.get("accountId") is not None
+        else ""
+    )
+    reporter_switch_user_id = await lookup_identity(
+        session,
+        instance=instance,
+        jira_account_id=reporter_account_id,
+    )
+    wait_channel = (
+        SWITCH_WAIT_CHANNEL if reporter_switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
+    )
+    previous_ticket = await session.scalar(
+        select(JiraWorkerTicket).where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.issue_key == issue_key,
+        )
+    )
     await upsert_ticket(
         session,
         instance=instance,
@@ -248,8 +505,33 @@ async def record_polled_issue(
         project_key=project_key,
         summary=str(fields.get("summary") or ""),
         status=status_name,
+        reporter_account_id=reporter_account_id,
+        reporter_switch_user_id=reporter_switch_user_id,
+        wait_channel=wait_channel,
         updated_at=jira_updated_at({"issue": issue}),
     )
+    if previous_ticket is None:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(
+                JiraWorkerTicket.instance == instance,
+                JiraWorkerTicket.issue_key == issue_key,
+            )
+        )
+        assert ticket is not None
+        if reporter_switch_user_id:
+            await _enqueue_switch_follow_up(
+                session,
+                command="invite_ticket_reporter",
+                ticket=ticket,
+                switch_user_id=reporter_switch_user_id,
+            )
+        else:
+            await _enqueue_switch_follow_up(
+                session,
+                command="upsert_ticket_admin_card",
+                ticket=ticket,
+                switch_user_id=None,
+            )
     return True
 
 
@@ -454,7 +736,7 @@ class JiraPollClient:
         while True:
             params: dict[str, str | int] = {
                 "jql": jql,
-                "fields": "summary,status,updated,project",
+                "fields": "summary,status,updated,project,reporter",
                 "maxResults": 50,
             }
             if next_page_token is not None:
