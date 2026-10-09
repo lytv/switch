@@ -1230,7 +1230,7 @@ class JiraWorkerOutbox(Base):
     instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
     command_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # pending | claimed | sending | done | parked | failed | uncertain
+    # pending | claimed | sending | done | parked | failed | uncertain | cancelled
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     due_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

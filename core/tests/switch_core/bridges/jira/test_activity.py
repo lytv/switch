@@ -1223,7 +1223,7 @@ def _edited_later_stamp() -> str:
     return (datetime.fromisoformat(BASE) + timedelta(seconds=100)).isoformat()
 
 
-async def test_reporter_edit_of_seen_comment_wakes_without_new_event_row(
+async def test_reporter_edit_of_seen_comment_wakes_and_records_input(
     session_factory,
 ) -> None:
     key = await seed(session_factory, mapped=False)
@@ -1241,7 +1241,9 @@ async def test_reporter_edit_of_seen_comment_wakes_without_new_event_row(
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = await events(session_factory)
+    assert [event.event_kind for event in recorded] == ["jira_comment"]
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_worker_edit_of_seen_comment_is_ignored(session_factory) -> None:
@@ -1408,7 +1410,13 @@ async def test_mixed_worker_comment_and_reporter_edit_wakes(session_factory) -> 
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.event_kind == "jira_comment"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_mixed_worker_history_and_reporter_edit_wakes(session_factory) -> None:
@@ -1429,7 +1437,13 @@ async def test_mixed_worker_history_and_reporter_edit_wakes(session_factory) -> 
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.event_kind == "jira_comment"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_mixed_worker_comment_and_other_edit_parks(session_factory) -> None:

@@ -473,6 +473,15 @@ class TicketActivity:
                         reporter=bool(actor) and actor == ticket.reporter_account_id,
                     )
                 if observation is not None and observation.reporter_edits:
+                    for comment in observation.reporter_edits:
+                        await self._input(
+                            session,
+                            ticket,
+                            "jira_comment",
+                            f"jira-comment:{ticket.issue_key}:{comment['id']}:{comment['updated']}",
+                            comment,
+                            reporter=True,
+                        )
                     request_wake(ticket)
             else:
                 for comment in (

@@ -918,7 +918,7 @@ class JiraWorkerScheduler:
             await self._sleep(interval)
 
     async def run_once(self) -> None:
-        """Seed poll jobs, send due Jira commands, reconcile rooms, and poll."""
+        """Seed poll jobs, read input, reconcile cards, send commands, and poll."""
         now = self._clock()
         projects = self._config.jira_worker_enabled_projects
         scopes = [
@@ -954,7 +954,6 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
-        await self._outbox.run_once()
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
         if self._admin_board is not None:
@@ -967,6 +966,7 @@ class JiraWorkerScheduler:
                 config=self._config,
                 now=self._clock(),
             )
+        await self._outbox.run_once()
         for job in jobs:
             try:
                 await self._handle_job(job)

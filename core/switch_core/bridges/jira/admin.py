@@ -482,6 +482,8 @@ async def _sync_admin_card(
     ticket_id: str,
     now: datetime,
 ) -> bool:
+    reminders: list[tuple[str, str]] = []
+    needs_card = False
     async with session_factory() as session:
         ticket = await session.scalar(
             select(JiraWorkerTicket)
@@ -490,7 +492,26 @@ async def _sync_admin_card(
         )
         if ticket is None or not _enabled(config, ticket):
             return False
-        await _apply_state(session, ticket, config, now, board)
+        await _apply_state(session, ticket, config, now, reminders)
+        reasons = {
+            str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
+        }
+        needs_card = bool(reasons) or ticket.admin_card_event_id is not None
+        if not needs_card:
+            await _consume_follow_ups(session, ticket.id)
+        await session.commit()
+    for room_id, body in reminders:
+        await board.remind_reporter(room_id=room_id, body=body)
+    if not needs_card:
+        return True
+    async with session_factory() as session:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket)
+            .where(JiraWorkerTicket.id == ticket_id)
+            .with_for_update()
+        )
+        if ticket is None or not _enabled(config, ticket):
+            return True
         reasons = {
             str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
         }
@@ -528,7 +549,7 @@ async def _apply_state(
     ticket: JiraWorkerTicket,
     config: SwitchConfig,
     now: datetime,
-    board: AdminBoard,
+    reminders: list[tuple[str, str]],
 ) -> None:
     reasons = {
         str(key): str(value)
@@ -555,7 +576,7 @@ async def _apply_state(
         reasons["blocked_writes"] = "Jira write failed 3 times"
     if needs_person(ticket.worker_parked_reason):
         reasons["parked"] = ticket.worker_parked_reason or "parked"
-    await _apply_wait(session, ticket, config, now, board, reasons)
+    await _apply_wait(session, ticket, config, now, reasons, reminders)
     ticket.admin_reasons = reasons or None
 
 
@@ -593,13 +614,36 @@ async def _latest_wait_reply(
     return found
 
 
+async def _cancel_pending_wait_commands(
+    session: AsyncSession, ticket: JiraWorkerTicket
+) -> None:
+    rows = (
+        await session.scalars(
+            select(JiraWorkerOutbox)
+            .where(
+                JiraWorkerOutbox.instance == ticket.instance,
+                JiraWorkerOutbox.issue_key == ticket.issue_key,
+                JiraWorkerOutbox.status == "pending",
+                or_(
+                    JiraWorkerOutbox.command_key.like("wait-reminder:%"),
+                    JiraWorkerOutbox.command_key.like("wait-blocked:%"),
+                ),
+            )
+            .with_for_update()
+        )
+    ).all()
+    for row in rows:
+        row.status = "cancelled"
+        row.error = "Wait ended before send"
+
+
 async def _apply_wait(
     session: AsyncSession,
     ticket: JiraWorkerTicket,
     config: SwitchConfig,
     now: datetime,
-    board: AdminBoard,
     reasons: dict[str, str],
+    reminders: list[tuple[str, str]],
 ) -> None:
     waiting_for_input = ticket.status == config.jira_worker_statuses.waiting_for_input
     waiting = waiting_for_input or (
@@ -608,12 +652,14 @@ async def _apply_wait(
     if not waiting or is_terminal_ticket_status(ticket.status):
         ticket.wait_anchor = None
         ticket.wait_fired = None
+        await _cancel_pending_wait_commands(session, ticket)
         return
     if waiting_for_input and ticket.wait_anchor is not None:
         replied_at = await _latest_wait_reply(session, ticket, ticket.wait_anchor)
         if replied_at is not None:
             ticket.wait_anchor = replied_at
             ticket.wait_fired = {}
+            await _cancel_pending_wait_commands(session, ticket)
     if ticket.worker_parked_reason:
         if ticket.wait_anchor is None:
             ticket.wait_anchor = now
@@ -631,7 +677,7 @@ async def _apply_wait(
         anchor, config.jira_worker_wait_reminder_hours, calendar
     ):
         try:
-            await _send_reminder(session, ticket, config, board, anchor)
+            await _send_reminder(session, ticket, config, anchor, reminders)
         except _WaitNotReady:
             logger.warning("Jira wait reminder for %s is not ready", ticket.issue_key)
         else:
@@ -662,8 +708,8 @@ async def _send_reminder(
     session: AsyncSession,
     ticket: JiraWorkerTicket,
     config: SwitchConfig,
-    board: AdminBoard,
     anchor: datetime,
+    reminders: list[tuple[str, str]],
 ) -> None:
     body = f"Reminder: the worker is still waiting for a reply on {ticket.issue_key}."
     if ticket.wait_channel == "jira_comments":
@@ -682,7 +728,7 @@ async def _send_reminder(
         return
     if not ticket.room_id:
         raise _WaitNotReady()
-    await board.remind_reporter(room_id=ticket.room_id, body=body)
+    reminders.append((ticket.room_id, body))
 
 
 async def _enqueue_blocked(

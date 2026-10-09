@@ -774,6 +774,196 @@ async def test_parked_ticket_does_not_fire_wait_milestones(
     assert blocked is None
 
 
+async def _wait_command(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    issue_key: str,
+    command_key: str,
+    command: str,
+    status: str,
+) -> None:
+    async with factory() as session:
+        session.add(
+            JiraWorkerOutbox(
+                channel="jira",
+                command=command,
+                instance="acme",
+                issue_key=issue_key,
+                command_key=command_key,
+                status=status,
+                payload={
+                    "data": "BLOCKED" if command == "transition" else "reminder",
+                    "based_updated": "2026-10-02T16:00:00.000+0000",
+                    "based_changelog_id": "200",
+                },
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_reply_cancels_pending_wait_commands(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=NOW - timedelta(hours=10),
+        wait_fired={"blocked": NOW.isoformat()},
+        jira_read_updated="2026-10-02T16:00:00.000+0000",
+        jira_read_changelog_id="200",
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"wait-blocked:{ticket_id}:old",
+        command="transition",
+        status="pending",
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"wait-reminder:{ticket_id}:old",
+        command="comment",
+        status="pending",
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"wait-blocked:{ticket_id}:sending",
+        command="transition",
+        status="sending",
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"failure:{ticket_id}:transition",
+        command="transition",
+        status="pending",
+    )
+    await _input_event(
+        session_factory,
+        kind="thread_message",
+        received_at=NOW - timedelta(hours=1),
+        reporter_input=True,
+    )
+    await _sync_at(session_factory, ticket_id, FakeAdminBoard(), NOW)
+    async with session_factory() as session:
+        rows = list(await session.scalars(select(JiraWorkerOutbox)))
+    by_key = {row.command_key: row.status for row in rows}
+    assert by_key[f"wait-blocked:{ticket_id}:old"] == "cancelled"
+    assert by_key[f"wait-reminder:{ticket_id}:old"] == "cancelled"
+    assert by_key[f"wait-blocked:{ticket_id}:sending"] == "sending"
+    assert by_key[f"failure:{ticket_id}:transition"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_leaving_wait_cancels_pending_wait_commands(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="In Progress",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=NOW - timedelta(hours=10),
+        wait_fired={"blocked": NOW.isoformat()},
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"wait-blocked:{ticket_id}:old",
+        command="transition",
+        status="pending",
+    )
+    await _sync_at(session_factory, ticket_id, FakeAdminBoard(), NOW)
+    async with session_factory() as session:
+        row = await session.scalar(select(JiraWorkerOutbox))
+    assert row is not None
+    assert row.status == "cancelled"
+    assert (await _ticket(session_factory, ticket_id)).wait_anchor is None
+
+
+@pytest.mark.asyncio
+async def test_approval_room_message_does_not_cancel_wait_commands(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for approval",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=NOW,
+        wait_fired={},
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
+        command_key=f"wait-blocked:{ticket_id}:old",
+        command="transition",
+        status="pending",
+    )
+    await _input_event(
+        session_factory,
+        kind="thread_message",
+        received_at=NOW + timedelta(minutes=5),
+        reporter_input=True,
+    )
+    await _sync_at(
+        session_factory, ticket_id, FakeAdminBoard(), NOW + timedelta(minutes=10)
+    )
+    async with session_factory() as session:
+        row = await session.scalar(select(JiraWorkerOutbox))
+    assert row is not None
+    assert row.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_card_failure_does_not_repeat_a_switch_reminder(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        admin_card_event_id="admin-card-1",
+        wait_anchor=NOW - timedelta(hours=3),
+        wait_fired={},
+    )
+    board = FakeAdminBoard()
+    board.cards["admin-card-1"] = "old"
+    missing = _worker_config(jira_worker_credentials={})
+    with pytest.raises(ValueError):
+        await sync_admin_card(
+            session_factory,
+            engine=await _engine(session_factory),
+            board=board,
+            config=missing,
+            ticket_id=ticket_id,
+            now=NOW,
+        )
+    assert len(board.reminders) == 1
+    fired = (await _ticket(session_factory, ticket_id)).wait_fired or {}
+    assert "reminder" in fired
+    with pytest.raises(ValueError):
+        await sync_admin_card(
+            session_factory,
+            engine=await _engine(session_factory),
+            board=board,
+            config=missing,
+            ticket_id=ticket_id,
+            now=NOW + timedelta(minutes=5),
+        )
+    assert len(board.reminders) == 1
+
+
 @pytest.mark.asyncio
 async def test_one_card_failure_does_not_stop_the_others(
     session_factory: async_sessionmaker[AsyncSession],
