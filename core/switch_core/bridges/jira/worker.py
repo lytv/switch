@@ -355,6 +355,10 @@ async def upsert_ticket(
     if ticket.last_event_at > updated_at:
         return ticket, False, False
 
+    if not reporter_account_id and ticket.reporter_account_id:
+        reporter_account_id = ticket.reporter_account_id
+        reporter_switch_user_id = ticket.reporter_switch_user_id
+        wait_channel = ticket.wait_channel
     reporter_resolution_changed = (
         ticket.reporter_account_id != reporter_account_id
         or ticket.reporter_switch_user_id != reporter_switch_user_id
@@ -380,6 +384,8 @@ async def _enqueue_ticket_intake_follow_ups(
     reporter_resolution_changed: bool,
     switch_user_id: str | None,
 ) -> None:
+    if ticket.status.lower() in _TERMINAL_TICKET_STATUSES:
+        return
     if created:
         if switch_user_id:
             await _enqueue_switch_follow_up(
