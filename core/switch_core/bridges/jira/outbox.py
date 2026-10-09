@@ -227,6 +227,16 @@ def _failure_reason(command_id: str) -> str:
     return f"Jira command failed: {command_id}"
 
 
+async def _still_claimed(session: AsyncSession, row: JiraWorkerOutbox) -> bool:
+    fresh = await session.get(
+        JiraWorkerOutbox,
+        row.id,
+        with_for_update=True,
+        populate_existing=True,
+    )
+    return fresh is not None and fresh.status == "claimed"
+
+
 class JiraOutboxSender:
     def __init__(
         self,
@@ -445,15 +455,21 @@ class JiraOutboxSender:
             # Resolve transitions first. The version check is the last Jira read.
             version = await read_jira_version(client, row.issue_key)
             check_jira_version(version, payload, account_id)
+            if not await _still_claimed(session, row):
+                return
             row.status = "sending"
             await session.commit()
             sending = True
             await client.request(method, path, json=body)
         except HumanChange as exc:
+            if not await _still_claimed(session, row):
+                return
             row.status = "parked"
             row.error = str(exc)
             park_ticket(ticket, str(exc))
         except Exception as exc:
+            if not sending and not await _still_claimed(session, row):
+                return
             if sending and (
                 isinstance(exc, httpx.TransportError)
                 or (

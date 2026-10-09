@@ -833,6 +833,13 @@ async def test_reply_cancels_pending_wait_commands(
     await _wait_command(
         session_factory,
         issue_key="KAN-1",
+        command_key=f"wait-blocked:{ticket_id}:claimed",
+        command="transition",
+        status="claimed",
+    )
+    await _wait_command(
+        session_factory,
+        issue_key="KAN-1",
         command_key=f"wait-blocked:{ticket_id}:sending",
         command="transition",
         status="sending",
@@ -856,8 +863,59 @@ async def test_reply_cancels_pending_wait_commands(
     by_key = {row.command_key: row.status for row in rows}
     assert by_key[f"wait-blocked:{ticket_id}:old"] == "cancelled"
     assert by_key[f"wait-reminder:{ticket_id}:old"] == "cancelled"
+    assert by_key[f"wait-blocked:{ticket_id}:claimed"] == "cancelled"
     assert by_key[f"wait-blocked:{ticket_id}:sending"] == "sending"
     assert by_key[f"failure:{ticket_id}:transition"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_accept_cancels_claimed_wait_command(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed(
+        session_factory,
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        agent_state="waiting",
+    )
+    async with session_factory() as session:
+        admin = User(name="Admin", email="accept-admin@example.invalid", role="admin")
+        event = JiraWorkerEvent(
+            instance="acme",
+            idempotency_key="ignored-accept-cancel",
+            issue_key="KAN-1",
+            project_key="KAN",
+            event_kind="ignored_input",
+            payload={"untrusted_data": {"body": "use this"}},
+        )
+        session.add_all([admin, event])
+        await session.commit()
+        await _wait_command(
+            session_factory,
+            issue_key="KAN-1",
+            command_key="wait-blocked:accept:claimed",
+            command="transition",
+            status="claimed",
+        )
+        await _wait_command(
+            session_factory,
+            issue_key="KAN-1",
+            command_key="wait-reminder:accept:sending",
+            command="comment",
+            status="sending",
+        )
+        await accept_ignored_input(
+            session,
+            event_id=event.id,
+            admin_user_id=admin.id,
+            enabled_projects={"acme": ["KAN"]},
+        )
+        await session.commit()
+    async with session_factory() as session:
+        rows = list(await session.scalars(select(JiraWorkerOutbox)))
+    by_key = {row.command_key: row.status for row in rows}
+    assert by_key["wait-blocked:accept:claimed"] == "cancelled"
+    assert by_key["wait-reminder:accept:sending"] == "sending"
 
 
 @pytest.mark.asyncio
@@ -949,18 +1007,28 @@ async def test_card_failure_does_not_repeat_a_switch_reminder(
             ticket_id=ticket_id,
             now=NOW,
         )
+    assert board.reminders == []
+    assert "reminder" not in (
+        (await _ticket(session_factory, ticket_id)).wait_fired or {}
+    )
+    await sync_admin_card(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        ticket_id=ticket_id,
+        now=NOW + timedelta(minutes=5),
+    )
     assert len(board.reminders) == 1
-    fired = (await _ticket(session_factory, ticket_id)).wait_fired or {}
-    assert "reminder" in fired
-    with pytest.raises(ValueError):
-        await sync_admin_card(
-            session_factory,
-            engine=await _engine(session_factory),
-            board=board,
-            config=missing,
-            ticket_id=ticket_id,
-            now=NOW + timedelta(minutes=5),
-        )
+    assert "reminder" in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    await sync_admin_card(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        ticket_id=ticket_id,
+        now=NOW + timedelta(minutes=10),
+    )
     assert len(board.reminders) == 1
 
 

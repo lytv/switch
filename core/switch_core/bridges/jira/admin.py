@@ -471,6 +471,7 @@ async def accept_ignored_input(
     )
     if ticket is not None:
         request_wake(ticket)
+        await _cancel_wait_commands(session, ticket)
     return new_id
 
 
@@ -499,10 +500,11 @@ async def _sync_admin_card(
         needs_card = bool(reasons) or ticket.admin_card_event_id is not None
         if not needs_card:
             await _consume_follow_ups(session, ticket.id)
+            _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
-    for room_id, body in reminders:
-        await board.remind_reporter(room_id=room_id, body=body)
     if not needs_card:
+        for room_id, body in reminders:
+            await board.remind_reporter(room_id=room_id, body=body)
         return True
     async with session_factory() as session:
         ticket = await session.scalar(
@@ -540,7 +542,10 @@ async def _sync_admin_card(
                 await board.edit_card(room_id, event_id, body=body)
         ticket.admin_card_event_id = event_id
         await _consume_follow_ups(session, ticket.id)
+        _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
+    for room_id, body in reminders:
+        await board.remind_reporter(room_id=room_id, body=body)
     return True
 
 
@@ -614,7 +619,17 @@ async def _latest_wait_reply(
     return found
 
 
-async def _cancel_pending_wait_commands(
+def _mark_switch_reminder(
+    ticket: JiraWorkerTicket, now: datetime, reminders: list[tuple[str, str]]
+) -> None:
+    if not reminders:
+        return
+    fired = dict(ticket.wait_fired or {})
+    fired["reminder"] = now.isoformat()
+    ticket.wait_fired = fired
+
+
+async def _cancel_wait_commands(
     session: AsyncSession, ticket: JiraWorkerTicket
 ) -> None:
     rows = (
@@ -623,7 +638,7 @@ async def _cancel_pending_wait_commands(
             .where(
                 JiraWorkerOutbox.instance == ticket.instance,
                 JiraWorkerOutbox.issue_key == ticket.issue_key,
-                JiraWorkerOutbox.status == "pending",
+                JiraWorkerOutbox.status.in_(("pending", "claimed")),
                 or_(
                     JiraWorkerOutbox.command_key.like("wait-reminder:%"),
                     JiraWorkerOutbox.command_key.like("wait-blocked:%"),
@@ -652,14 +667,14 @@ async def _apply_wait(
     if not waiting or is_terminal_ticket_status(ticket.status):
         ticket.wait_anchor = None
         ticket.wait_fired = None
-        await _cancel_pending_wait_commands(session, ticket)
+        await _cancel_wait_commands(session, ticket)
         return
     if waiting_for_input and ticket.wait_anchor is not None:
         replied_at = await _latest_wait_reply(session, ticket, ticket.wait_anchor)
         if replied_at is not None:
             ticket.wait_anchor = replied_at
             ticket.wait_fired = {}
-            await _cancel_pending_wait_commands(session, ticket)
+            await _cancel_wait_commands(session, ticket)
     if ticket.worker_parked_reason:
         if ticket.wait_anchor is None:
             ticket.wait_anchor = now
@@ -681,7 +696,8 @@ async def _apply_wait(
         except _WaitNotReady:
             logger.warning("Jira wait reminder for %s is not ready", ticket.issue_key)
         else:
-            fired["reminder"] = now.isoformat()
+            if ticket.wait_channel == "jira_comments":
+                fired["reminder"] = now.isoformat()
     if "admin" not in fired and now >= add_work_time(
         anchor, config.jira_worker_wait_admin_hours, calendar
     ):
