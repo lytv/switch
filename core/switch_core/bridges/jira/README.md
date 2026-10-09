@@ -68,14 +68,17 @@ existing outbox version check, retry, and uncertain-write rules.
 
 ## Admin cards
 
-One private admin room holds every alert. The worker finds it by the
-`jira_worker_admin_room` marker, not by name. The room has no owner, so only
-admins can read and write it. The Jira system agent posts there.
+One admin room holds every alert. The worker finds it by the
+`jira_worker_admin_room` marker, not by name. The configured admin user owns
+the room. The room uses the default bridge channel. Agents owned by admins
+are members, so they can read the card. The Jira system agent posts there.
 
 One card per ticket is posted once, then edited in place. The message keeps
 its id and position. The card shows the current reasons, ticket key, summary,
 status, reporter mapping state, Jira link, and ticket room link. Clearing a
-reason edits the card. The card stays.
+reason edits the card. The card stays. A new reason also posts one short
+alert line after the card commit. A clear does not. Follow-up: propagate
+message edits to bridge channels.
 
 Reasons come from an unmapped reporter, a Jira write that failed 3 times, a
 park that needs a person (human Jira action, token limit, uncertain write),

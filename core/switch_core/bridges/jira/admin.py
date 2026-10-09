@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, delete, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -25,6 +25,7 @@ from switch_core.bridges.jira.activity import (
 from switch_core.bridges.jira.outbox import enqueue_jira_command, needs_person
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
+    Agent,
     JiraWorkerEvent,
     JiraWorkerOutbox,
     JiraWorkerTicket,
@@ -41,6 +42,7 @@ ADMIN_ROOM_MARKER = "jira_worker_admin_room"
 ADMIN_ROOM_LOCK = "jira-worker-admin-room"
 ADMIN_ROOM_NAME = "Jira admin"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
+ADMIN_ALERT_COMMAND = "admin_reason_alert"
 INTAKE_REASON = "intake_questions"
 _WAIT_INPUT_KIND = {"switch": "thread_message", "jira_comments": "jira_comment"}
 _DERIVED = (
@@ -69,9 +71,46 @@ class AdminBoard(Protocol):
 
     async def remind_reporter(self, *, room_id: str, body: str) -> None: ...
 
+    async def post_alert(self, room_id: str, *, body: str) -> None: ...
+
 
 def card_marker(instance: str, issue_key: str) -> str:
     return f"jira-admin-card:{instance}:{issue_key}"
+
+
+def _alert_key(ticket_id: str, reason: str) -> str:
+    return f"admin-alert:{ticket_id}:{reason}"
+
+
+def alert_line(issue_key: str, reason: str) -> str:
+    return f"{issue_key}: {reason}. Card updated."
+
+
+async def _admin_owner_id(session: AsyncSession, config: SwitchConfig) -> str:
+    owner = await session.scalar(
+        select(User).where(
+            User.email == config.gateway_admin_email,
+            User.role == "admin",
+        )
+    )
+    if owner is None:
+        raise ValueError(f"Admin user {config.gateway_admin_email!r} is missing")
+    return owner.id
+
+
+async def _admin_room_agent_names(
+    session: AsyncSession, config: SwitchConfig
+) -> list[str]:
+    names = [config.jira_agent_name]
+    extra = await session.scalars(
+        select(Agent.name)
+        .join(User, Agent.owner_id == User.id)
+        .where(User.role == "admin")
+    )
+    for name in extra:
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def _marker_like(marker: str) -> str:
@@ -252,16 +291,21 @@ class SwitchAdminBoard:
                 {"key": ADMIN_ROOM_LOCK},
             )
             try:
+                owner_id = await _admin_owner_id(session, self._config)
                 found = await find_admin_room(session)
                 if found is not None:
+                    if found.owner_id != owner_id:
+                        found.owner_id = owner_id
                     return found.id
                 result = await self._rooms.create_room(
                     RoomCreateConfig(
                         name=ADMIN_ROOM_NAME,
                         description="Jira worker alerts. One card per ticket.",
-                        agent_names=[self._config.jira_agent_name],
-                        internal_only=True,
-                        owner_id=None,
+                        agent_names=await _admin_room_agent_names(
+                            session, self._config
+                        ),
+                        created_by=owner_id,
+                        owner_id=owner_id,
                         read_visibility="private",
                         write_visibility="private",
                         metadata={ADMIN_ROOM_MARKER: "1"},
@@ -305,6 +349,9 @@ class SwitchAdminBoard:
             )
 
     async def remind_reporter(self, *, room_id: str, body: str) -> None:
+        await self._protocol.send_message(await self._agent_id(), room_id, body)
+
+    async def post_alert(self, room_id: str, *, body: str) -> None:
         await self._protocol.send_message(await self._agent_id(), room_id, body)
 
 
@@ -475,6 +522,66 @@ async def accept_ignored_input(
     return new_id
 
 
+async def _record_reason_alerts(
+    session: AsyncSession,
+    ticket: JiraWorkerTicket,
+    previous: set[str],
+) -> None:
+    current = set(ticket.admin_reasons or {})
+    for reason in previous - current:
+        await session.execute(
+            delete(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.instance == ticket.instance,
+                JiraWorkerOutbox.command_key == _alert_key(ticket.id, reason),
+            )
+        )
+    for reason in sorted(current - previous):
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                command=ADMIN_ALERT_COMMAND,
+                instance=ticket.instance,
+                issue_key=ticket.issue_key,
+                command_key=_alert_key(ticket.id, reason),
+                status="pending",
+                payload={"reason": reason, "issue_key": ticket.issue_key},
+            )
+        )
+
+
+async def _deliver_reason_alerts(
+    session_factory: async_sessionmaker[AsyncSession],
+    board: AdminBoard,
+    instance: str,
+    issue_key: str,
+    room_id: str,
+) -> None:
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox)
+                    .where(
+                        JiraWorkerOutbox.instance == instance,
+                        JiraWorkerOutbox.issue_key == issue_key,
+                        JiraWorkerOutbox.command == ADMIN_ALERT_COMMAND,
+                        JiraWorkerOutbox.status == "pending",
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+        lines = [
+            alert_line(issue_key, str((row.payload or {}).get("reason", "")))
+            for row in rows
+        ]
+        for row in rows:
+            row.status = "done"
+        await session.commit()
+    for line in lines:
+        await board.post_alert(room_id, body=line)
+
+
 async def _sync_admin_card(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -493,7 +600,11 @@ async def _sync_admin_card(
         )
         if ticket is None or not _enabled(config, ticket):
             return False
+        previous = set(ticket.admin_reasons or {})
+        instance = ticket.instance
+        issue_key = ticket.issue_key
         await _apply_state(session, ticket, config, now, reminders)
+        await _record_reason_alerts(session, ticket, previous)
         reasons = {
             str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
         }
@@ -544,6 +655,7 @@ async def _sync_admin_card(
         await _consume_follow_ups(session, ticket.id)
         _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
+    await _deliver_reason_alerts(session_factory, board, instance, issue_key, room_id)
     for room_id, body in reminders:
         await board.remind_reporter(room_id=room_id, body=body)
     return True
