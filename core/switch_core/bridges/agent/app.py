@@ -20,7 +20,7 @@ from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.collaboration.lifecycle_service import (
     CollaborationBridgeLifecycleService,
 )
-from switch_core.bridges.jira.rooms import SwitchTicketRooms
+from switch_core.bridges.jira.rooms import SwitchCardUpdater, SwitchTicketRooms
 from switch_core.bridges.jira.routes import init_jira_routes
 from switch_core.bridges.jira.routes import router as jira_router
 from switch_core.bridges.jira.service import JiraBridgeService
@@ -160,6 +160,7 @@ def create_agent_bridge_app(
             agent_store=agent_store,
             config=config,
         ),
+        card_updater=SwitchCardUpdater(room_service=room_service),
     )
     init_jira_routes(
         service=jira_service,

@@ -13,8 +13,10 @@ still gets a room for the record with no owner, which only admins can see.
 When an admin later maps the reporter, the pending invite follow-up transfers
 room ownership to them.
 
-The card-update mechanism is one seam (``CardUpdater``) because Switch has no
-message-edit path to reuse: see ``update_card`` below.
+Card refresh (option C): the creation card message stays fixed as the
+thread root, and the live ticket state is rewritten in place into the room
+description (``SwitchCardUpdater``). True message edit stays a follow-up for
+step 7's admin cards.
 """
 
 from __future__ import annotations
@@ -70,10 +72,10 @@ class TicketRooms(Protocol):
 
 
 class CardUpdater(Protocol):
-    """In-place card refresh. Separate seam because Switch has no
-    message-edit path today: ``PostgresTransport`` only appends, and
-    ``read_context`` renders the ``messages`` table as-is, so there is no
-    existing card or edited-message pattern to reuse."""
+    """In-place card refresh. Switch has no message-edit path
+    (``PostgresTransport`` only appends), so per the step-3 decision the
+    creation card message stays fixed as the thread root and the live
+    ticket state rides in the room description via ``update_room``."""
 
     async def update_card(self, room_id: str, *, event_id: str, body: str) -> None: ...
 
@@ -337,3 +339,17 @@ class SwitchTicketRooms:
         if credentials is None:
             return issue_key
         return f"{credentials.base_url.rstrip('/')}/browse/{issue_key}"
+
+
+class SwitchCardUpdater:
+    """Production ``CardUpdater``: the live card state is the room description.
+
+    The creation card message stays fixed (it is the design's thread root),
+    and each refresh rewrites the room description in place through the
+    existing ``RoomService.update_room`` path."""
+
+    def __init__(self, *, room_service: RoomService) -> None:
+        self._rooms = room_service
+
+    async def update_card(self, room_id: str, *, event_id: str, body: str) -> None:
+        await self._rooms.update_room(room_id, description=body)

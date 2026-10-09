@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND,
+    SwitchCardUpdater,
     consume_reporter_invites,
     render_ticket_card,
     sync_ticket_room,
@@ -505,6 +506,22 @@ def test_render_ticket_card_fields() -> None:
     assert "Waiting for approval" in body
     assert "Ada" in body
     assert "https://jira.example/browse/KAN-9" in body
+
+
+class StubRoomService:
+    def __init__(self) -> None:
+        self.descriptions: dict[str, str] = {}
+
+    async def update_room(self, room_id: str, **fields: Any) -> None:
+        self.descriptions[room_id] = str(fields["description"])
+
+
+@pytest.mark.asyncio
+async def test_production_card_updater_rewrites_room_description() -> None:
+    service = StubRoomService()
+    updater = SwitchCardUpdater(room_service=service)  # type: ignore[arg-type]
+    await updater.update_card("room-1", event_id="card-room-1", body="Status: Done")
+    assert service.descriptions == {"room-1": "Status: Done"}
 
 
 @pytest.mark.asyncio
