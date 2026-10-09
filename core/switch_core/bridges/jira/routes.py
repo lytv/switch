@@ -49,6 +49,9 @@ async def jira_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_switch_secret: str | None = Header(default=None, alias=SECRET_HEADER),
+    x_atlassian_webhook_identifier: str | None = Header(
+        default=None, alias="X-Atlassian-Webhook-Identifier"
+    ),
 ) -> JSONResponse:
     """Accept a signed Jira webhook and process matching rules asynchronously."""
     if not verify_instance_secret(
@@ -87,4 +90,10 @@ async def jira_webhook(
 
     service = _require_service()
     background_tasks.add_task(service.process_event, instance=instance, event=event)
+    background_tasks.add_task(
+        service.record_worker_intake,
+        instance=instance,
+        event=event,
+        webhook_identifier=x_atlassian_webhook_identifier,
+    )
     return JSONResponse(status_code=202, content={"status": "accepted"})

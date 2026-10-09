@@ -62,6 +62,7 @@ from switch_core.bridges.collaboration.telegram.adapter import (
     TelegramConnectionConfig,
 )
 from switch_core.bridges.jira.identity import ensure_jira_system_agent
+from switch_core.bridges.jira.worker import JiraWorkerScheduler, build_poll_clients
 from switch_core.bridges.resource.service import ResourceService
 from switch_core.clients.admin_client import AdminClient
 from switch_core.clients.agent_client import AgentClient
@@ -425,6 +426,24 @@ async def run(config: SwitchConfig) -> None:
     )
 
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
+    worker_scheduler: JiraWorkerScheduler | None = None
+    if config.jira_worker_enabled_projects and config.jira_worker_credentials:
+        worker_scheduler = JiraWorkerScheduler(
+            session_factory=session_factory,
+            config=config,
+            poll_clients=build_poll_clients(config),
+        )
+    elif config.jira_worker_enabled_projects:
+        missing = sorted(
+            f"{instance}/{project_key}"
+            for instance, project_keys in config.jira_worker_enabled_projects.items()
+            if instance not in config.jira_worker_credentials
+            for project_key in project_keys
+        )
+        logger.warning(
+            "Jira worker enabled for %s but no Jira credentials are configured; polling is disabled",
+            ", ".join(missing) if missing else "enabled projects",
+        )
     original_lifespan = agent_bridge_app.router.lifespan_context
 
     @asynccontextmanager
@@ -435,12 +454,16 @@ async def run(config: SwitchConfig) -> None:
             connection_sweep_task = asyncio.create_task(
                 _connection_sweep_loop(protocol)
             )
+            if worker_scheduler is not None:
+                worker_scheduler.start()
             await message_listener.start()
             try:
                 yield
             finally:
                 sweep_task.cancel()
                 connection_sweep_task.cancel()
+                if worker_scheduler is not None:
+                    await worker_scheduler.stop()
                 await message_listener.stop()
 
     agent_bridge_app.router.lifespan_context = lifespan  # type: ignore[assignment]

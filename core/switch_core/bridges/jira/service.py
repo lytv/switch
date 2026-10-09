@@ -13,6 +13,7 @@ from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.agent.protocol.types import AgentStatus
 from switch_core.bridges.jira.matching import matching_rules
 from switch_core.bridges.jira.template import render_template
+from switch_core.bridges.jira.worker import is_worker_enabled, record_webhook_event
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraTrigger, Room
@@ -120,6 +121,31 @@ class JiraBridgeService:
             )
 
         await self._prune_delivery_log()
+
+    async def record_worker_intake(
+        self,
+        *,
+        instance: str,
+        event: NormalizedTriggerEvent,
+        webhook_identifier: str | None,
+    ) -> None:
+        """Step-1 worker intake: event log + ticket map for enabled projects.
+
+        Returns immediately when the event's project is not enabled, leaving
+        the existing bridge behaviour unchanged."""
+        if not is_worker_enabled(self._config, instance, event.project):
+            return
+        async with self._session_factory() as session:
+            await record_webhook_event(
+                session,
+                event,
+                instance=instance,
+                enabled_projects=self._config.jira_worker_enabled_projects.get(
+                    instance, []
+                ),
+                webhook_identifier=webhook_identifier,
+            )
+            await session.commit()
 
     async def _resolve_jira_agent(self) -> str | None:
         async with self._session_factory() as session:

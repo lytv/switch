@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -74,6 +74,22 @@ class TestJiraWebhookRoute:
         assert resp.status_code == 202
         assert resp.json()["status"] == "accepted"
         service.process_event.assert_awaited()
+
+    def test_worker_intake_uses_authenticated_instance_and_header_key(self) -> None:
+        service = AsyncMock()
+        client = _client({"acme": "s3cret"}, service)
+        response = client.post(
+            "/integrations/jira/acme",
+            json=_payload(),
+            headers={
+                SECRET_HEADER: "s3cret",
+                "X-Atlassian-Webhook-Identifier": "atlassian-event-1",
+            },
+        )
+        assert response.status_code == 202
+        service.record_worker_intake.assert_awaited_once_with(
+            instance="acme", event=ANY, webhook_identifier="atlassian-event-1"
+        )
 
     def test_malformed_payload_400(self) -> None:
         service = AsyncMock()

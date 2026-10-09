@@ -1064,6 +1064,126 @@ class JiraIssueThread(Base):
     )
 
 
+# ── Jira ticket worker (intake only, v1) ─────────────────────────────────────
+# Worker tables are namespaced apart from chat and trigger tables. Step 1 is
+# intake only: webhook/poll events land in the event log, one row per ticket
+# in the ticket map. Jira writes, rooms, and the orchestrator come later.
+
+
+class JiraWorkerIdentity(Base):
+    """Manual Jira account → Switch user map.
+
+    Never guessed; admin-maintained. Step 1 only creates the table."""
+
+    __tablename__ = "jira_worker_identity_map"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    jira_account_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    switch_agent_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class JiraWorkerTicket(Base):
+    """One row per Jira issue the worker has seen."""
+
+    __tablename__ = "jira_worker_ticket_map"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"
+        ),
+        Index("ix_jira_worker_ticket_map_instance_project", "instance", "project_key"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Set by a later step when the ticket room exists; null until then.
+    room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_seen_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_event_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class JiraWorkerJob(Base):
+    """Due-work rows owned by the scheduler.
+
+    ``due_at`` is the timer; the scheduler claims due rows transactionally
+    (``pending`` → ``claimed`` in one statement) so a timer never runs twice
+    across restarts or overlaps. Step 1 only runs the watermark poll job."""
+
+    __tablename__ = "jira_worker_job_record"
+    __table_args__ = (Index("ix_jira_worker_job_record_due", "status", "due_at"),)
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    due_at: Mapped[str] = mapped_column(DateTime(timezone=True), nullable=False)
+    # pending | claimed | done | error
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    claimed_at: Mapped[str | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    claimed_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_at: Mapped[str | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class JiraWorkerEvent(Base):
+    """Durable intake log. The idempotency key makes redeliveries no-ops."""
+
+    __tablename__ = "jira_worker_event_log"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance", "idempotency_key", name="uq_jira_worker_event_instance_key"
+        ),
+        Index("ix_jira_worker_event_log_instance_issue", "instance", "issue_key"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False)
+    project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    event_kind: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    webhook_event: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    received_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class JiraWorkerOutbox(Base):
+    """Jira and Switch commands awaiting a sender. Step 1 only creates the table."""
+
+    __tablename__ = "jira_worker_outbox"
+    __table_args__ = (Index("ix_jira_worker_outbox_status", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
+    # jira | switch
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    issue_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    created_at: Mapped[str] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 
