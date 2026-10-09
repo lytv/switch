@@ -39,4 +39,6 @@ def test_the_unauthenticated_allowlist_has_not_grown() -> None:
         "/oauth",
         "/gateway",
         "/deeplink",
+        # Integration routes verify provider secrets instead of agent tokens.
+        "/integrations",
     }

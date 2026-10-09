@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 
 from sqlalchemy import (
     DDL,
@@ -1065,9 +1066,7 @@ class JiraIssueThread(Base):
 
 
 # ── Jira ticket worker (intake only, v1) ─────────────────────────────────────
-# Worker tables are namespaced apart from chat and trigger tables. Step 1 is
-# intake only: webhook/poll events land in the event log, one row per ticket
-# in the ticket map. Jira writes, rooms, and the orchestrator come later.
+# Worker tables are namespaced apart from chat and trigger tables.
 
 
 class JiraWorkerIdentity(Base):
@@ -1120,6 +1119,7 @@ class JiraWorkerTicket(Base):
     wait_channel: Mapped[str] = mapped_column(
         Text, nullable=False, default="jira_comments"
     )
+    worker_parked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Set by a later step when the ticket room exists; null until then.
     room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Transport event id of the ticket card message; null until posted.
@@ -1138,7 +1138,7 @@ class JiraWorkerJob(Base):
 
     ``due_at`` is the timer; the scheduler claims due rows transactionally
     (``pending`` → ``claimed`` in one statement) so a timer never runs twice
-    across restarts or overlaps. Step 1 only runs the watermark poll job."""
+    across restarts or overlaps. Job rows schedule watermark polling."""
 
     __tablename__ = "jira_worker_job_record"
     __table_args__ = (Index("ix_jira_worker_job_record_due", "status", "due_at"),)
@@ -1187,18 +1187,32 @@ class JiraWorkerEvent(Base):
 
 
 class JiraWorkerOutbox(Base):
-    """Jira and Switch commands awaiting a sender. Step 1 only creates the table."""
+    """Durable Jira and Switch commands, including failed and uncertain writes."""
 
     __tablename__ = "jira_worker_outbox"
-    __table_args__ = (Index("ix_jira_worker_outbox_status", "status", "created_at"),)
+    __table_args__ = (
+        Index("ix_jira_worker_outbox_status", "status", "created_at"),
+        UniqueConstraint(
+            "instance", "command_key", name="uq_jira_worker_outbox_command"
+        ),
+        Index("ix_jira_worker_outbox_due", "channel", "status", "due_at"),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     # jira | switch
     channel: Mapped[str] = mapped_column(Text, nullable=False)
     command: Mapped[str] = mapped_column(Text, nullable=False)
     issue_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    command_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # pending | claimed | sending | done | parked | failed | uncertain
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

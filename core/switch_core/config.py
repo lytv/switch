@@ -3,7 +3,7 @@ import ssl
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # A Postgres time value: a bare count of milliseconds, or a count with a unit.
@@ -14,6 +14,19 @@ class JiraWorkerCredentials(BaseModel):
     base_url: str
     email: str
     api_token: str
+
+
+class JiraWorkerStatuses(BaseModel):
+    to_do: str = Field(default="To Do", min_length=1, pattern=r"\S")
+    in_progress: str = Field(default="In Progress", min_length=1, pattern=r"\S")
+    waiting_for_input: str = Field(
+        default="Waiting for input", min_length=1, pattern=r"\S"
+    )
+    waiting_for_approval: str = Field(
+        default="Waiting for approval", min_length=1, pattern=r"\S"
+    )
+    blocked: str = Field(default="BLOCKED", min_length=1, pattern=r"\S")
+    done: str = Field(default="Done", min_length=1, pattern=r"\S")
 
 
 class SwitchConfig(BaseSettings):
@@ -149,8 +162,10 @@ class SwitchConfig(BaseSettings):
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
-    # Read-only Jira REST credentials by instance for the watermark poll.
+    # Jira REST credentials used only by the worker for polling and outbox writes.
     jira_worker_credentials: dict[str, JiraWorkerCredentials] = {}
+    jira_worker_statuses: JiraWorkerStatuses = JiraWorkerStatuses()
+    jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead
