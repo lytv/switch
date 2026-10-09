@@ -412,11 +412,15 @@ async def test_reporter_changed_to_unmapped_clears_owner(
             },
         )
 
-    assert await _intake(session_factory, _event("acct-ada", 1791443000000, "m-1")) is True
+    assert (
+        await _intake(session_factory, _event("acct-ada", 1791443000000, "m-1")) is True
+    )
     room_id = await _sync(session_factory, "KAN-1", rooms, updater)
     assert rooms.rooms[room_id]["owner_id"] == "user-ada"
 
-    assert await _intake(session_factory, _event("acct-bob", 1791443999000, "m-2")) is True
+    assert (
+        await _intake(session_factory, _event("acct-bob", 1791443999000, "m-2")) is True
+    )
     assert await _sync(session_factory, "KAN-1", rooms, updater) == room_id
     assert rooms.rooms[room_id]["owner_id"] is None
     assert "unmapped reporter" in updater.updates[-1]["body"]
@@ -445,7 +449,12 @@ async def test_card_created_once_then_updated_in_place(
     assert "KAN-1" in body and "First ticket" in body and "To Do" in body
     assert "unmapped reporter" in body
     assert "https://jira.example/browse/KAN-1" in body
-    assert provisioner.rooms[(await _ticket(session_factory, "KAN-1")).room_id]["description"] == body
+    assert (
+        provisioner.rooms[(await _ticket(session_factory, "KAN-1")).room_id][
+            "description"
+        ]
+        == body
+    )
     assert len(updater.updates) == 0
 
     assert (
@@ -720,7 +729,9 @@ async def test_adopt_requires_marker_for_this_instance_and_issue(
 ) -> None:
     rooms, updater = FakeRooms(), FakeCards()
     rooms.rooms["person"] = _bare_room()
-    rooms.rooms["beta"] = _bare_room(description="beta ticket", marker=("beta", "KAN-1"))
+    rooms.rooms["beta"] = _bare_room(
+        description="beta ticket", marker=("beta", "KAN-1")
+    )
     rooms._next = 2
     assert await _intake(session_factory, _webhook_event()) is True
     room_id = await _sync(session_factory, "KAN-1", rooms, updater)
@@ -833,7 +844,9 @@ async def test_done_ticket_owner_follows_current_mapping(
             enabled_projects=[PROJECT],
         )
         await session.commit()
-    assert (await _ticket(session_factory, "KAN-1")).reporter_switch_user_id == "user-ada"
+    assert (
+        await _ticket(session_factory, "KAN-1")
+    ).reporter_switch_user_id == "user-ada"
     await _sync(session_factory, "KAN-1", rooms, updater)
     assert rooms.rooms[room_id]["owner_id"] == "user-bob"
     assert "Bob" in updater.updates[-1]["body"]
@@ -849,7 +862,9 @@ async def test_done_ticket_owner_follows_current_mapping(
     await _sync(session_factory, "KAN-1", rooms, updater)
     assert rooms.rooms[room_id]["owner_id"] is None
     assert "unmapped reporter (admins only)" in updater.updates[-1]["body"]
-    assert (await _ticket(session_factory, "KAN-1")).reporter_switch_user_id == "user-ada"
+    assert (
+        await _ticket(session_factory, "KAN-1")
+    ).reporter_switch_user_id == "user-ada"
 
 
 async def _pending_sync_count(session_factory: async_sessionmaker[AsyncSession]) -> int:
@@ -1001,9 +1016,7 @@ async def test_mapping_routes_reconcile_only_enabled_projects(
         )
         await session.commit()
         user_id = user.id
-        config = _switch_config(
-            jira_worker_enabled_projects={INSTANCE: [PROJECT]}
-        )
+        config = _switch_config(jira_worker_enabled_projects={INSTANCE: [PROJECT]})
         await put_worker_identity_mapping(
             "acct-ada",
             JiraWorkerIdentityMappingRequest(switch_user_id=user_id),
@@ -1022,15 +1035,12 @@ async def test_mapping_routes_reconcile_only_enabled_projects(
         rooms.rooms["off-room"] = _bare_room(owner_id=user_id)
         off = (
             await session.execute(
-                text(
-                    "SELECT id FROM jira_worker_ticket_map WHERE issue_key = 'OFF-1'"
-                )
+                text("SELECT id FROM jira_worker_ticket_map WHERE issue_key = 'OFF-1'")
             )
         ).scalar_one()
         await session.execute(
             text(
-                "UPDATE jira_worker_ticket_map SET room_id = 'off-room'"
-                " WHERE id = :id"
+                "UPDATE jira_worker_ticket_map SET room_id = 'off-room' WHERE id = :id"
             ),
             {"id": off},
         )
@@ -1082,7 +1092,9 @@ async def test_find_ticket_room_matches_marker_not_name(
         agent_store=None,  # type: ignore[arg-type]
         config=_switch_config(),
     )
-    assert await finder.find_ticket_room(instance=INSTANCE, issue_key="KAN-1") == acme_id
+    assert (
+        await finder.find_ticket_room(instance=INSTANCE, issue_key="KAN-1") == acme_id
+    )
     async with session_factory() as session:
         session.add(
             JiraWorkerTicket(

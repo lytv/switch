@@ -704,8 +704,10 @@ async def test_polled_issue_enqueues_mapped_reporter_invitation(
 
     async with session_factory() as session:
         commands = (
-            await session.execute(text("SELECT command FROM jira_worker_outbox"))
-        ).scalars().all()
+            (await session.execute(text("SELECT command FROM jira_worker_outbox")))
+            .scalars()
+            .all()
+        )
         assert set(commands) == {"sync_ticket_room", "invite_ticket_reporter"}
 
 

@@ -1136,18 +1136,14 @@ class RoomService:
             room = await self._room_store.get(session, room_id)
         if room is None:
             return
-        await self._invite_missing_member_clients(
-            room, self._resolve_system_clients()
-        )
+        await self._invite_missing_member_clients(room, self._resolve_system_clients())
 
     async def _invite_missing_member_clients(
         self, room: Room, system_clients: dict[str, str]
     ) -> None:
         async with self._session_factory() as session:
             existing = set(await self._room_store.get_client_ids(session, room.id))
-            expected = await self._room_store.get_member_agent_clients(
-                session, room.id
-            )
+            expected = await self._room_store.get_member_agent_clients(session, room.id)
         expected.update(system_clients)
         missing = {cid: uid for cid, uid in expected.items() if cid not in existing}
         if not missing:

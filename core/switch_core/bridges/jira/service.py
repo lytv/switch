@@ -138,7 +138,7 @@ class JiraBridgeService:
         event: NormalizedTriggerEvent,
         webhook_identifier: str | None,
     ) -> None:
-        """Step-1 worker intake: event log + ticket map for enabled projects.
+        """Record worker intake and reconcile its ticket room when enabled.
 
         Returns immediately when the event's project is not enabled, leaving
         the existing bridge behaviour unchanged."""

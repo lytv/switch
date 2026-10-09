@@ -22,7 +22,7 @@ step 7's admin cards.
 from __future__ import annotations
 
 import logging
-from typing import Protocol
+from typing import Protocol, cast
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -33,7 +33,13 @@ from switch_core.bridges.jira.worker import (
     is_terminal_ticket_status,
 )
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerIdentity, JiraWorkerOutbox, JiraWorkerTicket, Room, User
+from switch_core.db.models import (
+    JiraWorkerIdentity,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+    Room,
+    User,
+)
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.room_service import RoomCreateConfig, RoomService
 
@@ -162,16 +168,14 @@ async def _render_card(
         summary=ticket.summary,
         status=ticket.status,
         reporter_label=await _reporter_label(session, rooms, switch_user_id),
-        issue_url=rooms.issue_url(
-            instance=ticket.instance, issue_key=ticket.issue_key
-        ),
+        issue_url=rooms.issue_url(instance=ticket.instance, issue_key=ticket.issue_key),
     )
 
 
 async def _relock_ticket(
     session: AsyncSession, *, instance: str, issue_key: str
 ) -> JiraWorkerTicket | None:
-    return await session.scalar(
+    ticket = await session.scalar(
         select(JiraWorkerTicket)
         .where(
             JiraWorkerTicket.instance == instance,
@@ -180,6 +184,7 @@ async def _relock_ticket(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    return cast(JiraWorkerTicket | None, ticket)
 
 
 async def _mark_ticket_room_sync_done(session: AsyncSession, *, ticket_id: str) -> None:

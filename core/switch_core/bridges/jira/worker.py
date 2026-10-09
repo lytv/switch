@@ -1,8 +1,9 @@
-"""Jira ticket worker, step 1: intake only.
+"""Jira ticket worker: intake, identity mapping, and ticket-room scheduling.
 
 One module inside the Jira bridge (option C). It records webhook and poll
-events into the worker tables and runs the scheduler skeleton. Jira writes,
-rooms, the orchestrator, and the outbox sender are later steps.
+events into the worker tables, resolves reporter identity, schedules ticket
+room reconciliation, and runs the worker scheduler. Jira writes, the intake
+orchestrator, and the outbox sender are later steps.
 
 With no project enabled (the default) the intake hook returns immediately and
 the existing Jira bridge behaves exactly as today.
