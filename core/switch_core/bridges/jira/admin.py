@@ -16,12 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.jira.activity import (
+    EXPLICIT_INPUT,
     is_terminal_ticket_status,
     record_event,
     request_wake,
     ticket_turn_lock,
 )
-from switch_core.bridges.jira.outbox import enqueue_jira_command
+from switch_core.bridges.jira.outbox import enqueue_jira_command, needs_person
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -41,7 +42,7 @@ ADMIN_ROOM_LOCK = "jira-worker-admin-room"
 ADMIN_ROOM_NAME = "Jira admin"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
 INTAKE_REASON = "intake_questions"
-EXPLICIT_INPUT = "explicit_input"
+_WAIT_INPUT_KIND = {"switch": "thread_message", "jira_comments": "jira_comment"}
 _DERIVED = (
     "unmapped_reporter",
     "blocked_writes",
@@ -76,19 +77,6 @@ def card_marker(instance: str, issue_key: str) -> str:
 def _marker_like(marker: str) -> str:
     escaped = marker.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return escaped + "\n%"
-
-
-def needs_person(reason: str | None) -> bool:
-    if not reason:
-        return False
-    text_value = reason.casefold()
-    return (
-        "human jira" in text_value
-        or "unattributed" in text_value
-        or "token limit" in text_value
-        or "unknown" in text_value
-        or "uncertain" in text_value
-    )
 
 
 def add_work_time(
@@ -344,14 +332,19 @@ async def reconcile_admin_cards(
         )
     done = 0
     for ticket_id in ids:
-        if await sync_admin_card(
-            session_factory,
-            engine=engine,
-            board=board,
-            config=config,
-            ticket_id=ticket_id,
-            now=moment,
-        ):
+        try:
+            changed = await sync_admin_card(
+                session_factory,
+                engine=engine,
+                board=board,
+                config=config,
+                ticket_id=ticket_id,
+                now=moment,
+            )
+        except Exception:
+            logger.exception("Jira admin card sync failed for %s", ticket_id)
+            continue
+        if changed:
             done += 1
     return done
 
@@ -447,6 +440,7 @@ async def accept_ignored_input(
         "accepted_from": event.id,
         "accepted_by": admin_user_id,
         "untrusted_data": (event.payload or {}).get("untrusted_data"),
+        "reporter_input": True,
     }
     new_id = await record_event(
         session,
@@ -565,6 +559,40 @@ async def _apply_state(
     ticket.admin_reasons = reasons or None
 
 
+async def _latest_wait_reply(
+    session: AsyncSession,
+    ticket: JiraWorkerTicket,
+    after: datetime,
+) -> datetime | None:
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=UTC)
+    matched = [JiraWorkerEvent.event_kind == EXPLICIT_INPUT]
+    channel_kind = _WAIT_INPUT_KIND.get(ticket.wait_channel)
+    if channel_kind is not None:
+        matched.append(
+            and_(
+                JiraWorkerEvent.event_kind == channel_kind,
+                JiraWorkerEvent.payload["reporter_input"].as_boolean().is_(True),
+            )
+        )
+    found = await session.scalar(
+        select(JiraWorkerEvent.received_at)
+        .where(
+            JiraWorkerEvent.instance == ticket.instance,
+            JiraWorkerEvent.issue_key == ticket.issue_key,
+            JiraWorkerEvent.received_at > after,
+            or_(*matched),
+        )
+        .order_by(JiraWorkerEvent.received_at.desc(), JiraWorkerEvent.id.desc())
+        .limit(1)
+    )
+    if not isinstance(found, datetime):
+        return None
+    if found.tzinfo is None:
+        return found.replace(tzinfo=UTC)
+    return found
+
+
 async def _apply_wait(
     session: AsyncSession,
     ticket: JiraWorkerTicket,
@@ -573,13 +601,23 @@ async def _apply_wait(
     board: AdminBoard,
     reasons: dict[str, str],
 ) -> None:
-    waiting = ticket.status in (
-        config.jira_worker_statuses.waiting_for_input,
-        config.jira_worker_statuses.waiting_for_approval,
+    waiting_for_input = ticket.status == config.jira_worker_statuses.waiting_for_input
+    waiting = waiting_for_input or (
+        ticket.status == config.jira_worker_statuses.waiting_for_approval
     )
     if not waiting or is_terminal_ticket_status(ticket.status):
         ticket.wait_anchor = None
         ticket.wait_fired = None
+        return
+    if waiting_for_input and ticket.wait_anchor is not None:
+        replied_at = await _latest_wait_reply(session, ticket, ticket.wait_anchor)
+        if replied_at is not None:
+            ticket.wait_anchor = replied_at
+            ticket.wait_fired = {}
+    if ticket.worker_parked_reason:
+        if ticket.wait_anchor is None:
+            ticket.wait_anchor = now
+            ticket.wait_fired = {}
         return
     if ticket.wait_anchor is None:
         ticket.wait_anchor = now

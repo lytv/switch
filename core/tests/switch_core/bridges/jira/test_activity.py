@@ -1293,6 +1293,47 @@ async def test_switch_channel_reporter_edit_does_not_wake(session_factory) -> No
     assert [e.event_kind for e in await events(session_factory)] == ["ignored_input"]
 
 
+async def test_accepted_input_wakes_a_live_turn(session_factory) -> None:
+    key = await seed(session_factory)
+    rooms, jira = ThreadRooms(), JiraMock()
+    rooms.messages = [message(1)]
+    reader = activity(session_factory, jira, rooms)
+    turns: list[TicketTurn] = []
+    inserted = False
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        nonlocal inserted
+        turns.append(turn)
+        if not inserted:
+            inserted = True
+            async with session_factory() as session:
+                session.add(
+                    JiraWorkerEvent(
+                        instance="acme",
+                        idempotency_key="accept:live",
+                        issue_key="KAN-1",
+                        project_key="KAN",
+                        event_kind="explicit_input",
+                        payload={
+                            "reporter_input": True,
+                            "untrusted_data": {"body": "use this answer"},
+                        },
+                    )
+                )
+                await session.commit()
+        return TurnResult(1, None)
+
+    assert await reader.run_one_turn(fake) == key
+    assert (await ticket(session_factory, key)).agent_state == "wake_requested"
+    assert await reader.run_one_turn(fake) == key
+    bodies = [
+        item.get("untrusted_data", {}).get("body")
+        for item in turns[1].untrusted_data["events"]
+        if isinstance(item, dict)
+    ]
+    assert "use this answer" in bodies
+
+
 async def test_claimed_turn_excludes_raw_intake_events(session_factory) -> None:
     key = await seed(session_factory)
     rooms, jira = ThreadRooms(), JiraMock()

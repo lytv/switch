@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from switch_core.bridges.jira import routes as jira_webhook_routes
+from switch_core.bridges.jira.admin import accept_ignored_input
 from switch_core.bridges.jira.matching import explain_match
 from switch_core.bridges.jira.parse import (
     JiraPayloadError,
@@ -32,6 +33,7 @@ from switch_core.config import SwitchConfig
 from switch_core.db.models import (
     Agent,
     JiraTrigger,
+    JiraWorkerEvent,
     JiraWorkerIdentity,
     JiraWorkerTicket,
     Room,
@@ -66,6 +68,7 @@ from switch_core.gateway.schemas import (
     JiraTriggerCreateRequest,
     JiraTriggerDetail,
     JiraTriggerUpdateRequest,
+    JiraWorkerAcceptedInputResponse,
     JiraWorkerIdentityMappingRequest,
     JiraWorkerIdentityMappingResponse,
     RevealKeyResponse,
@@ -659,6 +662,43 @@ async def delete_worker_identity_mapping(
         config=config,
     )
     return Response(status_code=204)
+
+
+@router.post("/worker/inputs/{event_id}/accept")
+async def accept_worker_ignored_input(
+    event_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    admin: Annotated[User, Depends(require_admin)],
+) -> JiraWorkerAcceptedInputResponse:
+    event_id = event_id.strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+    try:
+        new_id = await accept_ignored_input(
+            session,
+            event_id=event_id,
+            admin_user_id=admin.id,
+            enabled_projects=config.jira_worker_enabled_projects,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await session.commit()
+    stored = await session.get(JiraWorkerEvent, new_id)
+    if stored is None:
+        raise HTTPException(
+            status_code=500, detail="accepted input event was not stored"
+        )
+    return JiraWorkerAcceptedInputResponse(
+        id=stored.id,
+        instance=stored.instance,
+        issue_key=stored.issue_key,
+        project_key=stored.project_key,
+        event_kind=stored.event_kind,
+        payload=stored.payload,
+    )
 
 
 @router.get("/{trigger_id}")

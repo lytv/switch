@@ -1138,6 +1138,15 @@ class JiraWorkerIdentityMappingResponse(BaseModel):
     updated_ticket_count: int = 0
 
 
+class JiraWorkerAcceptedInputResponse(BaseModel):
+    id: str
+    instance: str
+    issue_key: str
+    project_key: str
+    event_kind: str
+    payload: dict[str, Any] | None = None
+
+
 class JiraRoomDeliveryResult(BaseModel):
     room_id: str
     room_name: str | None = None

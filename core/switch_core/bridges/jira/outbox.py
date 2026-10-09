@@ -146,7 +146,7 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
         "fields"
     ]["updated"]
     if _stamp(before) != _stamp(updated):
-        raise HumanChange("Issue changed while the version check read its history")
+        raise HumanChange(ISSUE_CHANGED_DURING_READ)
     histories.sort(key=lambda item: (_stamp(item["created"]), int(item["id"])))
     return {
         "updated": updated,
@@ -158,6 +158,35 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
 
 class HumanChange(Exception):
     """A non-worker or unattributed change must park the ticket."""
+
+
+HUMAN_JIRA_ACTION = "Human Jira action"
+UNATTRIBUTED_JIRA_ACTION = "Unattributed Jira action"
+TOKEN_LIMIT = "Ticket token limit"
+ISSUE_CHANGED_DURING_READ = "Issue changed while the version check read its history"
+STAMP_MISMATCH = "Jira updated stamp has no attributable worker change"
+NON_WORKER_SUPERSEDED = "A non-worker Jira action superseded the command"
+INTERRUPTED_TURN = "Interrupted orchestrator turn; outcome and token usage unknown"
+TURN_FAILED = "Orchestrator turn failed; outcome and token usage unknown"
+UNCERTAIN_REPLAY = "automatic replay is unsafe"
+_PERSON_REASONS = frozenset(
+    {
+        HUMAN_JIRA_ACTION,
+        UNATTRIBUTED_JIRA_ACTION,
+        TOKEN_LIMIT,
+        ISSUE_CHANGED_DURING_READ,
+        STAMP_MISMATCH,
+        NON_WORKER_SUPERSEDED,
+        INTERRUPTED_TURN,
+        TURN_FAILED,
+    }
+)
+
+
+def needs_person(reason: str | None) -> bool:
+    if not reason:
+        return False
+    return reason in _PERSON_REASONS or UNCERTAIN_REPLAY in reason
 
 
 def check_jira_version(
@@ -183,8 +212,8 @@ def check_jira_version(
     if observation.park == "regressed":
         raise HumanChange("Jira version is older than the command baseline")
     if observation.park == "stamp_mismatch":
-        raise HumanChange("Jira updated stamp has no attributable worker change")
-    raise HumanChange("A non-worker Jira action superseded the command")
+        raise HumanChange(STAMP_MISMATCH)
+    raise HumanChange(NON_WORKER_SUPERSEDED)
 
 
 def park_ticket(ticket: JiraWorkerTicket, reason: str) -> None:
@@ -326,7 +355,9 @@ class JiraOutboxSender:
             return
         if row.status == "sending":
             row.status = "uncertain"
-            row.error = "Restart found a write with an unknown outcome; automatic replay is unsafe"
+            row.error = (
+                f"Restart found a write with an unknown outcome; {UNCERTAIN_REPLAY}"
+            )
             park_ticket(ticket, row.error)
             await session.commit()
             return
@@ -431,7 +462,7 @@ class JiraOutboxSender:
                 )
             ):
                 row.status = "uncertain"
-                row.error = f"{type(exc).__name__}: Jira write outcome is unknown; automatic replay is unsafe"
+                row.error = f"{type(exc).__name__}: Jira write outcome is unknown; {UNCERTAIN_REPLAY}"
                 park_ticket(ticket, row.error)
             else:
                 transient = isinstance(exc, httpx.TransportError) or (

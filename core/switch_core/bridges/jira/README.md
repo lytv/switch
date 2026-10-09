@@ -88,7 +88,8 @@ Wait timers count work hours on `JIRA_WORKER_CALENDAR` (default Monday-Friday
 ticket wait channel. The admin alert is 4 work hours. Blocked is 8 work hours,
 one default work day. A disabled project is left unchanged.
 
-An admin may accept a stored `ignored_input` event. That writes a new
+An admin accepts a stored `ignored_input` event with
+`POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new
 `explicit_input` event. The old event is not rewritten.
 
 No UI is part of this boundary.
