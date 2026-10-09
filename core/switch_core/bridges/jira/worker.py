@@ -19,15 +19,20 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from sqlalchemy import and_, func, or_, select, true, update
+from sqlalchemy import and_, case, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.activity import (
+    TicketActivity,
+    is_terminal_ticket_status,
+    park_ticket,
+    record_event,
+)
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import (
-    JiraWorkerEvent,
     JiraWorkerIdentity,
     JiraWorkerJob,
     JiraWorkerOutbox,
@@ -45,11 +50,6 @@ JIRA_COMMENTS_WAIT_CHANNEL = "jira_comments"
 SYNC_TICKET_ROOM_COMMAND = "sync_ticket_room"
 
 _TERMINAL_TICKET_STATUSES = ("done", "cancelled", "canceled")
-
-
-def is_terminal_ticket_status(status: str) -> bool:
-    """Whether a Jira status ends the v1 ticket flow (Done, or cancelled)."""
-    return status.strip().casefold() in _TERMINAL_TICKET_STATUSES
 
 
 SleepFn = Callable[[float], Awaitable[None]]
@@ -334,38 +334,6 @@ def jira_updated_at(payload: dict[str, Any]) -> datetime:
     return datetime.now(UTC)
 
 
-async def record_event(
-    session: AsyncSession,
-    *,
-    instance: str,
-    idempotency_key: str,
-    issue_key: str,
-    project_key: str,
-    event_kind: str,
-    webhook_event: str,
-    payload: dict[str, Any] | None,
-) -> str | None:
-    """Insert an event row; return its id, or None when the key already exists."""
-    stmt = (
-        insert(JiraWorkerEvent)
-        .values(
-            id=str(uuid.uuid4()),
-            instance=instance,
-            idempotency_key=idempotency_key,
-            issue_key=issue_key,
-            project_key=project_key,
-            event_kind=event_kind,
-            webhook_event=webhook_event,
-            payload=payload,
-        )
-        .on_conflict_do_nothing(index_elements=["instance", "idempotency_key"])
-        .returning(JiraWorkerEvent.id)
-    )
-    result = await session.execute(stmt)
-    await session.flush()
-    return result.scalar_one_or_none()
-
-
 async def upsert_ticket(
     session: AsyncSession,
     *,
@@ -392,6 +360,7 @@ async def upsert_ticket(
         reporter_switch_user_id=reporter_switch_user_id,
         wait_channel=wait_channel,
         last_event_at=updated_at,
+        jira_read_updated=updated_at.isoformat(),
     )
     result = await session.execute(
         stmt.on_conflict_do_nothing(index_elements=["instance", "issue_key"]).returning(
@@ -400,6 +369,8 @@ async def upsert_ticket(
     )
     ticket = result.scalar_one_or_none()
     if ticket is not None:
+        if is_terminal_ticket_status(ticket.status):
+            park_ticket(ticket, "Jira ticket completed or cancelled")
         await session.flush()
         await _enqueue_room_sync(session, ticket)
         return ticket, True, False
@@ -420,15 +391,24 @@ async def upsert_ticket(
         reporter_account_id = ticket.reporter_account_id
         reporter_switch_user_id = ticket.reporter_switch_user_id
         wait_channel = ticket.wait_channel
+    if (
+        ticket.reporter_account_id == reporter_account_id
+        and ticket.reporter_switch_user_id == reporter_switch_user_id
+    ):
+        wait_channel = ticket.wait_channel
     reporter_resolution_changed = (
         ticket.reporter_account_id != reporter_account_id
         or ticket.reporter_switch_user_id != reporter_switch_user_id
         or ticket.wait_channel != wait_channel
     )
+    if ticket.jira_read_updated is None:
+        ticket.jira_read_updated = ticket.last_event_at.isoformat()
     ticket.issue_id = issue_id
     ticket.project_key = project_key
     ticket.summary = summary
     ticket.status = status
+    if is_terminal_ticket_status(status):
+        park_ticket(ticket, "Jira ticket completed or cancelled")
     ticket.reporter_account_id = reporter_account_id
     ticket.reporter_switch_user_id = reporter_switch_user_id
     ticket.wait_channel = wait_channel
@@ -898,6 +878,13 @@ class JiraWorkerScheduler:
         )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
+        self.activity = TicketActivity(
+            session_factory=session_factory,
+            config=config,
+            clients=self._poll_clients,
+            rooms=ticket_rooms,
+            clock=self._clock,
+        )
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -964,6 +951,7 @@ class JiraWorkerScheduler:
             await session.commit()
         await self._outbox.run_once()
         await self.sweep_ticket_rooms()
+        await self.activity.read_once()
         for job in jobs:
             try:
                 await self._handle_job(job)
@@ -989,7 +977,7 @@ class JiraWorkerScheduler:
         if self._ticket_rooms is None:
             return 0
         projects = self._config.jira_worker_enabled_projects
-        if not projects:
+        if not any(projects.values()):
             return 0
         from switch_core.bridges.jira.rooms import sync_ticket_room
 
@@ -1018,11 +1006,38 @@ class JiraWorkerScheduler:
                     or_(
                         JiraWorkerTicket.room_id.is_(None),
                         JiraWorkerTicket.card_event_id.is_(None),
+                        and_(
+                            JiraWorkerTicket.room_claimed.is_(False),
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
+                        ),
+                        and_(
+                            JiraWorkerTicket.room_claimed.is_(True),
+                            func.lower(func.trim(JiraWorkerTicket.status)).in_(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
+                        ),
                         JiraWorkerTicket.id.in_(pending_follow_ups),
                     ),
                     scope,
                 )
-                .order_by(JiraWorkerTicket.last_event_at.asc())
+                .order_by(
+                    case(
+                        (
+                            and_(
+                                JiraWorkerTicket.room_claimed.is_(True),
+                                func.lower(func.trim(JiraWorkerTicket.status)).in_(
+                                    _TERMINAL_TICKET_STATUSES
+                                ),
+                            ),
+                            0,
+                        ),
+                        else_=1,
+                    ),
+                    JiraWorkerTicket.first_seen_at.asc(),
+                    JiraWorkerTicket.id,
+                )
                 .limit(max(1, limit))
             )
             pending = list((await session.execute(stmt)).all())
@@ -1048,6 +1063,8 @@ class JiraWorkerScheduler:
                 rooms=self._ticket_rooms,
                 jira_agent_name=self._config.jira_agent_name,
                 cards=self._card_updater,
+                config=self._config,
+                now=self._clock(),
             ):
                 done += 1
         return done
@@ -1097,6 +1114,8 @@ class JiraWorkerScheduler:
                         rooms=self._ticket_rooms,
                         jira_agent_name=self._config.jira_agent_name,
                         cards=self._card_updater,
+                        config=self._config,
+                        now=self._clock(),
                     )
             stamps = [
                 str(issue.get("fields", {}).get("updated") or "")

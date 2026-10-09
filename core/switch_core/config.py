@@ -29,6 +29,13 @@ class JiraWorkerStatuses(BaseModel):
     done: str = Field(default="Done", min_length=1, pattern=r"\S")
 
 
+class JiraWorkerLimits(BaseModel):
+    open_rooms: int = Field(default=50, ge=1)
+    live_sessions: int = Field(default=5, ge=1)
+    room_creates_per_hour: int = Field(default=20, ge=1)
+    tokens_per_ticket: int = Field(default=50_000, ge=1)
+
+
 class SwitchConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="")
 
@@ -165,6 +172,7 @@ class SwitchConfig(BaseSettings):
     # Jira REST credentials used only by the worker for polling and outbox writes.
     jira_worker_credentials: dict[str, JiraWorkerCredentials] = {}
     jira_worker_statuses: JiraWorkerStatuses = JiraWorkerStatuses()
+    jira_worker_limits: JiraWorkerLimits = JiraWorkerLimits()
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
 
     # Upper bound on a single attachment an agent may post to a room (and that

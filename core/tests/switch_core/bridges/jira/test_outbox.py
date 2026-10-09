@@ -45,6 +45,7 @@ class JiraMock:
         self.pre_send_server_errors = 0
         self.unavailable_transition = False
         self.read_failure = False
+        self.fail_issue_keys: set[str] = set()
         self.read_change = False
         self.write_started: asyncio.Event | None = None
         self.write_release: asyncio.Event | None = None
@@ -80,7 +81,10 @@ class JiraMock:
             if self.pre_send_server_errors:
                 self.pre_send_server_errors -= 1
                 return httpx.Response(500, json={"errorMessages": ["unavailable"]})
-            if self.read_failure:
+            if self.read_failure or any(
+                path.endswith(f"/issue/{key}") or f"/issue/{key}/" in path
+                for key in self.fail_issue_keys
+            ):
                 raise httpx.ConnectError("mock read unavailable", request=request)
             if path.endswith("/myself"):
                 return httpx.Response(200, json={"accountId": "worker-account"})
@@ -719,8 +723,242 @@ async def test_unverifiable_changes_park(scenario: str) -> None:
         check_jira_version(version, payload, "worker-account")
 
 
+async def test_comment_from_the_first_read_does_not_block_a_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    await enqueue(session_factory)
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+async def test_new_same_stamp_human_comment_blocks_the_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    await enqueue(session_factory)
+    jira.comments.append(
+        {
+            "id": "2",
+            "author": {"accountId": "human-account"},
+            "updateAuthor": {"accountId": "human-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await sender_for(session_factory, jira).run_once()
+    assert not jira.writes
+    row = (await rows(session_factory))[0]
+    assert row.status == "parked" and row.error
+    assert "non-worker" in row.error
+    parked = await ticket(session_factory, key)
+    assert parked.worker_parked_reason == row.error
+
+
 def test_invalid_config_fails_before_sending() -> None:
     with pytest.raises(ValueError):
         JiraWorkerStatuses(blocked=" ")
     with pytest.raises(ValueError):
         _config(jira_worker_write_backoff_seconds=-1)
+
+
+async def test_later_stamp_reporter_comment_does_not_block_a_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    await enqueue(session_factory)
+    jira.change("reporter-account", comment=True)
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+async def test_same_stamp_reporter_comment_does_not_block_a_jira_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    await activity(session_factory, jira, ThreadRooms()).read_once()
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+    await enqueue(session_factory)
+    jira.comments.append(
+        {
+            "id": "1",
+            "author": {"accountId": "reporter-account"},
+            "updateAuthor": {"accountId": "reporter-account"},
+            "created": BASE,
+            "updated": BASE,
+        }
+    )
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+def _outbox_stamp(seconds: int) -> str:
+    return (datetime.fromisoformat(BASE) + timedelta(seconds=seconds)).isoformat()
+
+
+async def test_mixed_worker_comment_and_reporter_edit_writes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        _same_stamp_comment,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    await activity(session_factory, jira, ThreadRooms()).read_ticket(
+        key, force_jira=True
+    )
+    await enqueue(session_factory)
+    second = _outbox_stamp(10)
+    third = _outbox_stamp(20)
+    jira.comments.append(
+        {
+            "id": "2",
+            "author": {"accountId": "worker-account"},
+            "updateAuthor": {"accountId": "worker-account"},
+            "created": second,
+            "updated": second,
+        }
+    )
+    jira.comments[0]["updated"] = third
+    jira.updated = third
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+async def test_mixed_worker_history_and_reporter_edit_writes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        _same_stamp_comment,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    await activity(session_factory, jira, ThreadRooms()).read_ticket(
+        key, force_jira=True
+    )
+    await enqueue(session_factory)
+    second = _outbox_stamp(10)
+    third = _outbox_stamp(20)
+    jira.histories.append(
+        {"id": "1", "author": {"accountId": "worker-account"}, "created": second}
+    )
+    jira.comments[0]["updated"] = third
+    jira.updated = third
+    await sender_for(session_factory, jira).run_once()
+    assert len(jira.writes) == 1
+    assert (await rows(session_factory))[0].status == "done"
+    assert (await ticket(session_factory, key)).worker_parked_reason is None
+
+
+async def test_mixed_worker_comment_and_other_edit_parks_write(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from tests.switch_core.bridges.jira.test_activity import (
+        ThreadRooms,
+        _same_stamp_comment,
+        activity,
+        seed,
+        ticket,
+    )
+
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    await activity(session_factory, jira, ThreadRooms()).read_ticket(
+        key, force_jira=True
+    )
+    await enqueue(session_factory)
+    second = _outbox_stamp(10)
+    third = _outbox_stamp(20)
+    jira.comments.append(
+        {
+            "id": "2",
+            "author": {"accountId": "worker-account"},
+            "updateAuthor": {"accountId": "worker-account"},
+            "created": second,
+            "updated": second,
+        }
+    )
+    jira.comments[0]["updated"] = third
+    jira.comments[0]["updateAuthor"] = {"accountId": "human-account"}
+    jira.updated = third
+    await sender_for(session_factory, jira).run_once()
+    assert not jira.writes
+    row = (await rows(session_factory))[0]
+    assert row.status == "parked" and row.error
+    assert (await ticket(session_factory, key)).worker_parked_reason == row.error

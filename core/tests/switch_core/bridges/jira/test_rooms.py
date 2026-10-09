@@ -56,6 +56,7 @@ class FakeRooms:
         self.fail_post_once = False
         self.fail_archive_once = False
         self.fail_owner_once = False
+        self.worker_senders: set[str] = set()
         self._next = 0
 
     async def create_ticket_room(
@@ -136,6 +137,9 @@ class FakeRooms:
 
     def issue_url(self, *, instance: str, issue_key: str) -> str:
         return f"https://jira.example/browse/{issue_key}"
+
+    async def is_worker_sender(self, sender: str) -> bool:
+        return sender in self.worker_senders
 
 
 class FakeCards:

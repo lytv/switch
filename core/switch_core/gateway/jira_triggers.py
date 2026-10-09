@@ -536,6 +536,7 @@ async def _reconcile_enabled_reporter_rooms(
     rooms: SwitchTicketRooms | None,
     jira_agent_name: str,
     cards: SwitchCardUpdater | None,
+    config: SwitchConfig,
 ) -> None:
     """Converge ticket rooms for this reporter in projects that are on.
 
@@ -559,6 +560,7 @@ async def _reconcile_enabled_reporter_rooms(
             rooms=rooms,
             jira_agent_name=jira_agent_name,
             cards=cards,
+            config=config,
         )
 
 
@@ -607,6 +609,7 @@ async def put_worker_identity_mapping(
         rooms=ticket_rooms,
         jira_agent_name=config.jira_agent_name,
         cards=card_updater,
+        config=config,
     )
     return _identity_mapping_response(
         mapping, updated_ticket_count=updated_ticket_count
@@ -653,6 +656,7 @@ async def delete_worker_identity_mapping(
         rooms=ticket_rooms,
         jira_agent_name=config.jira_agent_name,
         cards=card_updater,
+        config=config,
     )
     return Response(status_code=204)
 

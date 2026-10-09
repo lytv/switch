@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
@@ -20,6 +20,7 @@ from sqlalchemy import and_, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
@@ -28,13 +29,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
-
-
-def _stamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        raise ValueError("Jira updated stamp must include a timezone")
-    return parsed
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -64,6 +58,7 @@ async def enqueue_jira_command(
     data: Any,
     based_updated: str,
     based_changelog_id: str,
+    based_comment_ids: list[str] | None = None,
 ) -> str | None:
     """Enqueue once per instance/key, in the caller's transaction."""
     if ticket.project_key not in config.jira_worker_enabled_projects.get(
@@ -74,10 +69,14 @@ async def enqueue_jira_command(
         raise ValueError("Jira command key is required")
     _validate_command(command, data)
     _stamp(based_updated)
+    if based_comment_ids is None:
+        based_comment_ids = sorted(set(ticket.jira_seen_comment_ids or []))
     payload = {
         "data": data,
         "based_updated": based_updated,
         "based_changelog_id": based_changelog_id,
+        "based_comment_ids": based_comment_ids,
+        "reporter_account_id": ticket.reporter_account_id,
     }
     result = await session.execute(
         insert(JiraWorkerOutbox)
@@ -163,39 +162,35 @@ class HumanChange(Exception):
 def check_jira_version(
     version: dict[str, Any], payload: dict[str, Any], account_id: str
 ) -> None:
-    base = _stamp(payload["based_updated"])
-    current = _stamp(version["updated"])
-    base_id = payload["based_changelog_id"]
-    if current == base and version["changelog_id"] == base_id:
+    reporter = payload.get("reporter_account_id")
+    if not isinstance(reporter, str):
+        reporter = ""
+    known = payload.get("based_comment_ids")
+    seen = {str(item) for item in known} if isinstance(known, list) else set()
+    observation = observe_jira(
+        version,
+        seen_ids=seen,
+        changelog_id=payload["based_changelog_id"],
+        base_stamp=_stamp(payload["based_updated"]),
+        worker_account=account_id,
+        reporter_account=reporter,
+    )
+    if observation.park is None:
         return
-    if current < base:
+    if observation.park == "changelog_missing":
+        raise HumanChange("The command's changelog baseline is missing")
+    if observation.park == "regressed":
         raise HumanChange("Jira version is older than the command baseline")
-    histories = version["histories"]
-    if base_id:
-        index = next(
-            (i for i, entry in enumerate(histories) if str(entry["id"]) == base_id),
-            None,
-        )
-        if index is None:
-            raise HumanChange("The command's changelog baseline is missing")
-        histories = histories[index + 1 :]
-    changes: list[tuple[datetime, str]] = [
-        (_stamp(entry["created"]), entry.get("author", {}).get("accountId", ""))
-        for entry in histories
-    ]
-    for comment in version["comments"]:
-        created = _stamp(comment["created"])
-        edited = _stamp(comment["updated"])
-        if created > base:
-            changes.append((created, comment.get("author", {}).get("accountId", "")))
-        if edited > base:
-            changes.append(
-                (edited, comment.get("updateAuthor", {}).get("accountId", ""))
-            )
-    if not changes or any(author != account_id for _, author in changes):
-        raise HumanChange("A non-worker Jira action superseded the command")
-    if max(stamp for stamp, _ in changes) != current:
+    if observation.park == "stamp_mismatch":
         raise HumanChange("Jira updated stamp has no attributable worker change")
+    raise HumanChange("A non-worker Jira action superseded the command")
+
+
+def park_ticket(ticket: JiraWorkerTicket, reason: str) -> None:
+    ticket.agent_state = "parked"
+    ticket.agent_generation += 1
+    ticket.wake_at = None
+    ticket.worker_parked_reason = reason
 
 
 def _failure_reason(command_id: str) -> str:
@@ -316,7 +311,7 @@ class JiraOutboxSender:
         if row.status == "sending":
             row.status = "uncertain"
             row.error = "Restart found a write with an unknown outcome; automatic replay is unsafe"
-            ticket.worker_parked_reason = row.error
+            park_ticket(ticket, row.error)
             await session.commit()
             return
         payload = row.payload or {}
@@ -365,6 +360,7 @@ class JiraOutboxSender:
                 if not isinstance(account_id, str) or not account_id:
                     raise ValueError("Jira worker accountId is required")
                 self._accounts[row.instance] = account_id
+            ticket.jira_worker_account_id = account_id
             path = f"/rest/api/3/issue/{quote(row.issue_key, safe='')}"
             method = "POST"
             if row.command == "transition":
@@ -409,7 +405,7 @@ class JiraOutboxSender:
         except HumanChange as exc:
             row.status = "parked"
             row.error = str(exc)
-            ticket.worker_parked_reason = str(exc)
+            park_ticket(ticket, str(exc))
         except Exception as exc:
             if sending and (
                 isinstance(exc, httpx.TransportError)
@@ -420,7 +416,7 @@ class JiraOutboxSender:
             ):
                 row.status = "uncertain"
                 row.error = f"{type(exc).__name__}: Jira write outcome is unknown; automatic replay is unsafe"
-                ticket.worker_parked_reason = row.error
+                park_ticket(ticket, row.error)
             else:
                 transient = isinstance(exc, httpx.TransportError) or (
                     isinstance(exc, httpx.HTTPStatusError)
@@ -445,7 +441,7 @@ class JiraOutboxSender:
                 else:
                     row.status = "failed"
                     if not payload.get("failure_of"):
-                        ticket.worker_parked_reason = _failure_reason(row.id)
+                        park_ticket(ticket, _failure_reason(row.id))
                     if (
                         not payload.get("failure_of")
                         and payload.get("based_updated")
@@ -479,6 +475,11 @@ class JiraOutboxSender:
                 data=data,
                 based_updated=payload["based_updated"],
                 based_changelog_id=payload["based_changelog_id"],
+                based_comment_ids=(
+                    payload["based_comment_ids"]
+                    if isinstance(payload.get("based_comment_ids"), list)
+                    else None
+                ),
             )
             child = await session.get(JiraWorkerOutbox, command_id)
             assert child is not None
