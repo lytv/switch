@@ -41,6 +41,8 @@ class JiraMock:
         self.failures = 0
         self.timeout_after_write = False
         self.crash_after_write = False
+        self.server_error_after_write = False
+        self.pre_send_server_errors = 0
         self.unavailable_transition = False
         self.read_failure = False
         self.read_change = False
@@ -75,6 +77,9 @@ class JiraMock:
         self.requests.append(request)
         path = request.url.path
         if request.method == "GET":
+            if self.pre_send_server_errors:
+                self.pre_send_server_errors -= 1
+                return httpx.Response(500, json={"errorMessages": ["unavailable"]})
             if self.read_failure:
                 raise httpx.ConnectError("mock read unavailable", request=request)
             if path.endswith("/myself"):
@@ -144,6 +149,8 @@ class JiraMock:
             raise asyncio.CancelledError()
         if self.timeout_after_write:
             raise httpx.ReadTimeout("mock lost response", request=request)
+        if self.server_error_after_write:
+            return httpx.Response(500, json={"errorMessages": ["applied but failed"]})
         return httpx.Response(201 if path.endswith("/comment") else 204)
 
 
@@ -414,6 +421,52 @@ async def test_human_change_during_retry_prevents_blocked_write(
     )
 
 
+@pytest.mark.parametrize(
+    ("command", "data"),
+    [("comment", "Intake summary"), ("transition", "In Progress")],
+)
+async def test_applied_write_http_500_stays_uncertain_across_restart(
+    session_factory: async_sessionmaker[AsyncSession], command: str, data: str
+) -> None:
+    jira = JiraMock()
+    jira.server_error_after_write = True
+    await enqueue(session_factory, command=command, data=data)
+    now = datetime.now(UTC) + timedelta(seconds=1)
+
+    def clock() -> datetime:
+        return now
+
+    def make_sender() -> JiraOutboxSender:
+        return JiraOutboxSender(
+            session_factory=session_factory,
+            config=_config(
+                jira_worker_enabled_projects={"acme": ["KAN"]},
+                jira_worker_write_backoff_seconds=5,
+            ),
+            clients={"acme": client_for(jira)},
+            clock=clock,
+        )
+
+    await make_sender().run_once()
+    row = (await rows(session_factory))[0]
+    assert row.status == "uncertain" and row.attempts == 1
+    assert row.error and "outcome is unknown" in row.error
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert ticket is not None and ticket.worker_parked_reason == row.error
+    now += timedelta(days=2)
+    await make_sender().run_once()
+    stored = await rows(session_factory)
+    assert [item.status for item in stored] == ["uncertain"]
+    assert stored[0].attempts == 1 and len(jira.writes) == 1
+    assert jira.status != "BLOCKED" and len(jira.comments) == (1 if command == "comment" else 0)
+    if command == "transition":
+        assert jira.status == "In Progress"
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert ticket is not None and ticket.worker_parked_reason == stored[0].error
+
+
 async def test_unknown_timeout_is_visible_and_never_replayed(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -551,6 +604,41 @@ async def test_outbox_migration_retains_switch_rows(mig_url: str) -> None:
             ).scalar_one() == "switch"
     finally:
         await engine.dispose()
+
+
+async def test_pre_send_server_error_retries_with_backoff(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    jira = JiraMock()
+    jira.pre_send_server_errors = 1
+    await enqueue(session_factory)
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=_config(
+            jira_worker_enabled_projects={"acme": ["KAN"]},
+            jira_worker_write_backoff_seconds=5,
+        ),
+        clients={"acme": client_for(jira)},
+        clock=lambda: now,
+    )
+    await sender.run_once()
+    row = (await rows(session_factory))[0]
+    assert (
+        row.attempts == 1
+        and row.status == "pending"
+        and row.due_at == now + timedelta(seconds=5)
+    )
+    assert not jira.writes
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert ticket is not None and ticket.worker_parked_reason is None
+    now += timedelta(seconds=5)
+    await sender.run_once()
+    done = (await rows(session_factory))[0]
+    assert done.status == "done" and done.attempts == 2
+    assert len(jira.writes) == 1 and len(jira.comments) == 1
+    assert len(await rows(session_factory)) == 1
 
 
 async def test_retry_after_read_failure_sends_once(

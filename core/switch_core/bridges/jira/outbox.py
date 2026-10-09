@@ -411,7 +411,13 @@ class JiraOutboxSender:
             row.error = str(exc)
             ticket.worker_parked_reason = str(exc)
         except Exception as exc:
-            if sending and isinstance(exc, httpx.TransportError):
+            if sending and (
+                isinstance(exc, httpx.TransportError)
+                or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code >= 500
+                )
+            ):
                 row.status = "uncertain"
                 row.error = f"{type(exc).__name__}: Jira write outcome is unknown; automatic replay is unsafe"
                 ticket.worker_parked_reason = row.error
