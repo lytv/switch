@@ -1100,6 +1100,11 @@ class JiraWorkerTicket(Base):
             "instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"
         ),
         Index("ix_jira_worker_ticket_map_instance_project", "instance", "project_key"),
+        Index(
+            "ix_jira_worker_ticket_map_instance_reporter",
+            "instance",
+            "reporter_account_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)

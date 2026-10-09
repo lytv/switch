@@ -201,7 +201,6 @@ async def set_identity_mapping(
         .with_for_update()
     )
     mapping = result.scalar_one_or_none()
-    changed = mapping is None or mapping.switch_user_id != switch_user_id
     if mapping is None:
         mapping = JiraWorkerIdentity(
             instance=instance,
@@ -212,15 +211,13 @@ async def set_identity_mapping(
     else:
         mapping.switch_user_id = switch_user_id
     await session.flush()
-    updated_tickets = 0
-    if changed:
-        updated_tickets = await _set_open_ticket_reporter_resolution(
-            session,
-            instance=instance,
-            jira_account_id=jira_account_id,
-            switch_user_id=switch_user_id,
-            enabled_projects=enabled_projects,
-        )
+    updated_tickets = await _set_open_ticket_reporter_resolution(
+        session,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        switch_user_id=switch_user_id,
+        enabled_projects=enabled_projects,
+    )
     return mapping, updated_tickets
 
 
