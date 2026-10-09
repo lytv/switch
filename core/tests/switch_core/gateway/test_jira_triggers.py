@@ -20,11 +20,14 @@ from switch_core.gateway.auth import require_admin
 from switch_core.gateway.jira_triggers import (
     create_trigger,
     delete_trigger,
+    delete_worker_identity_mapping,
     dry_run_trigger,
     get_setup,
     list_deliveries,
     list_triggers,
+    list_worker_identity_mappings,
     patch_trigger,
+    put_worker_identity_mapping,
     reveal_instance_secret,
     rotate_instance_secret,
     router,
@@ -33,6 +36,7 @@ from switch_core.gateway.schemas import (
     JiraDryRunRequest,
     JiraTriggerCreateRequest,
     JiraTriggerUpdateRequest,
+    JiraWorkerIdentityMappingRequest,
 )
 
 _TRIGGER_STORE = JiraTriggerStore()
@@ -123,6 +127,77 @@ def test_write_routes_require_admin() -> None:
         and require_admin not in _calls(route.dependant)  # type: ignore[attr-defined]
     ]
     assert unguarded == [], f"jira-trigger writes missing require_admin: {unguarded}"
+
+
+def test_worker_identity_routes_require_admin() -> None:
+    def calls(dependant: object) -> list[object]:
+        out = [dependant.call]  # type: ignore[attr-defined]
+        for sub in dependant.dependencies:  # type: ignore[attr-defined]
+            out.extend(calls(sub))
+        return out
+
+    worker_routes = [
+        route
+        for route in router.routes
+        if route.path.startswith("/worker/identities")  # type: ignore[attr-defined]
+    ]
+    assert worker_routes
+    assert all(
+        require_admin in calls(route.dependant)  # type: ignore[attr-defined]
+        for route in worker_routes
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_admin_is_rejected_from_worker_identity_routes() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await require_admin(
+            User(name="member", email="member@example.invalid", role="user")
+        )
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_worker_identity_mapping_routes_manage_exact_user_ids(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        admin = await _make_user(session, "identity-admin")
+        first_user = await _make_user(session, "identity-user-1", role="user")
+        second_user = await _make_user(session, "identity-user-2", role="user")
+        await session.commit()
+
+        created = await put_worker_identity_mapping(
+            "jira-account-1",
+            JiraWorkerIdentityMappingRequest(switch_user_id=first_user.id),
+            "acme",
+            session,
+            _config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+            admin,
+        )
+        assert created.switch_user_id == first_user.id
+
+        listed = await list_worker_identity_mappings("acme", session, admin)
+        assert [mapping.jira_account_id for mapping in listed] == ["jira-account-1"]
+
+        updated = await put_worker_identity_mapping(
+            "jira-account-1",
+            JiraWorkerIdentityMappingRequest(switch_user_id=second_user.id),
+            "acme",
+            session,
+            _config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+            admin,
+        )
+        assert updated.switch_user_id == second_user.id
+
+        deleted = await delete_worker_identity_mapping(
+            "jira-account-1",
+            "acme",
+            session,
+            _config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+            admin,
+        )
+        assert deleted.status_code == 204
 
 
 @pytest.mark.asyncio

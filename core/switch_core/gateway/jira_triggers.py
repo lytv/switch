@@ -18,8 +18,13 @@ from switch_core.bridges.jira.parse import (
     parse_jira_payload,
 )
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
+from switch_core.bridges.jira.worker import (
+    list_identity_mappings,
+    remove_identity_mapping,
+    set_identity_mapping,
+)
 from switch_core.config import SwitchConfig
-from switch_core.db.models import Agent, JiraTrigger, Room, User
+from switch_core.db.models import Agent, JiraTrigger, JiraWorkerIdentity, Room, User
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
@@ -46,6 +51,8 @@ from switch_core.gateway.schemas import (
     JiraTriggerCreateRequest,
     JiraTriggerDetail,
     JiraTriggerUpdateRequest,
+    JiraWorkerIdentityMappingRequest,
+    JiraWorkerIdentityMappingResponse,
     RevealKeyResponse,
 )
 
@@ -84,6 +91,19 @@ def _to_detail(
         thread_by=trigger.thread_by,
         created_at=str(trigger.created_at),
         updated_at=str(trigger.updated_at),
+    )
+
+
+def _identity_mapping_response(
+    mapping: JiraWorkerIdentity, *, updated_ticket_count: int = 0
+) -> JiraWorkerIdentityMappingResponse:
+    return JiraWorkerIdentityMappingResponse(
+        id=mapping.id,
+        instance=mapping.instance,
+        jira_account_id=mapping.jira_account_id,
+        switch_user_id=mapping.switch_user_id,
+        created_at=str(mapping.created_at),
+        updated_ticket_count=updated_ticket_count,
     )
 
 
@@ -476,6 +496,80 @@ async def create_trigger(
     await session.commit()
     await session.refresh(trigger)
     return await _resolve_names(session, room_store, room_group_store, trigger)
+
+
+@router.get("/worker/identities")
+async def list_worker_identity_mappings(
+    instance: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    _admin: Annotated[User, Depends(require_admin)],
+) -> list[JiraWorkerIdentityMappingResponse]:
+    instance = instance.strip()
+    if not instance:
+        raise HTTPException(status_code=400, detail="instance is required")
+    mappings = await list_identity_mappings(session, instance=instance)
+    return [_identity_mapping_response(mapping) for mapping in mappings]
+
+
+@router.put("/worker/identities/{jira_account_id}")
+async def put_worker_identity_mapping(
+    jira_account_id: str,
+    req: JiraWorkerIdentityMappingRequest,
+    instance: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    _admin: Annotated[User, Depends(require_admin)],
+) -> JiraWorkerIdentityMappingResponse:
+    instance = instance.strip()
+    jira_account_id = jira_account_id.strip()
+    switch_user_id = req.switch_user_id.strip()
+    if not instance:
+        raise HTTPException(status_code=400, detail="instance is required")
+    if not jira_account_id:
+        raise HTTPException(status_code=400, detail="jira_account_id is required")
+    if not switch_user_id:
+        raise HTTPException(status_code=400, detail="switch_user_id is required")
+    if await session.get(User, switch_user_id) is None:
+        raise HTTPException(status_code=400, detail="Switch user not found")
+    mapping, updated_ticket_count = await set_identity_mapping(
+        session,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        switch_user_id=switch_user_id,
+        enabled_projects=config.jira_worker_enabled_projects.get(instance, []),
+    )
+    await session.commit()
+    await session.refresh(mapping)
+    return _identity_mapping_response(
+        mapping, updated_ticket_count=updated_ticket_count
+    )
+
+
+@router.delete("/worker/identities/{jira_account_id}", status_code=204)
+async def delete_worker_identity_mapping(
+    jira_account_id: str,
+    instance: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    _admin: Annotated[User, Depends(require_admin)],
+) -> Response:
+    instance = instance.strip()
+    jira_account_id = jira_account_id.strip()
+    if not instance:
+        raise HTTPException(status_code=400, detail="instance is required")
+    if not jira_account_id:
+        raise HTTPException(status_code=400, detail="jira_account_id is required")
+    try:
+        await remove_identity_mapping(
+            session,
+            instance=instance,
+            jira_account_id=jira_account_id,
+            enabled_projects=config.jira_worker_enabled_projects.get(instance, []),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.get("/{trigger_id}")

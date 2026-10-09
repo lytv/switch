@@ -1125,6 +1125,19 @@ class JiraRotateSecretResponse(BaseModel):
     note: str
 
 
+class JiraWorkerIdentityMappingRequest(BaseModel):
+    switch_user_id: str
+
+
+class JiraWorkerIdentityMappingResponse(BaseModel):
+    id: str
+    instance: str
+    jira_account_id: str
+    switch_user_id: str | None
+    created_at: str
+    updated_ticket_count: int = 0
+
+
 class JiraRoomDeliveryResult(BaseModel):
     room_id: str
     room_name: str | None = None

@@ -1071,15 +1071,21 @@ class JiraIssueThread(Base):
 
 
 class JiraWorkerIdentity(Base):
-    """Manual Jira account → Switch user map.
-
-    Never guessed; admin-maintained. Step 1 only creates the table."""
+    """Manual Jira account → Switch user map."""
 
     __tablename__ = "jira_worker_identity_map"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance",
+            "jira_account_id",
+            name="uq_jira_worker_identity_instance_account",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
-    jira_account_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
-    switch_agent_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    instance: Mapped[str] = mapped_column(Text, nullable=False)
+    jira_account_id: Mapped[str] = mapped_column(Text, nullable=False)
+    switch_user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -1094,6 +1100,11 @@ class JiraWorkerTicket(Base):
             "instance", "issue_key", name="uq_jira_worker_ticket_instance_issue"
         ),
         Index("ix_jira_worker_ticket_map_instance_project", "instance", "project_key"),
+        Index(
+            "ix_jira_worker_ticket_map_instance_reporter",
+            "instance",
+            "reporter_account_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
@@ -1103,6 +1114,12 @@ class JiraWorkerTicket(Base):
     project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     status: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reporter_account_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reporter_switch_user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # switch | jira_comments
+    wait_channel: Mapped[str] = mapped_column(
+        Text, nullable=False, default="jira_comments"
+    )
     # Set by a later step when the ticket room exists; null until then.
     room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     first_seen_at: Mapped[str] = mapped_column(
