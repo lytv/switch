@@ -92,6 +92,7 @@ from switch_core.events import (
 from switch_core.gateway.known_agents import KNOWN_AGENTS
 from switch_core.messages.recorded_types import MEMBERSHIP_EVENT_TYPE
 from switch_core.transport import (
+    NotAuthorError,
     TransportError,
 )
 
@@ -1167,6 +1168,27 @@ class ProtocolService:
                 "Failed to clear typing indicator for room %s", room_id, exc_info=True
             )
         return event_id
+
+    async def edit_message(
+        self, agent_id: str, room_id: str, event_id: str, content: str
+    ) -> None:
+        """Replace a message this agent authored. The id and position stay.
+
+        Room history reads the same row, so the new body is what `read_context`
+        and the history endpoint render.
+        """
+        room = await self.require_room_member(agent_id, room_id)
+        client = self.client_lifecycle.get_by_agent_id(agent_id)
+        if client is None:
+            raise ValueError("Agent client not running")
+        if client.transport is None:
+            raise ValueError("Agent client not connected to Matrix")
+        try:
+            await client.edit_message(room.matrix_room_id, event_id, content)
+        except NotAuthorError as exc:
+            raise PermissionError("Only the author may edit this message") from exc
+        except TransportError as exc:
+            raise ValueError(f"Failed to edit message: {exc}") from exc
 
     async def send_media(
         self,

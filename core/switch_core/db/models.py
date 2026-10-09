@@ -1138,6 +1138,16 @@ class JiraWorkerTicket(Base):
     # Transport event id of the ticket card message; null until posted.
     # Step 3 updates the card in place rather than posting a new one.
     card_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Admin-room card for this ticket. Null until the first alert is posted.
+    admin_card_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Active alert reasons. Absent keys are cleared. The card row stays.
+    admin_reasons: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Start of the current wait-status timer. Null when the ticket is not waiting.
+    wait_anchor: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Milestones already fired for wait_anchor, so a restart does not repeat them.
+    wait_fired: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

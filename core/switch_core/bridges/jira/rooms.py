@@ -15,8 +15,7 @@ room ownership to them.
 
 Card refresh (option C): the creation card message stays fixed as the
 thread root, and the live ticket state is rewritten in place into the room
-description (``SwitchCardUpdater``). True message edit stays a follow-up for
-step 7's admin cards.
+description (``SwitchCardUpdater``). Admin cards use message edit instead.
 """
 
 from __future__ import annotations
@@ -121,10 +120,11 @@ class TicketRooms(Protocol):
 
 
 class CardUpdater(Protocol):
-    """In-place card refresh. Switch has no message-edit path
-    (``PostgresTransport`` only appends), so per the step-3 decision the
-    creation card message stays fixed as the thread root and the live
-    ticket state rides in the room description via ``update_room``."""
+    """In-place ticket-card refresh via the room description.
+
+    The creation card message stays fixed as the thread root. Admin cards
+    use message edit and do not use this path.
+    """
 
     async def update_card(self, room_id: str, *, event_id: str, body: str) -> None: ...
 

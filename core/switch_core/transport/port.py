@@ -81,6 +81,17 @@ class MessageTransport(Protocol):
         """Post a text message. Raises `TransportError` if it is not accepted."""
         ...
 
+    async def edit_message(
+        self, room_id: str, event_id: str, new_content: str
+    ) -> None:
+        """Replace the body of a message this connection authored.
+
+        The original id and room position stay. Raises `TransportError` when
+        the message is missing, and `NotAuthorError` when another author
+        posted it.
+        """
+        ...
+
     async def send_event(
         self,
         room_id: str,

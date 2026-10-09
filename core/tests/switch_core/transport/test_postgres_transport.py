@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.db.models import Client, Room
 from switch_core.db.stores.media_store import MediaStore
 from switch_core.db.stores.message_store import MessageStore
@@ -29,6 +31,7 @@ from switch_core.transport import (
     InboundMembership,
     InboundMessage,
     MessageTransport,
+    NotAuthorError,
     TransportError,
     TransportHandlers,
 )
@@ -858,3 +861,102 @@ class TestHearingYourOwnArrival:
 
         kinds = [type(event) for event in received.events]
         assert kinds == [InboundMembership]
+
+
+class TestEdit:
+    async def test_author_edit_keeps_id_and_position(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            room_id, transport_room_id, client_id, user_id = await _make_room(session)
+            await session.commit()
+        transport = _transport(session_factory, client_id=client_id, user_id=user_id)
+        first = await transport.send_message(
+            transport_room_id, "old card", sender_name="agent one"
+        )
+        second = await transport.send_message(
+            transport_room_id, "later", sender_name="agent one"
+        )
+        await transport.edit_message(transport_room_id, first.event_id, "new card")
+
+        async with session_factory() as session:
+            store = MessageStore()
+            edited = await store.get_by_transport_event_id(session, first.event_id)
+            following = await store.get_by_transport_event_id(session, second.event_id)
+            assert edited is not None and following is not None
+            assert edited.body == "new card"
+            assert edited.content["body"] == "new card"
+            assert edited.transport_event_id == first.event_id
+            assert edited.seq == 1
+            assert following.seq == 2
+            assert following.body == "later"
+
+        result = await _read_context(session_factory, room_id)
+        root = result["threads"][0]["root"]
+        assert root["id"] == first.event_id
+        assert root["body"] == "new card"
+        bodies = [
+            entry.get("body")
+            for group in result["threads"]
+            for entry in [group["root"], *group["replies"]]
+        ]
+        assert "old card" not in bodies
+        assert "new card" in bodies
+
+    async def test_only_the_author_can_edit(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with session_factory() as session:
+            _, transport_room_id, client_id, user_id = await _make_room(session)
+            await session.commit()
+        author = _transport(session_factory, client_id=client_id, user_id=user_id)
+        sent = await author.send_message(
+            transport_room_id, "mine", sender_name="agent one"
+        )
+        other = _transport(session_factory, client_id=client_id, user_id="@other:test")
+        with pytest.raises(NotAuthorError):
+            await other.edit_message(transport_room_id, sent.event_id, "stolen")
+        async with session_factory() as session:
+            row = await MessageStore().get_by_transport_event_id(session, sent.event_id)
+        assert row is not None
+        assert row.body == "mine"
+
+    async def test_protocol_maps_non_author_to_permission_error(self) -> None:
+        class Boom:
+            async def edit_message(
+                self, room_id: str, event_id: str, body: str
+            ) -> None:
+                raise NotAuthorError("Only the author may edit this message")
+
+        class Client:
+            transport = Boom()
+
+            async def edit_message(
+                self, room_id: str, event_id: str, body: str
+            ) -> None:
+                await self.transport.edit_message(room_id, event_id, body)
+
+        class Life:
+            def get_by_agent_id(self, agent_id: str) -> Client:
+                return Client()
+
+        service = object.__new__(ProtocolService)
+        service.client_lifecycle = Life()
+
+        async def require(agent_id: str, room_id: str) -> SimpleNamespace:
+            return SimpleNamespace(matrix_room_id="!r:test")
+
+        service.require_room_member = require  # type: ignore[method-assign]
+        with pytest.raises(PermissionError):
+            await service.edit_message("agent", "room", "evt", "new")
+
+
+def _read_context(session_factory, room_id):
+    async def require(agent_id: str, room_id: str) -> SimpleNamespace:
+        return SimpleNamespace(id=room_id)
+
+    service = object.__new__(ProtocolService)
+    service.session_factory = session_factory
+    service.message_store = MessageStore()
+    service.require_room_member = require  # type: ignore[method-assign]
+    return service.read_context("agent-1", room_id)

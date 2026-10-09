@@ -16,12 +16,12 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from sqlalchemy import and_, case, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.jira.activity import (
     TicketActivity,
@@ -29,6 +29,7 @@ from switch_core.bridges.jira.activity import (
     park_ticket,
     record_event,
 )
+from switch_core.bridges.jira.admin import reconcile_admin_cards
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
@@ -42,6 +43,7 @@ from switch_core.db.models import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from switch_core.bridges.jira.admin import AdminBoard
     from switch_core.bridges.jira.rooms import CardUpdater, TicketRooms
 
 POLL_JOB_KIND = "watermark_poll"
@@ -863,6 +865,7 @@ class JiraWorkerScheduler:
         owner: str = "scheduler",
         ticket_rooms: TicketRooms | None = None,
         card_updater: CardUpdater | None = None,
+        admin_board: AdminBoard | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._config = config
@@ -879,6 +882,7 @@ class JiraWorkerScheduler:
         )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
+        self._admin_board = admin_board
         self.activity = TicketActivity(
             session_factory=session_factory,
             config=config,
@@ -953,6 +957,16 @@ class JiraWorkerScheduler:
         await self._outbox.run_once()
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
+        if self._admin_board is not None:
+            async with self._session_factory() as session:
+                engine = cast(AsyncEngine, session.bind)
+            await reconcile_admin_cards(
+                self._session_factory,
+                engine=engine,
+                board=self._admin_board,
+                config=self._config,
+                now=self._clock(),
+            )
         for job in jobs:
             try:
                 await self._handle_job(job)

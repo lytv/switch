@@ -26,6 +26,10 @@ class NotConnectedError(TransportError):
     """An operation was attempted before the transport was connected."""
 
 
+class NotAuthorError(TransportError):
+    """The caller is not the author of the message it tried to edit."""
+
+
 # ── Outbound results ──────────────────────────────────────────────────────────
 
 

@@ -40,6 +40,7 @@ class FakeTransport:
         self._fail_send = fail_send
 
         self.sent_messages: list[dict[str, Any]] = []
+        self.edits: list[tuple[str, str, str]] = []
         self.sent_events: list[tuple[str, str, dict[str, object]]] = []
         self.sent_media: list[dict[str, Any]] = []
         self.uploads: list[tuple[bytes, str, str]] = []
@@ -120,6 +121,11 @@ class FakeTransport:
             event_type="m.room.message",
             content=content,
         )
+
+    async def edit_message(
+        self, room_id: str, event_id: str, new_content: str
+    ) -> None:
+        self.edits.append((room_id, event_id, new_content))
 
     async def send_event(
         self, room_id: str, event_type: str, content: dict[str, object]

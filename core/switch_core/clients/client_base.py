@@ -462,6 +462,12 @@ class ClientBase[ConfigT: ClientConfig]:
             return None
         return result.event_id
 
+    async def edit_message(self, room_id: str, event_id: str, body: str) -> None:
+        """Replace a message this client authored. The id and position stay."""
+        if self.transport is None:
+            raise TransportError("not connected")
+        await self.transport.edit_message(room_id, event_id, body)
+
     async def send_event(
         self, room_id: str, event_type: str, content: dict[str, object]
     ) -> str:
