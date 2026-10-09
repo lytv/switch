@@ -334,9 +334,9 @@ async def upsert_ticket(
         last_event_at=updated_at,
     )
     result = await session.execute(
-        stmt.on_conflict_do_nothing(
-            index_elements=["instance", "issue_key"]
-        ).returning(JiraWorkerTicket)
+        stmt.on_conflict_do_nothing(index_elements=["instance", "issue_key"]).returning(
+            JiraWorkerTicket
+        )
     )
     ticket = result.scalar_one_or_none()
     if ticket is not None:
