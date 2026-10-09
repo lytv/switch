@@ -174,6 +174,7 @@ class SwitchConfig(BaseSettings):
     jira_worker_statuses: JiraWorkerStatuses = JiraWorkerStatuses()
     jira_worker_limits: JiraWorkerLimits = JiraWorkerLimits()
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
+    jira_worker_notice_window_seconds: int = Field(default=86_400, ge=1)
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

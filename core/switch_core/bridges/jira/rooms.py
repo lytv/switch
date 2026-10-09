@@ -115,6 +115,10 @@ class TicketRooms(Protocol):
 
     async def is_worker_sender(self, sender: str) -> bool: ...
 
+    async def is_human_sender(self, sender: str) -> bool: ...
+
+    async def post_notice(self, room_id: str, *, body: str) -> str: ...
+
 
 class CardUpdater(Protocol):
     """In-place card refresh. Switch has no message-edit path
@@ -627,6 +631,22 @@ class SwitchTicketRooms:
             self._worker_matrix_id = matrix_id
         return bool(matrix_id) and sender == matrix_id
 
+    async def is_human_sender(self, sender: str) -> bool:
+        async with self._sessions() as session:
+            return (
+                await session.scalar(
+                    select(Client.id).where(
+                        Client.matrix_user_id == sender, Client.type == "user"
+                    )
+                )
+                is not None
+            )
+
+    async def post_notice(self, room_id: str, *, body: str) -> str:
+        return await self._protocol.send_message(
+            await self._jira_agent_id(), room_id, body
+        )
+
     async def post_card(self, room_id: str, *, body: str) -> str:
         return await self._protocol.send_message(
             await self._jira_agent_id(), room_id, body
@@ -656,7 +676,7 @@ class SwitchTicketRooms:
     def issue_url(self, *, instance: str, issue_key: str) -> str:
         credentials = self._config.jira_worker_credentials.get(instance)
         if credentials is None:
-            return issue_key
+            raise ValueError(f"Jira credentials missing for {instance}")
         return f"{credentials.base_url.rstrip('/')}/browse/{issue_key}"
 
 

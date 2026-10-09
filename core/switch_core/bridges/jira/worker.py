@@ -875,6 +875,7 @@ class JiraWorkerScheduler:
             config=config,
             clients=self._poll_clients,
             clock=self._clock,
+            rooms=ticket_rooms,
         )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater

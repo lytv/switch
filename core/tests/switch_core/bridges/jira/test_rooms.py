@@ -57,6 +57,8 @@ class FakeRooms:
         self.fail_archive_once = False
         self.fail_owner_once = False
         self.worker_senders: set[str] = set()
+        self.human_senders: set[str] = {"reporter-user", "admin-user"}
+        self.notices: list[tuple[str, str]] = []
         self._next = 0
 
     async def create_ticket_room(
@@ -140,6 +142,13 @@ class FakeRooms:
 
     async def is_worker_sender(self, sender: str) -> bool:
         return sender in self.worker_senders
+
+    async def is_human_sender(self, sender: str) -> bool:
+        return sender in self.human_senders
+
+    async def post_notice(self, room_id: str, *, body: str) -> str:
+        self.notices.append((room_id, body))
+        return f"notice-{len(self.notices)}"
 
 
 class FakeCards:
