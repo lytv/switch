@@ -45,6 +45,12 @@ class _FakeRoomStore:
     async def add_client(self, session: Any, client_id: str, room_id: str) -> None:
         self.added.append((client_id, room_id))
 
+    async def get(self, session: Any, room_id: str) -> Any:
+        for room in self._rooms:
+            if room.id == room_id:
+                return room
+        return None
+
 
 class _FakeClientLifecycle:
     """Resolves system clients by type, mirroring the real lookup."""
@@ -177,3 +183,21 @@ class TestReconcileRoomClients:
 
         assert matrix.invited == []
         assert room_store.added == []
+
+    async def test_invite_missing_member_clients_repairs_one_room(self) -> None:
+        room = SimpleNamespace(id="room-1", matrix_room_id="!mx:switch.local")
+        other = SimpleNamespace(id="room-2", matrix_room_id="!other:switch.local")
+        svc, room_store, matrix = _build_service(
+            rooms=[room, other],
+            client_ids_by_room={"room-1": [], "room-2": []},
+            by_type={},
+            agent_clients_by_room={
+                "room-1": {"agent-client": "@fixer:switch.local"},
+                "room-2": {"other-client": "@other:switch.local"},
+            },
+        )
+
+        await svc.invite_missing_member_clients("room-1")
+
+        assert matrix.invited == [("!mx:switch.local", "@fixer:switch.local")]
+        assert room_store.added == [("agent-client", "room-1")]

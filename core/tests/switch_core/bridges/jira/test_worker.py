@@ -546,11 +546,18 @@ async def test_unmapped_reporter_uses_jira_comments_then_mapping_wakes_ticket(
                 )
             )
         ).all()
-        assert outbox == [
-            ("upsert_ticket_admin_card", None),
-            ("invite_ticket_reporter", "switch-user-1"),
-            ("upsert_ticket_admin_card", "switch-user-1"),
-        ]
+        # created_at ties within one transaction, so row order is not a contract.
+        key = lambda row: (row[0], row[1] or "")  # noqa: E731
+        assert sorted(outbox, key=key) == sorted(
+            [
+                ("sync_ticket_room", None),
+                ("upsert_ticket_admin_card", None),
+                ("invite_ticket_reporter", "switch-user-1"),
+                ("upsert_ticket_admin_card", "switch-user-1"),
+                ("sync_ticket_room", "switch-user-1"),
+            ],
+            key=key,
+        )
 
 
 @pytest.mark.asyncio
@@ -609,7 +616,9 @@ async def test_later_webhook_mapping_transition_invites_reporter(
         key = lambda row: (row[0], row[1] or "")  # noqa: E731
         assert sorted(outbox, key=key) == sorted(
             [
+                ("sync_ticket_room", None),
                 ("upsert_ticket_admin_card", None),
+                ("sync_ticket_room", "switch-user-1"),
                 ("invite_ticket_reporter", "switch-user-1"),
                 ("upsert_ticket_admin_card", "switch-user-1"),
             ],
@@ -661,7 +670,8 @@ async def test_concurrent_new_webhooks_enqueue_one_follow_up(
             .scalars()
             .all()
         )
-        assert commands == ["invite_ticket_reporter"]
+        assert commands.count("invite_ticket_reporter") == 1
+        assert commands.count("sync_ticket_room") == 2
 
 
 @pytest.mark.asyncio
@@ -693,10 +703,10 @@ async def test_polled_issue_enqueues_mapped_reporter_invitation(
         await session.commit()
 
     async with session_factory() as session:
-        command = (
+        commands = (
             await session.execute(text("SELECT command FROM jira_worker_outbox"))
-        ).scalar_one()
-        assert command == "invite_ticket_reporter"
+        ).scalars().all()
+        assert set(commands) == {"sync_ticket_room", "invite_ticket_reporter"}
 
 
 @pytest.mark.asyncio

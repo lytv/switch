@@ -16,16 +16,26 @@ import switch_core.db.models  # noqa: F401 — registers every table on Base.met
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND,
     SwitchCardUpdater,
+    SwitchTicketRooms,
+    _relock_ticket,
     reconcile_ticket_room,
     render_ticket_card,
 )
 from switch_core.bridges.jira.worker import (
+    JiraWorkerScheduler,
     record_webhook_event,
+    remove_identity_mapping,
     set_identity_mapping,
 )
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
+from switch_core.config import SwitchConfig
 from switch_core.db.base import Base
-from switch_core.db.models import JiraWorkerTicket
+from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket, Room, User
+from switch_core.gateway.jira_triggers import (
+    delete_worker_identity_mapping,
+    put_worker_identity_mapping,
+)
+from switch_core.gateway.schemas import JiraWorkerIdentityMappingRequest
 
 _CORE = Path(__file__).resolve().parents[4]
 
@@ -44,10 +54,18 @@ class FakeRooms:
         self.archived_calls: list[tuple[str, bool]] = []
         self.fail_create_once = False
         self.fail_post_once = False
+        self.fail_archive_once = False
+        self.fail_owner_once = False
         self._next = 0
 
     async def create_ticket_room(
-        self, *, name: str, description: str, owner_id: str | None
+        self,
+        *,
+        name: str,
+        description: str,
+        owner_id: str | None,
+        instance: str,
+        issue_key: str,
     ) -> str:
         self._next += 1
         room_id = f"room-{self._next}"
@@ -57,6 +75,7 @@ class FakeRooms:
             "owner_id": owner_id,
             "archived": False,
             "agents": [],
+            "marker": (instance, issue_key),
         }
         self.created.append({"room_id": room_id, "name": name, "owner_id": owner_id})
         if self.fail_create_once:
@@ -80,12 +99,16 @@ class FakeRooms:
         return None if room is None else room["archived"]
 
     async def set_archived(self, room_id: str, *, archived: bool) -> None:
+        if self.fail_archive_once:
+            self.fail_archive_once = False
+            raise RuntimeError("archive failed")
         self.rooms[room_id]["archived"] = archived
         self.archived_calls.append((room_id, archived))
 
-    async def find_ticket_room(self, *, name: str) -> str | None:
+    async def find_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
+        marker = (instance, issue_key)
         for room_id in reversed(list(self.rooms)):
-            if self.rooms[room_id]["name"] == name:
+            if self.rooms[room_id].get("marker") == marker:
                 return room_id
         return None
 
@@ -98,6 +121,9 @@ class FakeRooms:
         return None if room is None else room["description"]
 
     async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
+        if self.fail_owner_once:
+            self.fail_owner_once = False
+            raise RuntimeError("owner write failed")
         room = self.rooms.get(room_id)
         if room is None:
             return False
@@ -106,7 +132,7 @@ class FakeRooms:
         return True
 
     async def reporter_display_name(self, switch_user_id: str) -> str | None:
-        return {"user-ada": "Ada"}.get(switch_user_id)
+        return {"user-ada": "Ada", "user-bob": "Bob"}.get(switch_user_id)
 
     def issue_url(self, *, instance: str, issue_key: str) -> str:
         return f"https://jira.example/browse/{issue_key}"
@@ -656,3 +682,477 @@ async def test_missing_ticket_sync_returns_none(
             )
             is None
         )
+
+
+def _switch_config(**overrides: object) -> SwitchConfig:
+    base: dict[str, Any] = {
+        "db_host": "localhost",
+        "db_port": "5432",
+        "db_user": "u",
+        "db_password": "p",
+        "db_name": "db",
+        "matrix_server_name": "localhost",
+        "agent_registration_token": "t",
+        "jwt_secret_key": "j" * 32,
+        "gateway_admin_email": "admin@example.com",
+        "gateway_admin_password": "pw",
+    }
+    base.update(overrides)
+    return SwitchConfig(**base)
+
+
+def _bare_room(**fields: Any) -> dict[str, Any]:
+    room = {
+        "name": "KAN-1",
+        "description": "personal notes",
+        "owner_id": "user-ada",
+        "archived": False,
+        "agents": [],
+        "marker": None,
+    }
+    room.update(fields)
+    return room
+
+
+@pytest.mark.asyncio
+async def test_adopt_requires_marker_for_this_instance_and_issue(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    rooms.rooms["person"] = _bare_room()
+    rooms.rooms["beta"] = _bare_room(description="beta ticket", marker=("beta", "KAN-1"))
+    rooms._next = 2
+    assert await _intake(session_factory, _webhook_event()) is True
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert room_id == "room-3"
+    assert rooms.rooms["person"]["description"] == "personal notes"
+    assert rooms.rooms["person"]["owner_id"] == "user-ada"
+    assert rooms.rooms["beta"]["description"] == "beta ticket"
+    assert len(rooms.created) == 1
+    assert rooms.rooms[room_id]["marker"] == (INSTANCE, "KAN-1")
+
+
+@pytest.mark.asyncio
+async def test_relock_sees_a_concurrent_ticket_update(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await _intake(session_factory, _webhook_event()) is True
+    async with session_factory() as session:
+        first = await _relock_ticket(session, instance=INSTANCE, issue_key="KAN-1")
+        assert first is not None
+        assert first.summary == "First ticket"
+        await session.commit()
+        async with session_factory() as other:
+            await other.execute(
+                text(
+                    "UPDATE jira_worker_ticket_map SET summary = :summary,"
+                    " status = :status WHERE instance = :instance AND issue_key = :key"
+                ),
+                {
+                    "summary": "Updated while open",
+                    "status": "Done",
+                    "instance": INSTANCE,
+                    "key": "KAN-1",
+                },
+            )
+            await other.commit()
+        again = await _relock_ticket(session, instance=INSTANCE, issue_key="KAN-1")
+        assert again is not None
+        assert again.summary == "Updated while open"
+        assert again.status == "Done"
+
+
+def _reporter_event(
+    account_id: str, updated_ms: int, event_id: str
+) -> NormalizedTriggerEvent:
+    return NormalizedTriggerEvent(
+        event_kind="updated",
+        webhook_event="jira:issue_updated",
+        key="KAN-1",
+        summary="Mapped ticket",
+        issue_type="Task",
+        project=PROJECT,
+        status="To Do",
+        assignee="",
+        priority="",
+        reporter="",
+        url="",
+        raw={
+            "webhookEvent": "jira:issue_updated",
+            "timestamp": updated_ms,
+            "issue": {
+                "id": "10001",
+                "key": "KAN-1",
+                "fields": {"reporter": {"accountId": account_id}},
+            },
+            "changelog": {"id": event_id},
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_done_ticket_owner_follows_current_mapping(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            switch_user_id="user-ada",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+    assert (
+        await _intake(
+            session_factory, _reporter_event("acct-ada", 1791443000000, "d-1")
+        )
+        is True
+    )
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert rooms.rooms[room_id]["owner_id"] == "user-ada"
+
+    assert (
+        await _intake(
+            session_factory,
+            _webhook_event(status="Done", updated_ms=1791443999000),
+            webhook_identifier="d-2",
+        )
+        is True
+    )
+    await _sync(session_factory, "KAN-1", rooms, updater)
+    assert rooms.rooms[room_id]["archived"] is True
+
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            switch_user_id="user-bob",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+    assert (await _ticket(session_factory, "KAN-1")).reporter_switch_user_id == "user-ada"
+    await _sync(session_factory, "KAN-1", rooms, updater)
+    assert rooms.rooms[room_id]["owner_id"] == "user-bob"
+    assert "Bob" in updater.updates[-1]["body"]
+
+    async with session_factory() as session:
+        await remove_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+    await _sync(session_factory, "KAN-1", rooms, updater)
+    assert rooms.rooms[room_id]["owner_id"] is None
+    assert "unmapped reporter (admins only)" in updater.updates[-1]["body"]
+    assert (await _ticket(session_factory, "KAN-1")).reporter_switch_user_id == "user-ada"
+
+
+async def _pending_sync_count(session_factory: async_sessionmaker[AsyncSession]) -> int:
+    async with session_factory() as session:
+        return (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM jira_worker_outbox"
+                    " WHERE command = 'sync_ticket_room' AND status = 'pending'"
+                )
+            )
+        ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_sweep_retries_until_archive_and_owner_are_applied(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, updater = FakeRooms(), FakeCards()
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            switch_user_id="user-ada",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+    assert (
+        await _intake(
+            session_factory, _reporter_event("acct-ada", 1791443000000, "s-1")
+        )
+        is True
+    )
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    assert await _pending_sync_count(session_factory) == 0
+
+    assert (
+        await _intake(
+            session_factory,
+            _webhook_event(status="Done", updated_ms=1791443999000),
+            webhook_identifier="s-2",
+        )
+        is True
+    )
+    assert await _pending_sync_count(session_factory) == 1
+    rooms.fail_archive_once = True
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_switch_config(jira_worker_enabled_projects={INSTANCE: [PROJECT]}),
+        ticket_rooms=rooms,
+        card_updater=updater,
+    )
+    assert await scheduler.sweep_ticket_rooms() == 0
+    assert rooms.rooms[room_id]["archived"] is False
+    assert await _pending_sync_count(session_factory) == 1
+    assert await scheduler.sweep_ticket_rooms() == 1
+    assert rooms.rooms[room_id]["archived"] is True
+    assert await _pending_sync_count(session_factory) == 0
+
+    async with session_factory() as session:
+        await remove_identity_mapping(
+            session,
+            instance=INSTANCE,
+            jira_account_id="acct-ada",
+            enabled_projects=[PROJECT],
+        )
+        await session.commit()
+    assert await _pending_sync_count(session_factory) == 1
+    rooms.fail_owner_once = True
+    assert await scheduler.sweep_ticket_rooms() == 0
+    assert rooms.rooms[room_id]["owner_id"] == "user-ada"
+    assert await _pending_sync_count(session_factory) == 1
+    assert await scheduler.sweep_ticket_rooms() == 1
+    assert rooms.rooms[room_id]["owner_id"] is None
+    assert await _pending_sync_count(session_factory) == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_a_disabled_project_unchanged(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms = FakeRooms()
+    rooms.rooms["off-room"] = _bare_room(owner_id="user-ada")
+    async with session_factory() as session:
+        ticket = JiraWorkerTicket(
+            instance=INSTANCE,
+            issue_key="OFF-1",
+            project_key="OFF",
+            summary="Left alone",
+            status="To Do",
+            reporter_account_id="acct-ada",
+            reporter_switch_user_id="user-ada",
+            room_id="off-room",
+            card_event_id="card-off",
+        )
+        session.add(ticket)
+        await session.flush()
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                command="sync_ticket_room",
+                issue_key="OFF-1",
+                payload={"ticket_id": ticket.id, "instance": INSTANCE},
+            )
+        )
+        await session.commit()
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_switch_config(jira_worker_enabled_projects={INSTANCE: [PROJECT]}),
+        ticket_rooms=rooms,
+        card_updater=FakeCards(),
+    )
+    assert await scheduler.sweep_ticket_rooms() == 0
+    assert rooms.rooms["off-room"]["owner_id"] == "user-ada"
+    assert rooms.rooms["off-room"]["description"] == "personal notes"
+    assert await _pending_sync_count(session_factory) == 1
+
+
+@pytest.mark.asyncio
+async def test_mapping_routes_reconcile_only_enabled_projects(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms, cards = FakeRooms(), FakeCards()
+    async with session_factory() as session:
+        user = User(name="Ada", email="ada@example.invalid", role="user")
+        admin = User(name="Admin", email="admin@example.invalid", role="admin")
+        session.add_all([user, admin])
+        await session.flush()
+        session.add_all(
+            [
+                JiraWorkerTicket(
+                    instance=INSTANCE,
+                    issue_key="KAN-1",
+                    project_key=PROJECT,
+                    summary="Enabled",
+                    status="To Do",
+                    reporter_account_id="acct-ada",
+                ),
+                JiraWorkerTicket(
+                    instance=INSTANCE,
+                    issue_key="OFF-1",
+                    project_key="OFF",
+                    summary="Disabled",
+                    status="To Do",
+                    reporter_account_id="acct-ada",
+                ),
+            ]
+        )
+        await session.commit()
+        user_id = user.id
+        config = _switch_config(
+            jira_worker_enabled_projects={INSTANCE: [PROJECT]}
+        )
+        await put_worker_identity_mapping(
+            "acct-ada",
+            JiraWorkerIdentityMappingRequest(switch_user_id=user_id),
+            INSTANCE,
+            session,
+            config,
+            admin,
+            rooms,  # type: ignore[arg-type]
+            cards,  # type: ignore[arg-type]
+            session_factory,
+        )
+        assert [item["name"] for item in rooms.created] == ["KAN-1"]
+        kan_room = rooms.created[0]["room_id"]
+        assert rooms.rooms[kan_room]["owner_id"] == user_id
+
+        rooms.rooms["off-room"] = _bare_room(owner_id=user_id)
+        off = (
+            await session.execute(
+                text(
+                    "SELECT id FROM jira_worker_ticket_map WHERE issue_key = 'OFF-1'"
+                )
+            )
+        ).scalar_one()
+        await session.execute(
+            text(
+                "UPDATE jira_worker_ticket_map SET room_id = 'off-room'"
+                " WHERE id = :id"
+            ),
+            {"id": off},
+        )
+        await session.commit()
+        await delete_worker_identity_mapping(
+            "acct-ada",
+            INSTANCE,
+            session,
+            config,
+            admin,
+            rooms,  # type: ignore[arg-type]
+            cards,  # type: ignore[arg-type]
+            session_factory,
+        )
+    assert rooms.rooms[kan_room]["owner_id"] is None
+    assert rooms.rooms["off-room"]["owner_id"] == user_id
+    assert rooms.rooms["off-room"]["description"] == "personal notes"
+
+
+@pytest.mark.asyncio
+async def test_find_ticket_room_matches_marker_not_name(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        person = Room(
+            matrix_room_id="!person:test",
+            name="KAN-1",
+            description="personal notes",
+        )
+        beta = Room(
+            matrix_room_id="!beta:test",
+            name="KAN-1",
+            description="beta",
+            metadata_={"jira_instance": "beta", "jira_issue_key": "KAN-1"},
+        )
+        acme = Room(
+            matrix_room_id="!acme:test",
+            name="other-name",
+            description="acme ticket",
+            metadata_={"jira_instance": INSTANCE, "jira_issue_key": "KAN-1"},
+        )
+        session.add_all([person, beta, acme])
+        await session.commit()
+        acme_id = acme.id
+    finder = SwitchTicketRooms(
+        room_service=None,  # type: ignore[arg-type]
+        protocol=None,  # type: ignore[arg-type]
+        session_factory=session_factory,
+        agent_store=None,  # type: ignore[arg-type]
+        config=_switch_config(),
+    )
+    assert await finder.find_ticket_room(instance=INSTANCE, issue_key="KAN-1") == acme_id
+    async with session_factory() as session:
+        session.add(
+            JiraWorkerTicket(
+                instance=INSTANCE,
+                issue_key="KAN-1",
+                project_key=PROJECT,
+                room_id=acme_id,
+            )
+        )
+        await session.commit()
+    assert await finder.find_ticket_room(instance=INSTANCE, issue_key="KAN-1") is None
+
+
+@pytest.mark.asyncio
+async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
+    captured: dict[str, Any] = {}
+
+    class _Recording:
+        async def create_room(self, config: Any) -> Any:
+            captured["metadata"] = config.metadata
+            captured["name"] = config.name
+
+            class _Result:
+                room = type("Room", (), {"id": "room-9"})()
+
+            return _Result()
+
+    rooms = SwitchTicketRooms(
+        room_service=_Recording(),  # type: ignore[arg-type]
+        protocol=None,  # type: ignore[arg-type]
+        session_factory=None,  # type: ignore[arg-type]
+        agent_store=None,  # type: ignore[arg-type]
+        config=_switch_config(),
+    )
+    assert (
+        await rooms.create_ticket_room(
+            name="KAN-1",
+            description="card",
+            owner_id=None,
+            instance=INSTANCE,
+            issue_key="KAN-1",
+        )
+        == "room-9"
+    )
+    assert captured["name"] == "KAN-1"
+    assert captured["metadata"] == {
+        "jira_instance": INSTANCE,
+        "jira_issue_key": "KAN-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ensure_agent_member_invites_clients_missing_membership() -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    class _Rooms:
+        async def add_agents_to_room(
+            self, room_id: str, agent_names: list[str] | None = None
+        ) -> None:
+            calls.append(("add", room_id, tuple(agent_names or [])))
+
+        async def invite_missing_member_clients(self, room_id: str) -> None:
+            calls.append(("invite", room_id))
+
+    rooms = SwitchTicketRooms(
+        room_service=_Rooms(),  # type: ignore[arg-type]
+        protocol=None,  # type: ignore[arg-type]
+        session_factory=None,  # type: ignore[arg-type]
+        agent_store=None,  # type: ignore[arg-type]
+        config=_switch_config(),
+    )
+    await rooms.ensure_agent_member("room-1", agent_name="jira")
+    assert calls == [("add", "room-1", ("jira",)), ("invite", "room-1")]

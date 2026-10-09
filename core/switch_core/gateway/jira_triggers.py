@@ -20,7 +20,7 @@ from switch_core.bridges.jira.parse import (
 from switch_core.bridges.jira.rooms import (
     SwitchCardUpdater,
     SwitchTicketRooms,
-    reconcile_ticket_room,
+    sync_ticket_room,
 )
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
 from switch_core.bridges.jira.worker import (
@@ -50,6 +50,7 @@ from switch_core.gateway.dependencies import (
     get_room_group_store,
     get_room_store,
     get_session,
+    get_session_factory,
     get_ticket_rooms,
 )
 from switch_core.gateway.schemas import (
@@ -525,6 +526,42 @@ async def list_worker_identity_mappings(
     return [_identity_mapping_response(mapping) for mapping in mappings]
 
 
+async def _reconcile_enabled_reporter_rooms(
+    session: AsyncSession,
+    session_factory: Any,
+    *,
+    instance: str,
+    jira_account_id: str,
+    enabled_projects: list[str],
+    rooms: SwitchTicketRooms | None,
+    jira_agent_name: str,
+    cards: SwitchCardUpdater | None,
+) -> None:
+    """Converge ticket rooms for this reporter in projects that are on.
+
+    A project that is off is left unchanged. One ticket's failure does not
+    skip the rest; each call uses the shared sync helper.
+    """
+    if rooms is None or session_factory is None or not enabled_projects:
+        return
+    result = await session.execute(
+        select(JiraWorkerTicket.issue_key).where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.project_key.in_(enabled_projects),
+            JiraWorkerTicket.reporter_account_id == jira_account_id,
+        )
+    )
+    for (issue_key,) in result.all():
+        await sync_ticket_room(
+            session_factory,
+            instance=instance,
+            issue_key=issue_key,
+            rooms=rooms,
+            jira_agent_name=jira_agent_name,
+            cards=cards,
+        )
+
+
 @router.put("/worker/identities/{jira_account_id}")
 async def put_worker_identity_mapping(
     jira_account_id: str,
@@ -539,6 +576,7 @@ async def put_worker_identity_mapping(
     card_updater: Annotated[SwitchCardUpdater | None, Depends(get_card_updater)] = (
         None
     ),
+    session_factory: Annotated[Any, Depends(get_session_factory)] = None,
 ) -> JiraWorkerIdentityMappingResponse:
     instance = instance.strip()
     jira_account_id = jira_account_id.strip()
@@ -560,29 +598,16 @@ async def put_worker_identity_mapping(
     )
     await session.commit()
     await session.refresh(mapping)
-    if ticket_rooms is not None:
-        try:
-            result = await session.execute(
-                select(JiraWorkerTicket.issue_key).where(
-                    JiraWorkerTicket.instance == instance,
-                    JiraWorkerTicket.reporter_account_id == jira_account_id,
-                )
-            )
-            for (issue_key,) in result.all():
-                await reconcile_ticket_room(
-                    session,
-                    instance=instance,
-                    issue_key=issue_key,
-                    rooms=ticket_rooms,
-                    jira_agent_name=config.jira_agent_name,
-                    cards=card_updater,
-                )
-            await session.commit()
-        except Exception:
-            logger.exception(
-                "Jira ticket room reconcile failed for %s", switch_user_id
-            )
-            await session.rollback()
+    await _reconcile_enabled_reporter_rooms(
+        session,
+        session_factory,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        enabled_projects=config.jira_worker_enabled_projects.get(instance, []),
+        rooms=ticket_rooms,
+        jira_agent_name=config.jira_agent_name,
+        cards=card_updater,
+    )
     return _identity_mapping_response(
         mapping, updated_ticket_count=updated_ticket_count
     )
@@ -601,6 +626,7 @@ async def delete_worker_identity_mapping(
     card_updater: Annotated[SwitchCardUpdater | None, Depends(get_card_updater)] = (
         None
     ),
+    session_factory: Annotated[Any, Depends(get_session_factory)] = None,
 ) -> Response:
     instance = instance.strip()
     jira_account_id = jira_account_id.strip()
@@ -618,30 +644,16 @@ async def delete_worker_identity_mapping(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await session.commit()
-    if ticket_rooms is not None:
-        try:
-            result = await session.execute(
-                select(JiraWorkerTicket.issue_key).where(
-                    JiraWorkerTicket.instance == instance,
-                    JiraWorkerTicket.reporter_account_id == jira_account_id,
-                    JiraWorkerTicket.room_id.is_not(None),
-                )
-            )
-            for (issue_key,) in result.all():
-                await reconcile_ticket_room(
-                    session,
-                    instance=instance,
-                    issue_key=issue_key,
-                    rooms=ticket_rooms,
-                    jira_agent_name=config.jira_agent_name,
-                    cards=card_updater,
-                )
-            await session.commit()
-        except Exception:
-            logger.exception(
-                "Jira ticket card refresh failed after unmap for %s", jira_account_id
-            )
-            await session.rollback()
+    await _reconcile_enabled_reporter_rooms(
+        session,
+        session_factory,
+        instance=instance,
+        jira_account_id=jira_account_id,
+        enabled_projects=config.jira_worker_enabled_projects.get(instance, []),
+        rooms=ticket_rooms,
+        jira_agent_name=config.jira_agent_name,
+        cards=card_updater,
+    )
     return Response(status_code=204)
 
 

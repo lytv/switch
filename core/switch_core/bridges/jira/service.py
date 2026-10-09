@@ -15,7 +15,7 @@ from switch_core.bridges.jira.matching import matching_rules
 from switch_core.bridges.jira.rooms import (
     CardUpdater,
     TicketRooms,
-    reconcile_ticket_room,
+    sync_ticket_room,
 )
 from switch_core.bridges.jira.template import render_template
 from switch_core.bridges.jira.worker import is_worker_enabled, record_webhook_event
@@ -155,30 +155,14 @@ class JiraBridgeService:
                 webhook_identifier=webhook_identifier,
             )
             await session.commit()
-        if self._ticket_rooms is None:
-            return
-        await self.sync_ticket_room(instance=instance, issue_key=event.key)
-
-    async def sync_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
-        """Step-3 room reconcile for one ticket. No-op without a provisioner."""
-        if self._ticket_rooms is None:
-            return None
-        async with self._session_factory() as session:
-            try:
-                room_id = await reconcile_ticket_room(
-                    session,
-                    instance=instance,
-                    issue_key=issue_key,
-                    rooms=self._ticket_rooms,
-                    jira_agent_name=self._config.jira_agent_name,
-                    cards=self._card_updater,
-                )
-                await session.commit()
-            except Exception:
-                logger.exception("Jira ticket room sync failed for %s", issue_key)
-                await session.rollback()
-                return None
-            return room_id
+        await sync_ticket_room(
+            self._session_factory,
+            instance=instance,
+            issue_key=event.key,
+            rooms=self._ticket_rooms,
+            jira_agent_name=self._config.jira_agent_name,
+            cards=self._card_updater,
+        )
 
     async def _resolve_jira_agent(self) -> str | None:
         async with self._session_factory() as session:
