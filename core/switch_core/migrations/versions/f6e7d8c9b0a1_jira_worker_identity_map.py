@@ -27,11 +27,8 @@ def upgrade() -> None:
         new_column_name="switch_user_id",
         existing_type=sa.Text(),
     )
-    op.alter_column(
-        "jira_worker_identity_map",
-        "switch_user_id",
-        existing_type=sa.Text(),
-        nullable=False,
+    op.execute(
+        "UPDATE jira_worker_identity_map SET switch_user_id = NULL"
     )
     op.drop_constraint(
         "jira_worker_identity_map_jira_account_id_key",

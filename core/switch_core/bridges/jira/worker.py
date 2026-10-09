@@ -322,7 +322,7 @@ async def upsert_ticket(
     project_key: str = "",
     summary: str = "",
     status: str = "",
-) -> None:
+) -> tuple[JiraWorkerTicket, bool, bool]:
     stmt = insert(JiraWorkerTicket).values(
         id=str(uuid.uuid4()),
         instance=instance,
@@ -336,22 +336,83 @@ async def upsert_ticket(
         wait_channel=wait_channel,
         last_event_at=updated_at,
     )
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["instance", "issue_key"],
-        set_={
-            "issue_id": stmt.excluded.issue_id,
-            "project_key": stmt.excluded.project_key,
-            "summary": stmt.excluded.summary,
-            "status": stmt.excluded.status,
-            "reporter_account_id": stmt.excluded.reporter_account_id,
-            "reporter_switch_user_id": stmt.excluded.reporter_switch_user_id,
-            "wait_channel": stmt.excluded.wait_channel,
-            "last_event_at": stmt.excluded.last_event_at,
-        },
-        where=JiraWorkerTicket.last_event_at <= stmt.excluded.last_event_at,
+    result = await session.execute(
+        stmt.on_conflict_do_nothing(
+            index_elements=["instance", "issue_key"]
+        ).returning(JiraWorkerTicket)
     )
-    await session.execute(stmt)
+    ticket = result.scalar_one_or_none()
+    if ticket is not None:
+        await session.flush()
+        return ticket, True, False
+
+    ticket = await session.scalar(
+        select(JiraWorkerTicket)
+        .where(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.issue_key == issue_key,
+        )
+        .with_for_update()
+    )
+    assert ticket is not None
+    if ticket.last_event_at > updated_at:
+        return ticket, False, False
+
+    reporter_resolution_changed = (
+        ticket.reporter_account_id != reporter_account_id
+        or ticket.reporter_switch_user_id != reporter_switch_user_id
+        or ticket.wait_channel != wait_channel
+    )
+    ticket.issue_id = issue_id
+    ticket.project_key = project_key
+    ticket.summary = summary
+    ticket.status = status
+    ticket.reporter_account_id = reporter_account_id
+    ticket.reporter_switch_user_id = reporter_switch_user_id
+    ticket.wait_channel = wait_channel
+    ticket.last_event_at = updated_at
     await session.flush()
+    return ticket, False, reporter_resolution_changed
+
+
+async def _enqueue_ticket_intake_follow_ups(
+    session: AsyncSession,
+    *,
+    ticket: JiraWorkerTicket,
+    created: bool,
+    reporter_resolution_changed: bool,
+    switch_user_id: str | None,
+) -> None:
+    if created:
+        if switch_user_id:
+            await _enqueue_switch_follow_up(
+                session,
+                command="invite_ticket_reporter",
+                ticket=ticket,
+                switch_user_id=switch_user_id,
+            )
+        else:
+            await _enqueue_switch_follow_up(
+                session,
+                command="upsert_ticket_admin_card",
+                ticket=ticket,
+                switch_user_id=None,
+            )
+        return
+    if reporter_resolution_changed:
+        if switch_user_id:
+            await _enqueue_switch_follow_up(
+                session,
+                command="invite_ticket_reporter",
+                ticket=ticket,
+                switch_user_id=switch_user_id,
+            )
+        await _enqueue_switch_follow_up(
+            session,
+            command="upsert_ticket_admin_card",
+            ticket=ticket,
+            switch_user_id=switch_user_id,
+        )
 
 
 async def record_webhook_event(
@@ -392,16 +453,10 @@ async def record_webhook_event(
     wait_channel = (
         SWITCH_WAIT_CHANNEL if reporter_switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
     )
-    previous_ticket = await session.scalar(
-        select(JiraWorkerTicket).where(
-            JiraWorkerTicket.instance == instance,
-            JiraWorkerTicket.issue_key == event.key,
-        )
-    )
     issue_id = ""
     if isinstance(raw.get("issue"), dict):
         issue_id = str(raw["issue"].get("id") or "")
-    await upsert_ticket(
+    ticket, created, reporter_resolution_changed = await upsert_ticket(
         session,
         instance=instance,
         issue_key=event.key,
@@ -414,28 +469,13 @@ async def record_webhook_event(
         wait_channel=wait_channel,
         updated_at=jira_updated_at(raw),
     )
-    if previous_ticket is None:
-        ticket = await session.scalar(
-            select(JiraWorkerTicket).where(
-                JiraWorkerTicket.instance == instance,
-                JiraWorkerTicket.issue_key == event.key,
-            )
-        )
-        assert ticket is not None
-        if reporter_switch_user_id:
-            await _enqueue_switch_follow_up(
-                session,
-                command="invite_ticket_reporter",
-                ticket=ticket,
-                switch_user_id=reporter_switch_user_id,
-            )
-        else:
-            await _enqueue_switch_follow_up(
-                session,
-                command="upsert_ticket_admin_card",
-                ticket=ticket,
-                switch_user_id=None,
-            )
+    await _enqueue_ticket_intake_follow_ups(
+        session,
+        ticket=ticket,
+        created=created,
+        reporter_resolution_changed=reporter_resolution_changed,
+        switch_user_id=reporter_switch_user_id,
+    )
     return True
 
 
@@ -491,13 +531,7 @@ async def record_polled_issue(
     wait_channel = (
         SWITCH_WAIT_CHANNEL if reporter_switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
     )
-    previous_ticket = await session.scalar(
-        select(JiraWorkerTicket).where(
-            JiraWorkerTicket.instance == instance,
-            JiraWorkerTicket.issue_key == issue_key,
-        )
-    )
-    await upsert_ticket(
+    ticket, created, reporter_resolution_changed = await upsert_ticket(
         session,
         instance=instance,
         issue_key=issue_key,
@@ -510,28 +544,13 @@ async def record_polled_issue(
         wait_channel=wait_channel,
         updated_at=jira_updated_at({"issue": issue}),
     )
-    if previous_ticket is None:
-        ticket = await session.scalar(
-            select(JiraWorkerTicket).where(
-                JiraWorkerTicket.instance == instance,
-                JiraWorkerTicket.issue_key == issue_key,
-            )
-        )
-        assert ticket is not None
-        if reporter_switch_user_id:
-            await _enqueue_switch_follow_up(
-                session,
-                command="invite_ticket_reporter",
-                ticket=ticket,
-                switch_user_id=reporter_switch_user_id,
-            )
-        else:
-            await _enqueue_switch_follow_up(
-                session,
-                command="upsert_ticket_admin_card",
-                ticket=ticket,
-                switch_user_id=None,
-            )
+    await _enqueue_ticket_intake_follow_ups(
+        session,
+        ticket=ticket,
+        created=created,
+        reporter_resolution_changed=reporter_resolution_changed,
+        switch_user_id=reporter_switch_user_id,
+    )
     return True
 
 
