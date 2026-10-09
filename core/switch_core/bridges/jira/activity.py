@@ -106,7 +106,13 @@ async def admit_room(
         count = await session.scalar(
             select(func.count())
             .select_from(JiraWorkerTicket)
-            .where(JiraWorkerTicket.room_claimed.is_(True))
+            .where(
+                JiraWorkerTicket.room_claimed.is_(True),
+                func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                    ("done", "cancelled", "canceled")
+                ),
+                scope,
+            )
         )
         older = await session.scalar(
             select(JiraWorkerTicket.id)
@@ -115,7 +121,6 @@ async def admit_room(
                 func.lower(func.trim(JiraWorkerTicket.status)).not_in(
                     ("done", "cancelled", "canceled")
                 ),
-                JiraWorkerTicket.queue_reason.is_not(None),
                 scope,
                 or_(
                     JiraWorkerTicket.first_seen_at < ticket.first_seen_at,
@@ -224,6 +229,7 @@ class TicketActivity:
         self._rooms = rooms
         self._clock = clock
         self._accounts: dict[str, str] = {}
+        self._comment_refresh_at: dict[str, datetime] = {}
 
     def _enabled(self, ticket: JiraWorkerTicket) -> bool:
         return ticket.project_key in self._config.jira_worker_enabled_projects.get(
@@ -366,16 +372,32 @@ class TicketActivity:
             await session.commit()
             return True
 
+    def _comment_refresh_due(self, ticket: JiraWorkerTicket) -> bool:
+        if ticket.wait_channel != "jira_comments":
+            return False
+        due = self._comment_refresh_at.get(ticket.id)
+        return due is None or due <= self._clock()
+
+    def _schedule_comment_refresh(self, ticket: JiraWorkerTicket) -> None:
+        if ticket.wait_channel != "jira_comments":
+            return
+        interval = max(1, self._config.jira_worker_poll_interval_seconds)
+        self._comment_refresh_at[ticket.id] = self._clock() + timedelta(
+            seconds=interval
+        )
+
     async def _read_jira(
         self, ticket: JiraWorkerTicket, *, force: bool
     ) -> dict[str, Any] | None:
         if (
             not force
+            and not self._comment_refresh_due(ticket)
             and ticket.jira_worker_account_id
             and ticket.jira_read_updated
             and ticket.last_event_at <= _stamp(ticket.jira_read_updated)
         ):
             return None
+        self._schedule_comment_refresh(ticket)
         client = self._clients.get(ticket.instance)
         if client is None:
             raise ValueError(f"Jira read credentials missing for {ticket.instance}")
@@ -455,17 +477,20 @@ class TicketActivity:
             if not isinstance(cursor, int) or cursor < ticket.thread_cursor:
                 raise ValueError("Thread reader returned an invalid cursor")
             for group in page["threads"]:
-                if group["root"]["id"] != ticket.card_event_id:
-                    continue
-                for message in group["replies"]:
-                    if message["kind"] != "message":
+                for message in (group["root"], *group["replies"]):
+                    if message.get("kind") != "message" or message.get("elided"):
+                        continue
+                    if message.get("id") == ticket.card_event_id:
+                        continue
+                    sender = message.get("sender")
+                    if not isinstance(sender, str) or await self._rooms.is_worker_sender(
+                        sender
+                    ):
                         continue
                     user_id = ticket.reporter_switch_user_id
                     reporter = (
                         user_id is not None
-                        and await self._rooms.is_reporter_sender(
-                            message["sender"], user_id
-                        )
+                        and await self._rooms.is_reporter_sender(sender, user_id)
                     )
                     await self._input(
                         session,
@@ -559,7 +584,14 @@ class TicketActivity:
             async with ticket_turn_lock(self._engine, ticket_id) as locked:
                 if not locked:
                     continue
-                if not await self.read_ticket(ticket_id, force_jira=True):
+                try:
+                    loaded = await self.read_ticket(ticket_id, force_jira=True)
+                except Exception:
+                    logger.exception(
+                        "Jira ticket input read failed for %s", ticket_id
+                    )
+                    continue
+                if not loaded:
                     continue
                 claimed = await self._claim_turn(ticket_id)
                 if claimed is None:

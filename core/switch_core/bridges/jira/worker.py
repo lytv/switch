@@ -403,19 +403,12 @@ async def upsert_ticket(
     )
     if ticket.jira_read_updated is None:
         ticket.jira_read_updated = ticket.last_event_at.isoformat()
-    previous_status = ticket.status
     ticket.issue_id = issue_id
     ticket.project_key = project_key
     ticket.summary = summary
     ticket.status = status
     if is_terminal_ticket_status(status):
         park_ticket(ticket, "Jira ticket completed or cancelled")
-    elif (
-        is_terminal_ticket_status(previous_status)
-        and ticket.worker_parked_reason == "Jira ticket completed or cancelled"
-    ):
-        ticket.worker_parked_reason = None
-        ticket.agent_state = "wake_requested"
     ticket.reporter_account_id = reporter_account_id
     ticket.reporter_switch_user_id = reporter_switch_user_id
     ticket.wait_channel = wait_channel

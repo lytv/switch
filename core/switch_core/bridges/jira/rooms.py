@@ -113,6 +113,8 @@ class TicketRooms(Protocol):
 
     async def is_reporter_sender(self, sender: str, user_id: str) -> bool: ...
 
+    async def is_worker_sender(self, sender: str) -> bool: ...
+
 
 class CardUpdater(Protocol):
     """In-place card refresh. Switch has no message-edit path
@@ -606,6 +608,24 @@ class SwitchTicketRooms:
                 )
                 is not None
             )
+
+    async def is_worker_sender(self, sender: str) -> bool:
+        matrix_id = getattr(self, "_worker_matrix_id", None)
+        if matrix_id is None:
+            async with self._sessions() as session:
+                agent = await self._agents.get_by_name(
+                    session, self._config.jira_agent_name
+                )
+                client = (
+                    await session.get(Client, agent.client_id)
+                    if agent is not None
+                    else None
+                )
+            if client is None:
+                return False
+            matrix_id = client.matrix_user_id
+            self._worker_matrix_id = matrix_id
+        return bool(matrix_id) and sender == matrix_id
 
     async def post_card(self, room_id: str, *, body: str) -> str:
         return await self._protocol.send_message(

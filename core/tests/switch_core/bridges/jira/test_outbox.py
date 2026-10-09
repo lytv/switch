@@ -45,6 +45,7 @@ class JiraMock:
         self.pre_send_server_errors = 0
         self.unavailable_transition = False
         self.read_failure = False
+        self.fail_issue_keys: set[str] = set()
         self.read_change = False
         self.write_started: asyncio.Event | None = None
         self.write_release: asyncio.Event | None = None
@@ -80,7 +81,10 @@ class JiraMock:
             if self.pre_send_server_errors:
                 self.pre_send_server_errors -= 1
                 return httpx.Response(500, json={"errorMessages": ["unavailable"]})
-            if self.read_failure:
+            if self.read_failure or any(
+                path.endswith(f"/issue/{key}") or f"/issue/{key}/" in path
+                for key in self.fail_issue_keys
+            ):
                 raise httpx.ConnectError("mock read unavailable", request=request)
             if path.endswith("/myself"):
                 return httpx.Response(200, json={"accountId": "worker-account"})

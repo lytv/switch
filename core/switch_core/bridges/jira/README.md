@@ -6,7 +6,7 @@ positive integer values:
 
 | Key | Default | Scope |
 | --- | ---: | --- |
-| `open_rooms` | 50 | All reserved or open ticket rooms |
+| `open_rooms` | 50 | Open rooms of enabled projects. Done, cancelled, and archived rooms do not count, and a project that is off does not hold a slot |
 | `live_sessions` | 5 | All claimed orchestrator turns |
 | `room_creates_per_hour` | 20 | Create attempts in the previous rolling hour |
 | `tokens_per_ticket` | 50000 | Cumulative reported usage for one ticket |
@@ -15,19 +15,24 @@ Room reservations and create attempts survive a restart. An uncertain room
 create keeps its reservation. Reconcile adopts the marked room before it attempts
 another create. Archive releases the room reservation after the archive succeeds.
 Tickets that exceed room or session capacity remain in the worker's To Do queue.
-Admission selects the oldest queued tickets first. The queue does not overwrite
+Admission selects the oldest unclaimed ticket in an enabled project first, including one that has no queue reason yet. The queue does not overwrite
 Jira status or a human decision.
 
 ## Input and waits
 
-The worker reads the ticket card's thread through `read_context`. Its internal
-sequence cursor follows database commit order. It does not use a timestamp cursor
-or require a mention. Event keys and cursor updates commit together.
+The worker reads every human message in the ticket room through `read_context`:
+top-level messages and replies in any thread. It skips its own messages and the
+ticket card. Its internal sequence cursor follows database commit order. It does
+not use a timestamp cursor or require a mention. Event keys and cursor updates
+commit together.
 
 An unmapped reporter uses Jira comments. A failed thread read records a fallback
 and selects Jira comments for that ticket. Ordinary Jira reads follow the existing
-webhook and watermark intake. The worker also checks Jira immediately before each
-orchestrator turn. It uses the existing paginated history and comment read path.
+webhook and watermark intake. While a ticket waits on Jira comments, the worker
+also reads comments on the poll interval when the issue timestamp has not moved.
+Comment event ids keep that repeat read from recording the same comment twice.
+The worker also checks Jira immediately before each orchestrator turn. It uses
+the existing paginated history and comment read path.
 
 Reporter input and due timers request a wake. They do not change Jira wait status.
 A human Jira action, Done, cancel, or an exhausted token budget parks the agent.
