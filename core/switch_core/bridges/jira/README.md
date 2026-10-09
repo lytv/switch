@@ -70,8 +70,8 @@ existing outbox version check, retry, and uncertain-write rules.
 
 One admin room holds every alert. The worker finds it by the
 `jira_worker_admin_room` marker, not by name. The configured admin user owns
-the room. The room uses the default bridge channel. Agents owned by admins
-are members, so they can read the card. The Jira system agent posts there.
+the room. The room uses the default bridge channel, the same way a ticket
+room does. The Jira system agent posts there.
 
 One card per ticket is posted once, then edited in place. The message keeps
 its id and position. The card shows the current reasons, ticket key, summary,

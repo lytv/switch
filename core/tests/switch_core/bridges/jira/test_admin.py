@@ -34,9 +34,6 @@ from switch_core.bridges.jira.rooms import (
 )
 from switch_core.config import JiraWorkerCalendar, JiraWorkerCredentials
 from switch_core.db.models import (
-    Agent,
-    ApiKey,
-    Client,
     JiraWorkerEvent,
     JiraWorkerOutbox,
     JiraWorkerTicket,
@@ -44,7 +41,6 @@ from switch_core.db.models import (
     Room,
     User,
 )
-from switch_core.db.stores.room_store import RoomStore
 from switch_core.room_service import RoomCreateConfig
 from tests.switch_core.bridges.jira.test_worker import _config, _run_migrations
 
@@ -1194,6 +1190,16 @@ async def test_admin_room_is_created_by_marker_not_name(
     assert room.external_channel_id == "channel-1"
     assert room.channel_type == "public"
     async with session_factory() as session:
+        room = await session.get(Room, first)
+        assert room is not None
+        room.owner_id = None
+        await session.commit()
+    assert await board.ensure_room() == first
+    assert len(created) == 1
+    async with session_factory() as session:
+        room = await session.get(Room, first)
+    assert room is not None and room.owner_id == admin_id
+    async with session_factory() as session:
         decoy = await session.scalar(
             select(Room).where(Room.matrix_room_id == "!decoy:test")
         )
@@ -1202,111 +1208,73 @@ async def test_admin_room_is_created_by_marker_not_name(
 
 
 @pytest.mark.asyncio
-async def test_admin_member_can_read_the_card(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    class Rooms:
-        def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
-            self.factory = factory
+class _RoomBoard(FakeAdminBoard):
+    def __init__(
+        self, factory: async_sessionmaker[AsyncSession], room_id: str
+    ) -> None:
+        super().__init__()
+        self.factory = factory
+        self.room_id = room_id
+        self._seq = 0
 
-        async def create_room(self, config: RoomCreateConfig) -> Any:
-            async with self.factory() as session:
-                room = Room(
-                    matrix_room_id=f"!admin-{uuid.uuid4().hex[:8]}:test",
-                    name=config.name,
-                    description=config.description,
-                    owner_id=config.owner_id,
-                    external_channel_id="channel-1",
-                    channel_type="public",
-                    metadata_=config.metadata,
-                )
-                session.add(room)
-                await session.flush()
-                if config.agent_names:
-                    agents = list(
-                        (
-                            await session.scalars(
-                                select(Agent).where(Agent.name.in_(config.agent_names))
-                            )
-                        ).all()
-                    )
-                    await RoomStore().add_agents(
-                        session, room.id, [agent.id for agent in agents]
-                    )
-                await session.commit()
-                return SimpleNamespace(room=room)
+    async def ensure_room(self) -> str:
+        return self.room_id
 
-    async with session_factory() as session:
-        admin = User(name="Admin", email="admin@example.com", role="admin")
-        stranger = User(name="Ada", email="ada@example.invalid", role="user")
-        session.add_all([admin, stranger])
-        await session.flush()
-        admin_agent = await _owned_agent(session, "admin-reader", admin.id)
-        other_agent = await _owned_agent(session, "other-reader", stranger.id)
-        await session.commit()
-        admin_agent_id = admin_agent.id
-        other_agent_id = other_agent.id
-    board = SwitchAdminBoard(
-        room_service=Rooms(session_factory),  # type: ignore[arg-type]
-        protocol=None,  # type: ignore[arg-type]
-        session_factory=session_factory,
-        agent_store=None,  # type: ignore[arg-type]
-        config=_worker_config(),
-    )
-    room_id = await board.ensure_room()
-    store = RoomStore()
-    async with session_factory() as session:
-        admin_room = await store.get_with_membership(session, room_id, admin_agent_id)
-        other_room = await store.get_with_membership(session, room_id, other_agent_id)
-        assert admin_room is not None and admin_room[1] is True
-        assert other_room is not None and other_room[1] is False
-        session.add(
-            Message(
-                seq=1,
-                room_id=room_id,
-                transport_event_id="card-1",
-                sender_id="jira",
-                event_type="m.room.message",
-                body="jira-admin-card:acme:KAN-1\nStatus: In Progress",
-                content={"body": "card"},
+    async def post_card(self, room_id: str, *, body: str) -> str:
+        return await self._insert(room_id, body, alert=False)
+
+    async def edit_card(self, room_id: str, event_id: str, *, body: str) -> None:
+        self.cards[event_id] = body
+        self.edits.append((event_id, body))
+        async with self.factory() as session:
+            message = await session.scalar(
+                select(Message).where(Message.transport_event_id == event_id)
             )
-        )
-        await session.commit()
-        body = await session.scalar(
-            select(Message.body).where(Message.room_id == room_id)
-        )
-    assert body is not None
-    assert "KAN-1" in body
+            if message is not None:
+                message.body = body
+                await session.commit()
+
+    async def post_alert(self, room_id: str, *, body: str) -> None:
+        await self._insert(room_id, body, alert=True)
+
+    async def _insert(self, room_id: str, body: str, *, alert: bool) -> str:
+        self._seq += 1
+        event_id = f"room-msg-{self._seq}"
+        async with self.factory() as session:
+            session.add(
+                Message(
+                    seq=self._seq,
+                    room_id=room_id,
+                    transport_event_id=event_id,
+                    sender_id="jira",
+                    event_type="m.room.message",
+                    body=body,
+                    content={"body": body},
+                )
+            )
+            await session.commit()
+        self.cards[event_id] = body
+        if alert:
+            self.alerts.append((room_id, body))
+        else:
+            self.posts.append(event_id)
+        return event_id
 
 
-async def _owned_agent(session: AsyncSession, name: str, owner_id: str) -> Agent:
-    api_key = ApiKey(
-        user_id=owner_id,
-        key_hash=f"hash-{name}",
-        encrypted_key="enc",
-        label=name,
-        type="agent",
-    )
-    client = Client(
-        matrix_user_id=f"@{name}:test",
-        display_name=name,
-        type="agent",
-    )
-    session.add_all([api_key, client])
-    await session.flush()
-    agent = Agent(
-        name=name,
-        description=name,
-        agent_type="session_addressable",
-        connector_type="claude_code",
-        integration_profile={},
-        client_id=client.id,
-        api_key_id=api_key.id,
-        owner_id=owner_id,
-    )
-    session.add(agent)
-    await session.flush()
-    return agent
+async def _alert_messages(
+    factory: async_sessionmaker[AsyncSession], room_id: str
+) -> list[str]:
+    async with factory() as session:
+        bodies = list(
+            (
+                await session.scalars(
+                    select(Message.body)
+                    .where(Message.room_id == room_id)
+                    .order_by(Message.seq)
+                )
+            ).all()
+        )
+    return [body for body in bodies if body and "Card updated." in body]
 
 
 @pytest.mark.asyncio
@@ -1314,7 +1282,18 @@ async def test_new_reason_posts_one_alert_and_clear_posts_none(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     ticket_id = await _seed(session_factory)
-    board = FakeAdminBoard()
+    async with session_factory() as session:
+        room = Room(
+            matrix_room_id="!alerts:test",
+            name="Jira admin",
+            description="alerts",
+            external_channel_id="channel-1",
+            channel_type="public",
+        )
+        session.add(room)
+        await session.commit()
+        room_id = room.id
+    board = _RoomBoard(session_factory, room_id)
     missing = _worker_config(jira_worker_credentials={})
     with pytest.raises(ValueError):
         await sync_admin_card(
@@ -1325,7 +1304,7 @@ async def test_new_reason_posts_one_alert_and_clear_posts_none(
             ticket_id=ticket_id,
             now=NOW,
         )
-    assert board.alerts == []
+    assert await _alert_messages(session_factory, room_id) == []
     await sync_admin_card(
         session_factory,
         engine=await _engine(session_factory),
@@ -1334,7 +1313,9 @@ async def test_new_reason_posts_one_alert_and_clear_posts_none(
         ticket_id=ticket_id,
         now=NOW,
     )
-    assert board.alerts == [("admin-room", "KAN-1: unmapped_reporter. Card updated.")]
+    alerts = await _alert_messages(session_factory, room_id)
+    assert len(alerts) == 1
+    assert alerts[0].startswith("KAN-1: unmapped_reporter. Card updated.")
     await sync_admin_card(
         session_factory,
         engine=await _engine(session_factory),
@@ -1343,7 +1324,7 @@ async def test_new_reason_posts_one_alert_and_clear_posts_none(
         ticket_id=ticket_id,
         now=NOW,
     )
-    assert len(board.alerts) == 1
+    assert len(await _alert_messages(session_factory, room_id)) == 1
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, ticket_id)
         assert ticket is not None
@@ -1357,7 +1338,108 @@ async def test_new_reason_posts_one_alert_and_clear_posts_none(
         ticket_id=ticket_id,
         now=NOW,
     )
-    assert len(board.alerts) == 1
+    assert len(await _alert_messages(session_factory, room_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_set_admin_card_reason_posts_one_alert(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed(
+        session_factory,
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        admin_card_event_id="card-1",
+    )
+    async with session_factory() as session:
+        room = Room(
+            matrix_room_id="!intake:test",
+            name="Jira admin",
+            description="alerts",
+            external_channel_id="channel-1",
+            channel_type="public",
+        )
+        session.add(room)
+        await session.commit()
+        room_id = room.id
+    board = _RoomBoard(session_factory, room_id)
+    board.cards["card-1"] = "old"
+    await set_admin_card_reason(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        instance="acme",
+        issue_key="KAN-1",
+        reason=INTAKE_REASON,
+        detail="6 questions",
+        now=NOW,
+    )
+    alerts = await _alert_messages(session_factory, room_id)
+    assert len(alerts) == 1
+    assert "intake_questions" in alerts[0]
+    await set_admin_card_reason(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        instance="acme",
+        issue_key="KAN-1",
+        reason=INTAKE_REASON,
+        detail=None,
+        now=NOW,
+    )
+    assert len(await _alert_messages(session_factory, room_id)) == 1
+    await set_admin_card_reason(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        instance="acme",
+        issue_key="KAN-1",
+        reason=INTAKE_REASON,
+        detail="7 questions",
+        now=NOW,
+    )
+    assert len(await _alert_messages(session_factory, room_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_before_reminder_send_is_not_posted(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        admin_card_event_id="admin-card-1",
+        wait_anchor=NOW - timedelta(hours=3),
+        wait_fired={},
+    )
+
+    class ReplyBoard(FakeAdminBoard):
+        async def edit_card(self, room_id: str, event_id: str, *, body: str) -> None:
+            await super().edit_card(room_id, event_id, body=body)
+            await _input_event(
+                session_factory,
+                kind="explicit_input",
+                received_at=NOW - timedelta(hours=1),
+            )
+
+    board = ReplyBoard()
+    board.cards["admin-card-1"] = "old"
+    await sync_admin_card(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        ticket_id=ticket_id,
+        now=NOW,
+    )
+    assert board.reminders == []
+    assert "reminder" not in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
 
 
 @pytest.mark.asyncio
