@@ -54,9 +54,10 @@ configuration fails the read without advancing its cursor. A ticket that uses
 `jira_comments` still accepts reporter comments as input.
 
 While Jira status equals `JIRA_WORKER_STATUSES.waiting_for_approval`, each human
-room message remains normal input with `wrong_place_type: switch_approval`.
-The worker queues a room notice with the Jira issue link. Agents do not trigger
-that notice. The notice never queues a Jira status change.
+room message creates an `ignored_input` event with `wrong_place_type:
+switch_approval`, without a wake. The worker queues a room notice with the Jira
+issue link. Agents do not trigger that notice. The notice never queues a Jira
+status change.
 
 `JIRA_WORKER_NOTICE_WINDOW_SECONDS` defaults to 86400 (24 hours) and must be
 positive. The durable outbox records each person's notice type and ticket.

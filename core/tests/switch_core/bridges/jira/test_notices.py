@@ -121,7 +121,7 @@ async def test_jira_edits_rate_limit_and_restart(session_factory, mapped):
 @pytest.mark.parametrize(
     "body", ["Approve", "Reject", "Please change the status", "A normal answer"]
 )
-async def test_human_room_message_is_input_not_approval(session_factory, body):
+async def test_human_room_message_is_ignored_not_approval(session_factory, body):
     key = await seed(session_factory)
     async with session_factory() as session:
         row = await session.get(JiraWorkerTicket, key)
@@ -143,7 +143,12 @@ async def test_human_room_message_is_input_not_approval(session_factory, body):
     ).read_once()
     logged = await events(session_factory)
     assert len(logged) == 4
-    assert all(e.event_kind == "thread_message" for e in logged)
+    assert [e.event_kind for e in logged] == [
+        "ignored_input",
+        "ignored_input",
+        "thread_message",
+        "ignored_input",
+    ]
     assert [e.payload.get("wrong_place_type") for e in logged] == [
         "switch_approval",
         "switch_approval",
@@ -179,8 +184,8 @@ async def test_human_room_message_is_input_not_approval(session_factory, body):
         turns.append(data)
         return TurnResult(1, None)
 
-    assert await reader.run_one_turn(turn) == key
-    assert len(turns[0].untrusted_data["events"]) == 4
+    assert await reader.run_one_turn(turn) is None
+    assert not turns
     assert (await ticket(session_factory, key)).status == "Awaiting review"
     assert not jira.writes
 
