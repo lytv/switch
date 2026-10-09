@@ -1330,3 +1330,77 @@ async def test_claimed_turn_excludes_raw_intake_events(session_factory) -> None:
         event.event_kind for event in await events(session_factory) if event.consumed
     }
     assert consumed == {"thread_message"}
+
+
+def _later_stamp(seconds: int) -> str:
+    return (datetime.fromisoformat(BASE) + timedelta(seconds=seconds)).isoformat()
+
+
+def _stamped_comment(
+    comment_id: str, author: str, created: str, updated: str
+) -> dict[str, Any]:
+    return {
+        "id": comment_id,
+        "author": {"accountId": author},
+        "updateAuthor": {"accountId": author},
+        "created": created,
+        "updated": updated,
+    }
+
+
+async def test_mixed_worker_comment_and_reporter_edit_wakes(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    assert (await ticket(session_factory, key)).agent_state == "waiting"
+    second = _later_stamp(10)
+    third = _later_stamp(20)
+    jira.comments.append(_stamped_comment("2", "worker-account", second, second))
+    jira.comments[0]["updated"] = third
+    jira.updated = third
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert row.agent_state == "wake_requested"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_mixed_worker_history_and_reporter_edit_wakes(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    second = _later_stamp(10)
+    third = _later_stamp(20)
+    jira.histories.append(
+        {"id": "1", "author": {"accountId": "worker-account"}, "created": second}
+    )
+    jira.updated = second
+    jira.comments[0]["updated"] = third
+    jira.updated = third
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert row.agent_state == "wake_requested"
+    assert len(await events(session_factory)) == 0
+
+
+async def test_mixed_worker_comment_and_other_edit_parks(session_factory) -> None:
+    key = await seed(session_factory, mapped=False)
+    rooms, jira = ThreadRooms(), JiraMock()
+    jira.comments.append(_same_stamp_comment("1", "reporter-account", BASE))
+    reader = activity(session_factory, jira, rooms)
+    await reader.read_ticket(key, force_jira=True)
+    second = _later_stamp(10)
+    third = _later_stamp(20)
+    jira.comments.append(_stamped_comment("2", "worker-account", second, second))
+    jira.comments[0]["updated"] = third
+    jira.comments[0]["updateAuthor"] = {"accountId": "human-account"}
+    jira.updated = third
+    await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked"

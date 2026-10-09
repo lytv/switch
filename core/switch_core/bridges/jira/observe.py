@@ -4,8 +4,8 @@ Activity reads, the outbox version check, and the webhook intake all classify
 the same way: comment newness only by ID, worker items ignored, new reporter
 IDs recorded, other authors or non-worker changelog rows park. A stamp move
 with no new ID and no new changelog row is attributed through the comments
-already returned in the same read (updated/updateAuthor, no new state); only
-a still-unexplained move parks.
+already returned in the same read (updated/updateAuthor, no new state), even alongside new IDs
+or changelog rows; only a still-unexplained move parks.
 """
 
 from __future__ import annotations
@@ -165,36 +165,32 @@ def observe_jira(
         if actor == worker_account or (actor and actor == reporter_account):
             attributable.append(_stamp(by_id[comment_id]["created"]))
             attributable.append(_stamp(by_id[comment_id]["updated"]))
-    if current_stamp > base_stamp and not new_entries and not new_ids:
-        edited = [
-            comment for comment in comments if _stamp(comment["updated"]) > base_stamp
-        ]
-        if not edited:
-            return Observation(
-                first=False,
-                park="unattributed",
-                seen_ids=tuple(sorted(seen_ids | current_ids)),
-                changelog_id=current_changelog,
-            )
-        edits: list[dict[str, Any]] = []
-        for comment in edited:
-            actor = comment_actor(comment)
-            if actor == worker_account:
-                attributable.append(_stamp(comment["updated"]))
-                continue
-            if actor and actor == reporter_account:
-                attributable.append(_stamp(comment["updated"]))
-                edits.append(comment)
-                continue
-            return Observation(
-                first=False,
-                park="human",
-                seen_ids=tuple(sorted(seen_ids | current_ids)),
-                changelog_id=current_changelog,
-            )
+    seen_comments = current_ids & seen_ids
+    edits: list[dict[str, Any]] = []
+    for comment_id in sorted(seen_comments):
+        comment = by_id[comment_id]
+        if _stamp(comment["updated"]) <= base_stamp:
+            continue
+        actor = comment_actor(comment)
+        if actor == worker_account:
+            attributable.append(_stamp(comment["updated"]))
+            continue
+        if actor and actor == reporter_account:
+            attributable.append(_stamp(comment["updated"]))
+            edits.append(comment)
+            continue
         return Observation(
             first=False,
-            reporter_edits=tuple(edits),
+            new_ids=frozenset(new_ids),
+            reporter_new=tuple(reporter_new),
+            park="human",
+            seen_ids=tuple(sorted(seen_ids | current_ids)),
+            changelog_id=current_changelog,
+        )
+    if current_stamp > base_stamp and not attributable:
+        return Observation(
+            first=False,
+            park="unattributed",
             seen_ids=tuple(sorted(seen_ids | current_ids)),
             changelog_id=current_changelog,
         )
@@ -211,17 +207,11 @@ def observe_jira(
             seen_ids=tuple(sorted(seen_ids | current_ids)),
             changelog_id=current_changelog,
         )
-    if not new_entries and not new_ids and current_stamp > base_stamp:
-        return Observation(
-            first=False,
-            park="unattributed",
-            seen_ids=tuple(sorted(seen_ids | current_ids)),
-            changelog_id=current_changelog,
-        )
     return Observation(
         first=False,
         new_ids=frozenset(new_ids),
         reporter_new=tuple(reporter_new),
+        reporter_edits=tuple(edits),
         seen_ids=tuple(sorted(seen_ids | current_ids)),
         changelog_id=current_changelog,
     )
