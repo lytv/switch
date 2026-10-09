@@ -198,6 +198,13 @@ def check_jira_version(
         raise HumanChange("Jira updated stamp has no attributable worker change")
 
 
+def park_ticket(ticket: JiraWorkerTicket, reason: str) -> None:
+    ticket.agent_state = "parked"
+    ticket.agent_generation += 1
+    ticket.wake_at = None
+    ticket.worker_parked_reason = reason
+
+
 def _failure_reason(command_id: str) -> str:
     return f"Jira command failed: {command_id}"
 
@@ -316,7 +323,7 @@ class JiraOutboxSender:
         if row.status == "sending":
             row.status = "uncertain"
             row.error = "Restart found a write with an unknown outcome; automatic replay is unsafe"
-            ticket.worker_parked_reason = row.error
+            park_ticket(ticket, row.error)
             await session.commit()
             return
         payload = row.payload or {}
@@ -365,6 +372,7 @@ class JiraOutboxSender:
                 if not isinstance(account_id, str) or not account_id:
                     raise ValueError("Jira worker accountId is required")
                 self._accounts[row.instance] = account_id
+            ticket.jira_worker_account_id = account_id
             path = f"/rest/api/3/issue/{quote(row.issue_key, safe='')}"
             method = "POST"
             if row.command == "transition":
@@ -409,7 +417,7 @@ class JiraOutboxSender:
         except HumanChange as exc:
             row.status = "parked"
             row.error = str(exc)
-            ticket.worker_parked_reason = str(exc)
+            park_ticket(ticket, str(exc))
         except Exception as exc:
             if sending and (
                 isinstance(exc, httpx.TransportError)
@@ -420,7 +428,7 @@ class JiraOutboxSender:
             ):
                 row.status = "uncertain"
                 row.error = f"{type(exc).__name__}: Jira write outcome is unknown; automatic replay is unsafe"
-                ticket.worker_parked_reason = row.error
+                park_ticket(ticket, row.error)
             else:
                 transient = isinstance(exc, httpx.TransportError) or (
                     isinstance(exc, httpx.HTTPStatusError)
@@ -445,7 +453,7 @@ class JiraOutboxSender:
                 else:
                     row.status = "failed"
                     if not payload.get("failure_of"):
-                        ticket.worker_parked_reason = _failure_reason(row.id)
+                        park_ticket(ticket, _failure_reason(row.id))
                     if (
                         not payload.get("failure_of")
                         and payload.get("based_updated")

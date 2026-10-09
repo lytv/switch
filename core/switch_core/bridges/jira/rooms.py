@@ -22,18 +22,27 @@ step 7's admin cards.
 from __future__ import annotations
 
 import logging
-from typing import Protocol, cast
+from datetime import UTC, datetime
+from typing import Any, Protocol, cast
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
+from switch_core.bridges.jira.activity import (
+    admit_room,
+    capacity_lock,
+    ticket_turn_lock,
+)
 from switch_core.bridges.jira.worker import (
     SYNC_TICKET_ROOM_COMMAND,
     is_terminal_ticket_status,
 )
-from switch_core.config import SwitchConfig
+from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import (
+    Client,
+    ExternalUser,
+    ExternalUserClaim,
     JiraWorkerIdentity,
     JiraWorkerOutbox,
     JiraWorkerTicket,
@@ -99,6 +108,10 @@ class TicketRooms(Protocol):
     async def reporter_display_name(self, switch_user_id: str) -> str | None: ...
 
     def issue_url(self, *, instance: str, issue_key: str) -> str: ...
+
+    async def read_context(self, room_id: str, *, after_seq: int) -> dict[str, Any]: ...
+
+    async def is_reporter_sender(self, sender: str, user_id: str) -> bool: ...
 
 
 class CardUpdater(Protocol):
@@ -175,6 +188,7 @@ async def _render_card(
 async def _relock_ticket(
     session: AsyncSession, *, instance: str, issue_key: str
 ) -> JiraWorkerTicket | None:
+    await capacity_lock(session)
     ticket = await session.scalar(
         select(JiraWorkerTicket)
         .where(
@@ -232,6 +246,7 @@ async def _ensure_owner(
     )
     ticket.room_id = None
     ticket.card_event_id = None
+    ticket.thread_cursor = 0
     await session.flush()
     return False
 
@@ -262,6 +277,39 @@ async def reconcile_ticket_room(
     rooms: TicketRooms,
     jira_agent_name: str,
     cards: CardUpdater | None = None,
+    limits: JiraWorkerLimits | None = None,
+    now: datetime | None = None,
+    enabled_projects: dict[str, list[str]] | None = None,
+) -> str | None:
+    async with ticket_turn_lock(
+        cast(AsyncEngine, session.bind), f"room:{instance}:{issue_key}"
+    ) as locked:
+        if not locked:
+            return None
+        return await _reconcile_ticket_room(
+            session,
+            instance=instance,
+            issue_key=issue_key,
+            rooms=rooms,
+            jira_agent_name=jira_agent_name,
+            cards=cards,
+            limits=limits or JiraWorkerLimits(),
+            now=now or datetime.now(UTC),
+            enabled_projects=enabled_projects,
+        )
+
+
+async def _reconcile_ticket_room(
+    session: AsyncSession,
+    *,
+    instance: str,
+    issue_key: str,
+    rooms: TicketRooms,
+    jira_agent_name: str,
+    cards: CardUpdater | None,
+    limits: JiraWorkerLimits,
+    now: datetime,
+    enabled_projects: dict[str, list[str]] | None,
 ) -> str | None:
     """Converge one ticket's room, owner, live card, thread root, and archive state.
 
@@ -281,6 +329,10 @@ async def reconcile_ticket_room(
     ticket = await _relock_ticket(session, instance=instance, issue_key=issue_key)
     if ticket is None:
         return None
+    if enabled_projects is not None and ticket.project_key not in enabled_projects.get(
+        ticket.instance, []
+    ):
+        return None
 
     for _ in range(2):
         room_id = ticket.room_id
@@ -292,6 +344,7 @@ async def reconcile_ticket_room(
             )
             ticket.room_id = None
             ticket.card_event_id = None
+            ticket.thread_cursor = 0
             await session.flush()
             room_id = None
         if room_id is None:
@@ -301,6 +354,15 @@ async def reconcile_ticket_room(
             if room_id is not None and await rooms.is_archived(room_id) is None:
                 room_id = None
             if room_id is not None:
+                if not await admit_room(
+                    session,
+                    ticket,
+                    limits,
+                    create=False,
+                    now=now,
+                    enabled_projects=enabled_projects,
+                ):
+                    return None
                 ticket.room_id = room_id
                 await session.commit()
                 ticket = await _relock_ticket(
@@ -312,6 +374,21 @@ async def reconcile_ticket_room(
             else:
                 owner_id = await _mapped_reporter_user_id(session, ticket)
                 body = await _render_card(session, rooms, ticket, owner_id)
+                if not await admit_room(
+                    session,
+                    ticket,
+                    limits,
+                    create=True,
+                    now=now,
+                    enabled_projects=enabled_projects,
+                ):
+                    return None
+                await session.commit()
+                ticket = await _relock_ticket(
+                    session, instance=instance, issue_key=issue_key
+                )
+                if ticket is None:
+                    return None
                 room_id = await rooms.create_ticket_room(
                     name=ticket.issue_key,
                     description=body,
@@ -327,6 +404,16 @@ async def reconcile_ticket_room(
                 if ticket is None:
                     return room_id
                 await rooms.ensure_agent_member(room_id, agent_name=jira_agent_name)
+        if not is_terminal_ticket_status(ticket.status) and not ticket.room_claimed:
+            if not await admit_room(
+                session,
+                ticket,
+                limits,
+                create=False,
+                now=now,
+                enabled_projects=enabled_projects,
+            ):
+                return None
         owner_id = await _mapped_reporter_user_id(session, ticket)
         if not await _ensure_owner(session, rooms, ticket, room_id, owner_id):
             continue
@@ -344,6 +431,9 @@ async def reconcile_ticket_room(
                 continue
             body = await _render_card(session, rooms, ticket, owner_id)
         await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        if is_terminal_ticket_status(ticket.status):
+            ticket.room_claimed = False
+            ticket.queue_reason = None
         await _mark_ticket_room_sync_done(session, ticket_id=ticket.id)
         await session.flush()
         return room_id
@@ -359,6 +449,8 @@ async def sync_ticket_room(
     rooms: TicketRooms | None,
     jira_agent_name: str,
     cards: CardUpdater | None = None,
+    config: SwitchConfig,
+    now: datetime | None = None,
 ) -> str | None:
     """Converge one ticket room. Shared by intake, poll, mapping, and the sweep.
 
@@ -377,6 +469,9 @@ async def sync_ticket_room(
                 rooms=rooms,
                 jira_agent_name=jira_agent_name,
                 cards=cards,
+                limits=config.jira_worker_limits,
+                enabled_projects=config.jira_worker_enabled_projects,
+                now=now,
             )
             await session.commit()
         except Exception:
@@ -487,6 +582,30 @@ class SwitchTicketRooms:
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         await self._rooms.add_agents_to_room(room_id, agent_names=[agent_name])
         await self._rooms.invite_missing_member_clients(room_id)
+
+    async def read_context(self, room_id: str, *, after_seq: int) -> dict[str, Any]:
+        return await self._protocol.read_context(
+            await self._jira_agent_id(), room_id, limit=500, after_seq=after_seq
+        )
+
+    async def is_reporter_sender(self, sender: str, user_id: str) -> bool:
+        async with self._sessions() as session:
+            return (
+                await session.scalar(
+                    select(ExternalUserClaim.user_id)
+                    .join(
+                        ExternalUser,
+                        ExternalUser.id == ExternalUserClaim.external_user_id,
+                    )
+                    .join(Client, Client.id == ExternalUser.client_id)
+                    .where(
+                        Client.matrix_user_id == sender,
+                        ExternalUserClaim.user_id == user_id,
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
 
     async def post_card(self, room_id: str, *, body: str) -> str:
         return await self._protocol.send_message(

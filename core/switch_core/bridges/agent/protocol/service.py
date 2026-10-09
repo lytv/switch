@@ -1761,6 +1761,8 @@ class ProtocolService:
         limit: int = 50,
         since_ms: int | None = None,
         before_ms: int | None = None,
+        *,
+        after_seq: int | None = None,
     ) -> dict[str, Any]:
         """Fetch room history grouped into threads.
 
@@ -1787,20 +1789,32 @@ class ProtocolService:
         """
         await self.require_room_member(agent_id, room_id)
         limit = max(1, min(limit, HISTORY_MAX_LIMIT))
+        if after_seq is not None and (
+            after_seq < 0 or since_ms is not None or before_ms is not None
+        ):
+            raise ValueError(
+                "after_seq requires a nonnegative cursor and no time window"
+            )
 
         async with self.session_factory() as session:
             # One more than asked for. Whether that row exists is precisely the
             # question `truncated` answers, so there is nothing to estimate and
             # no reason to be conservative about it.
-            rows = await self.message_store.list_timeline(
-                session,
-                room_id,
-                limit=limit + 1,
-                since=_from_epoch_ms(since_ms),
-                before=_from_epoch_ms(before_ms),
-            )
+            if after_seq is None:
+                rows = await self.message_store.list_timeline(
+                    session,
+                    room_id,
+                    limit=limit + 1,
+                    since=_from_epoch_ms(since_ms),
+                    before=_from_epoch_ms(before_ms),
+                )
+            else:
+                rows = await self.message_store.list_for_room(
+                    session, room_id, after_seq=after_seq, limit=limit + 1
+                )
             truncated = len(rows) > limit
             rows = rows[:limit]
+            next_seq = rows[-1].seq if after_seq is not None and rows else after_seq
 
             # Replies whose root is older than the window. Reading them costs
             # one more query for the whole page rather than one per thread.
@@ -1850,14 +1864,18 @@ class ProtocolService:
 
         threads: list[dict[str, Any]] = []
         for group in sorted(groups.values(), key=lambda g: g["latest"]):
-            group["replies"].reverse()  # rows came newest-first
+            if after_seq is None:
+                group["replies"].reverse()  # timeline rows came newest-first
             threads.append({"root": group["root"], "replies": group["replies"]})
 
-        return {
+        result = {
             "threads": threads,
             "truncated": truncated,
             "oldest_timestamp": oldest_ts,
         }
+        if after_seq is not None:
+            result["next_seq"] = next_seq
+        return result
 
     async def download_media(
         self, agent_id: str, room_id: str, mxc: str

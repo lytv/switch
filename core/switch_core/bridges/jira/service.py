@@ -162,6 +162,7 @@ class JiraBridgeService:
             rooms=self._ticket_rooms,
             jira_agent_name=self._config.jira_agent_name,
             cards=self._card_updater,
+            config=self._config,
         )
 
     async def _resolve_jira_agent(self) -> str | None:

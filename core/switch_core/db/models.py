@@ -1120,15 +1120,27 @@ class JiraWorkerTicket(Base):
         Text, nullable=False, default="jira_comments"
     )
     worker_parked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_state: Mapped[str] = mapped_column(
+        Text, nullable=False, default="wake_requested"
+    )
+    agent_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    wake_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tokens_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    room_claimed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    queue_reason: Mapped[str | None] = mapped_column(Text)
+    thread_cursor: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    jira_read_updated: Mapped[str | None] = mapped_column(Text)
+    jira_read_changelog_id: Mapped[str | None] = mapped_column(Text)
+    jira_worker_account_id: Mapped[str | None] = mapped_column(Text)
     # Set by a later step when the ticket room exists; null until then.
     room_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Transport event id of the ticket card message; null until posted.
     # Step 3 updates the card in place rather than posting a new one.
     card_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    first_seen_at: Mapped[str] = mapped_column(
+    first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    last_event_at: Mapped[str] = mapped_column(
+    last_event_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
@@ -1184,6 +1196,7 @@ class JiraWorkerEvent(Base):
     received_at: Mapped[str] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    consumed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class JiraWorkerOutbox(Base):
