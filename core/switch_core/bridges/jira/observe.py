@@ -71,18 +71,18 @@ def observe_jira(
             if _stamp(comment["created"]) > base_stamp
         )
         pre_by_id = {str(comment.get("id", "")): comment for comment in comments}
-        reporter_new = []
+        initial_reporter_new = []
         for comment_id in pre_new:
             actor = comment_actor(pre_by_id[comment_id])
             if actor == worker_account:
                 continue
             if actor and actor == reporter_account:
-                reporter_new.append(pre_by_id[comment_id])
+                initial_reporter_new.append(pre_by_id[comment_id])
                 continue
             return Observation(
                 first=True,
                 new_ids=frozenset(pre_new),
-                reporter_new=tuple(reporter_new),
+                reporter_new=tuple(initial_reporter_new),
                 park="human",
                 seen_ids=tuple(sorted(current_ids)),
                 changelog_id=current_changelog,
@@ -95,7 +95,7 @@ def observe_jira(
                 return Observation(
                     first=True,
                     new_ids=frozenset(pre_new),
-                    reporter_new=tuple(reporter_new),
+                    reporter_new=tuple(initial_reporter_new),
                     park="human",
                     seen_ids=tuple(sorted(current_ids)),
                     changelog_id=current_changelog,
@@ -103,7 +103,7 @@ def observe_jira(
         return Observation(
             first=True,
             new_ids=frozenset(pre_new),
-            reporter_new=tuple(reporter_new),
+            reporter_new=tuple(initial_reporter_new),
             seen_ids=tuple(sorted(current_ids)),
             changelog_id=current_changelog,
         )
