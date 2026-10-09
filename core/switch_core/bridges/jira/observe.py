@@ -71,18 +71,29 @@ def observe_jira(
             if _stamp(comment["created"]) > base_stamp
         )
         pre_by_id = {str(comment.get("id", "")): comment for comment in comments}
+        pre_edits = {
+            str(comment.get("id", ""))
+            for comment in comments
+            if _stamp(comment["created"]) <= base_stamp
+            and _stamp(comment["updated"]) > base_stamp
+        }
         initial_reporter_new = []
-        for comment_id in pre_new:
+        initial_reporter_edits = []
+        for comment_id in sorted(set(pre_new) | pre_edits):
             actor = comment_actor(pre_by_id[comment_id])
             if actor == worker_account:
                 continue
             if actor and actor == reporter_account:
-                initial_reporter_new.append(pre_by_id[comment_id])
+                if comment_id in pre_edits:
+                    initial_reporter_edits.append(pre_by_id[comment_id])
+                else:
+                    initial_reporter_new.append(pre_by_id[comment_id])
                 continue
             return Observation(
                 first=True,
                 new_ids=frozenset(pre_new),
                 reporter_new=tuple(initial_reporter_new),
+                reporter_edits=tuple(initial_reporter_edits),
                 park="human",
                 seen_ids=tuple(sorted(current_ids)),
                 changelog_id=current_changelog,
@@ -96,6 +107,7 @@ def observe_jira(
                     first=True,
                     new_ids=frozenset(pre_new),
                     reporter_new=tuple(initial_reporter_new),
+                    reporter_edits=tuple(initial_reporter_edits),
                     park="human",
                     seen_ids=tuple(sorted(current_ids)),
                     changelog_id=current_changelog,
@@ -104,6 +116,7 @@ def observe_jira(
             first=True,
             new_ids=frozenset(pre_new),
             reporter_new=tuple(initial_reporter_new),
+            reporter_edits=tuple(initial_reporter_edits),
             seen_ids=tuple(sorted(current_ids)),
             changelog_id=current_changelog,
         )

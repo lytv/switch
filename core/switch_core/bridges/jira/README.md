@@ -40,6 +40,35 @@ A human Jira action, Done, cancel, or an exhausted token budget parks the agent.
 New input cannot clear a human park. An interrupted turn also parks the ticket,
 because its outcome and token usage are unknown.
 
+## Wrong-place notices
+
+Jira owns status changes and the Approve/Reject transitions. Switch owns answers
+when the ticket's wait channel is `switch`. Milestone summaries remain Jira
+comments. No keyword matching or model infers approval from a room message.
+
+A new or edited reporter Jira comment on a Switch-channel ticket creates an
+`ignored_input` event, without a wake. The orchestrator never consumes that event.
+The worker enqueues a Jira comment notice through the compare-read-write outbox.
+The notice links to the ticket room using `FRONTEND_BASE_URL`; missing link
+configuration fails the read without advancing its cursor. A ticket that uses
+`jira_comments` still accepts reporter comments as input.
+
+While Jira status equals `JIRA_WORKER_STATUSES.waiting_for_approval`, each human
+room message remains normal input with `wrong_place_type: switch_approval`.
+The worker queues a room notice with the Jira issue link. Agents do not trigger
+that notice. The notice never queues a Jira status change.
+
+`JIRA_WORKER_NOTICE_WINDOW_SECONDS` defaults to 86400 (24 hours) and must be
+positive. The durable outbox records each person's notice type and ticket.
+The ticket row lock serializes the rolling-window check and enqueue across
+restarts and concurrent readers. Notice claims count even when delivery fails.
+A Switch notice with an unknown send outcome becomes `uncertain` and logs an
+error; the worker does not replay it automatically. Jira notices retain the
+existing outbox version check, retry, and uncertain-write rules.
+
+Admin override and admin cards remain step 7 work. Intake decisions remain step 8
+work. No UI is part of this boundary.
+
 ## One-turn integration
 
 Step 8 can call `scheduler.activity.run_one_turn(callback)`. This method claims
@@ -56,4 +85,4 @@ during the turn requests another wake. A concurrent human park invalidates the
 turn's completion; it cannot clear that park or consume the pending input.
 
 This boundary does not implement intake prompts, Jira approval decisions,
-wrong-place notices, or admin cards.
+or admin cards.

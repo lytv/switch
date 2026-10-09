@@ -20,9 +20,19 @@ from switch_core.bridges.jira.observe import (
     comment_actor,
     observe_jira,
 )
-from switch_core.bridges.jira.outbox import HumanChange, park_ticket, read_jira_version
+from switch_core.bridges.jira.outbox import (
+    HumanChange,
+    enqueue_jira_command,
+    park_ticket,
+    read_jira_version,
+)
 from switch_core.config import JiraWorkerLimits, SwitchConfig
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerEvent,
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+)
 
 if TYPE_CHECKING:
     from switch_core.bridges.jira.rooms import TicketRooms
@@ -284,7 +294,8 @@ class TicketActivity:
         data: dict[str, Any],
         *,
         reporter: bool,
-    ) -> None:
+        wrong_place_type: str | None = None,
+    ) -> str | None:
         event_id = await record_event(
             session,
             instance=ticket.instance,
@@ -293,10 +304,91 @@ class TicketActivity:
             project_key=ticket.project_key,
             event_kind=kind,
             webhook_event=f"worker:{kind}",
-            payload={"untrusted_data": data, "reporter_input": reporter},
+            payload={
+                "untrusted_data": data,
+                "reporter_input": reporter,
+                **({"wrong_place_type": wrong_place_type} if wrong_place_type else {}),
+            },
         )
         if event_id and reporter:
             request_wake(ticket)
+        return event_id
+
+    async def _notice(
+        self,
+        session: AsyncSession,
+        ticket: JiraWorkerTicket,
+        *,
+        person: str,
+        wrong_place_type: str,
+        event_id: str,
+    ) -> None:
+        # The caller holds the ticket row lock through the throttle check and enqueue.
+        now = self._clock()
+        recent = await session.scalar(
+            select(JiraWorkerOutbox.id)
+            .where(
+                JiraWorkerOutbox.instance == ticket.instance,
+                JiraWorkerOutbox.issue_key == ticket.issue_key,
+                JiraWorkerOutbox.payload["notice_person"].astext == person,
+                JiraWorkerOutbox.payload["wrong_place_type"].astext == wrong_place_type,
+                JiraWorkerOutbox.created_at
+                > now
+                - timedelta(seconds=self._config.jira_worker_notice_window_seconds),
+            )
+            .limit(1)
+        )
+        if recent:
+            return
+        command_key = f"wrong-place:{event_id}"
+        metadata = {"notice_person": person, "wrong_place_type": wrong_place_type}
+        if wrong_place_type == "jira_answer":
+            if not self._config.frontend_base_url or not ticket.room_id:
+                raise ValueError(
+                    "Jira answer notices require frontend_base_url and a ticket room"
+                )
+            link = (
+                f"{self._config.frontend_base_url.rstrip('/')}/rooms/{ticket.room_id}"
+            )
+            assert ticket.jira_read_updated is not None
+            assert ticket.jira_read_changelog_id is not None
+            command_id = await enqueue_jira_command(
+                session,
+                config=self._config,
+                ticket=ticket,
+                command_key=command_key,
+                command="comment",
+                data=f"The worker did not use this Jira comment as an answer; answer in the Switch ticket room at {link}",
+                based_updated=ticket.jira_read_updated,
+                based_changelog_id=ticket.jira_read_changelog_id,
+            )
+            row = await session.get(JiraWorkerOutbox, command_id)
+            assert row is not None
+            row.payload = {**(row.payload or {}), **metadata}
+            row.created_at = now
+            row.due_at = now
+        else:
+            assert self._rooms is not None and ticket.room_id
+            link = self._rooms.issue_url(
+                instance=ticket.instance, issue_key=ticket.issue_key
+            )
+            session.add(
+                JiraWorkerOutbox(
+                    channel="switch",
+                    instance=ticket.instance,
+                    issue_key=ticket.issue_key,
+                    command_key=command_key,
+                    command="wrong_place_notice",
+                    payload={
+                        **metadata,
+                        "room_id": ticket.room_id,
+                        "data": f"This room message cannot approve, reject, or change status; use the Jira Approve or Reject transition or change status at {link}",
+                    },
+                    created_at=now,
+                    due_at=now,
+                )
+            )
+        await session.flush()
 
     async def read_ticket(self, ticket_id: str, *, force_jira: bool = False) -> bool:
         async with self._factory() as session:
@@ -316,7 +408,11 @@ class TicketActivity:
             version, observation = await self._read_jira(ticket, force=force_jira)
             fell_back = False
             if (
-                ticket.wait_channel == "switch"
+                (
+                    ticket.wait_channel == "switch"
+                    or ticket.status
+                    == self._config.jira_worker_statuses.waiting_for_approval
+                )
                 and self._rooms is not None
                 and ticket.room_id
                 and ticket.card_event_id
@@ -374,16 +470,27 @@ class TicketActivity:
                     request_wake(ticket)
             else:
                 for comment in (
-                    observation.reporter_new if observation is not None else []
+                    (*observation.reporter_new, *observation.reporter_edits)
+                    if observation is not None
+                    else ()
                 ):
-                    await self._input(
+                    event_id = await self._input(
                         session,
                         ticket,
-                        "jira_comment",
+                        "ignored_input",
                         f"jira-comment:{ticket.issue_key}:{comment['id']}:{comment['updated']}",
                         comment,
                         reporter=False,
+                        wrong_place_type="jira_answer",
                     )
+                    if event_id:
+                        await self._notice(
+                            session,
+                            ticket,
+                            person=comment_actor(comment),
+                            wrong_place_type="jira_answer",
+                            event_id=event_id,
+                        )
             if ticket.wake_at and ticket.wake_at <= self._clock():
                 due = ticket.wake_at.isoformat()
                 await self._input(
@@ -500,14 +607,28 @@ class TicketActivity:
                         user_id is not None
                         and await self._rooms.is_reporter_sender(sender, user_id)
                     )
-                    await self._input(
+                    wrong_place = (
+                        ticket.status
+                        == self._config.jira_worker_statuses.waiting_for_approval
+                        and await self._rooms.is_human_sender(sender)
+                    )
+                    event_id = await self._input(
                         session,
                         ticket,
                         "thread_message",
                         f"thread:{ticket.room_id}:{message['id']}",
                         message,
                         reporter=reporter,
+                        wrong_place_type="switch_approval" if wrong_place else None,
                     )
+                    if event_id and wrong_place:
+                        await self._notice(
+                            session,
+                            ticket,
+                            person=sender,
+                            wrong_place_type="switch_approval",
+                            event_id=event_id,
+                        )
             if page["truncated"] and cursor == ticket.thread_cursor:
                 raise ValueError("Thread pagination made no progress")
             ticket.thread_cursor = cursor

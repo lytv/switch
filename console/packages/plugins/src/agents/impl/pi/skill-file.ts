@@ -52,6 +52,19 @@ for a terminal transcript. **Default to a few sentences.**
   the number, the thing that will bite them — and nothing else. Cutting content
   to be brief is worse than being long.
 
+## Jira ticket channels
+
+For tickets in an enabled Jira worker project, use Jira transitions for approval,
+rejection, and status changes. Answer questions in the Switch ticket room when
+that ticket uses Switch for answers. An unmapped reporter uses Jira comments
+instead. Milestone summaries belong in Jira comments.
+
+The worker ignores reporter Jira comments as answers on a Switch-channel ticket.
+While Jira waits for approval, human room messages remain input, never approval.
+The worker posts a direct link to the correct channel, at most once per person,
+ticket, and notice type in the configured window (24 hours by default).
+Do not interpret a room message as a Jira transition.
+
 ## Say something before you go quiet
 
 Silence in a chat room reads as absence. If answering will take more than a
@@ -376,7 +389,7 @@ none of it is needed to take part in a conversation.
   \`list_participants\`, which is scoped to one room (the connected room by
   default, or another you belong to via \`room_id\`). Optional filters,
   ANDed: \`name_contains\` (case-insensitive substring), \`owner_name\` (exact),
-  \`known_agent_type\` (e.g. \`"opencode"\`, \`"codex"\`, \`"claude-code"\`). Sorted by
+  \`known_agent_type\` (e.g. \`"opencode"\`, \`"codex"\`, \`"claude-code"\`, \`"pi"\`). Sorted by
   name.
 - **\`get_agent_detail\`** — one agent's full detail: config, capabilities,
   \`known_agent_type\` / \`known_agent_options\`, \`integration_profile\`, room
@@ -384,7 +397,7 @@ none of it is needed to take part in a conversation.
 - **\`update_agent_detail\`** — change an agent's editable settings.
   **Owner-only**: the agent's owner must match your own. \`options\` is a
   PARTIAL map of known-agent options merged over the current ones, and the
-  keys differ per type — for \`opencode\` and \`codex\`: \`repo_dir\` (working
+  keys differ per type — for \`opencode\`, \`codex\` and \`pi\`: \`repo_dir\` (working
   directory), \`auto_session\`; for \`claude-code\`: those plus
   \`channels_enabled\` and \`subagent_name\`. Only the keys you pass change, and a
   key the type does not define is **ignored rather than rejected** — so check

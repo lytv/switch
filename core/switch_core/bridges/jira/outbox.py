@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -25,6 +25,7 @@ from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
 if TYPE_CHECKING:
+    from switch_core.bridges.jira.rooms import TicketRooms
     from switch_core.bridges.jira.worker import ClockFn, JiraPollClient
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,7 @@ class JiraOutboxSender:
         config: SwitchConfig,
         clients: dict[str, JiraPollClient],
         clock: ClockFn,
+        rooms: TicketRooms | None = None,
     ) -> None:
         self._factory = session_factory
         self._engine = cast(AsyncEngine, session_factory.kw["bind"])
@@ -212,6 +214,7 @@ class JiraOutboxSender:
         self._clients = clients
         self._clock = clock
         self._accounts: dict[str, str] = {}
+        self._rooms = rooms
 
     async def run_once(self) -> None:
         scopes = [
@@ -220,7 +223,7 @@ class JiraOutboxSender:
                 JiraWorkerTicket.project_key.in_(projects),
             )
             for instance, projects in self._config.jira_worker_enabled_projects.items()
-            if projects and instance in self._clients
+            if projects
         ]
         if not scopes:
             return
@@ -238,7 +241,17 @@ class JiraOutboxSender:
                             ),
                         )
                         .where(
-                            JiraWorkerOutbox.channel == "jira",
+                            or_(
+                                and_(
+                                    JiraWorkerOutbox.channel == "jira",
+                                    JiraWorkerOutbox.instance.in_(self._clients),
+                                ),
+                                and_(
+                                    JiraWorkerOutbox.channel == "switch",
+                                    JiraWorkerOutbox.command == "wrong_place_notice",
+                                    literal(self._rooms is not None),
+                                ),
+                            ),
                             JiraWorkerOutbox.status.in_(_ACTIVE),
                             JiraWorkerOutbox.due_at <= self._clock(),
                             or_(*scopes),
@@ -307,6 +320,9 @@ class JiraOutboxSender:
         if ticket.project_key not in self._config.jira_worker_enabled_projects.get(
             ticket.instance, []
         ):
+            return
+        if row.channel == "switch":
+            await self._send_switch_notice(session, row)
             return
         if row.status == "sending":
             row.status = "uncertain"
@@ -448,6 +464,32 @@ class JiraOutboxSender:
                         and "based_changelog_id" in payload
                     ):
                         await self._enqueue_failure(session, ticket, row)
+        else:
+            row.status = "done"
+            row.error = None
+        await session.commit()
+
+    async def _send_switch_notice(
+        self, session: AsyncSession, row: JiraWorkerOutbox
+    ) -> None:
+        if row.command != "wrong_place_notice" or self._rooms is None:
+            raise ValueError("Switch notice sender requires ticket rooms")
+        if row.status == "sending":
+            row.status = "uncertain"
+            row.error = "Restart found a room notice with an unknown outcome; automatic replay is unsafe"
+            logger.error("Switch notice %s: %s", row.id, row.error)
+            await session.commit()
+            return
+        payload = row.payload or {}
+        row.status = "sending"
+        row.attempts += 1
+        await session.commit()
+        try:
+            await self._rooms.post_notice(payload["room_id"], body=payload["data"])
+        except Exception as exc:
+            row.status = "uncertain"
+            row.error = f"{type(exc).__name__}: Room notice outcome is unknown; automatic replay is unsafe"
+            logger.exception("Switch notice %s failed", row.id)
         else:
             row.status = "done"
             row.error = None

@@ -44,6 +44,19 @@ for a terminal transcript. **Default to a few sentences.**
   the number, the thing that will bite them — and nothing else. Cutting content
   to be brief is worse than being long.
 
+## Jira ticket channels
+
+For tickets in an enabled Jira worker project, use Jira transitions for approval,
+rejection, and status changes. Answer questions in the Switch ticket room when
+that ticket uses Switch for answers. An unmapped reporter uses Jira comments
+instead. Milestone summaries belong in Jira comments.
+
+The worker ignores reporter Jira comments as answers on a Switch-channel ticket.
+While Jira waits for approval, human room messages remain input, never approval.
+The worker posts a direct link to the correct channel, at most once per person,
+ticket, and notice type in the configured window (24 hours by default).
+Do not interpret a room message as a Jira transition.
+
 ## Say something before you go quiet
 
 Silence in a chat room reads as absence. If answering will take more than a

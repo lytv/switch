@@ -121,7 +121,10 @@ async def ticket(factory, ticket_id) -> JiraWorkerTicket:
 def activity(factory, jira, rooms, *, clock=None, **options) -> TicketActivity:
     return TicketActivity(
         session_factory=factory,
-        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}, **options),
+        config=_config(
+            jira_worker_enabled_projects={"acme": ["KAN"]},
+            **{"frontend_base_url": "https://switch.example.invalid", **options},
+        ),
         clients={"acme": client_for(jira)},
         rooms=rooms,
         clock=clock or (lambda: NOW),
@@ -1153,7 +1156,7 @@ async def test_switch_channel_old_comment_is_baseline_across_reads(
     recorded = [
         event
         for event in await events(session_factory)
-        if event.event_kind == "jira_comment"
+        if event.event_kind == "ignored_input"
     ]
     assert len(recorded) == 1
     assert recorded[0].payload["reporter_input"] is False
@@ -1287,7 +1290,7 @@ async def test_switch_channel_reporter_edit_does_not_wake(session_factory) -> No
     await reader.read_ticket(key, force_jira=True)
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None and row.agent_state == "waiting"
-    assert len(await events(session_factory)) == 0
+    assert [e.event_kind for e in await events(session_factory)] == ["ignored_input"]
 
 
 async def test_claimed_turn_excludes_raw_intake_events(session_factory) -> None:
