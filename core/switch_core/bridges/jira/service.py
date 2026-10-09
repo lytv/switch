@@ -12,6 +12,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from switch_core.bridges.agent.protocol.service import ProtocolService
 from switch_core.bridges.agent.protocol.types import AgentStatus
 from switch_core.bridges.jira.matching import matching_rules
+from switch_core.bridges.jira.rooms import (
+    CardUpdater,
+    TicketRooms,
+    sync_ticket_room,
+)
 from switch_core.bridges.jira.template import render_template
 from switch_core.bridges.jira.worker import is_worker_enabled, record_webhook_event
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
@@ -72,6 +77,8 @@ class JiraBridgeService:
         config: SwitchConfig,
         sleep: SleepFn | None = None,
         clock: ClockFn | None = None,
+        ticket_rooms: TicketRooms | None = None,
+        card_updater: CardUpdater | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._trigger_store = trigger_store
@@ -81,6 +88,8 @@ class JiraBridgeService:
         self._config = config
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
+        self._ticket_rooms = ticket_rooms
+        self._card_updater = card_updater
 
     async def process_event(
         self, *, instance: str, event: NormalizedTriggerEvent
@@ -136,7 +145,7 @@ class JiraBridgeService:
         if not is_worker_enabled(self._config, instance, event.project):
             return
         async with self._session_factory() as session:
-            await record_webhook_event(
+            new = await record_webhook_event(
                 session,
                 event,
                 instance=instance,
@@ -146,6 +155,29 @@ class JiraBridgeService:
                 webhook_identifier=webhook_identifier,
             )
             await session.commit()
+        if new and self._ticket_rooms is not None:
+            await self.sync_ticket_room(instance=instance, issue_key=event.key)
+
+    async def sync_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
+        """Step-3 room sync for one ticket. No-op without a provisioner."""
+        if self._ticket_rooms is None:
+            return None
+        async with self._session_factory() as session:
+            try:
+                room_id = await sync_ticket_room(
+                    session,
+                    instance=instance,
+                    issue_key=issue_key,
+                    rooms=self._ticket_rooms,
+                    jira_agent_name=self._config.jira_agent_name,
+                    cards=self._card_updater,
+                )
+                await session.commit()
+            except Exception:
+                logger.exception("Jira ticket room sync failed for %s", issue_key)
+                await session.rollback()
+                return None
+            return room_id
 
     async def _resolve_jira_agent(self) -> str | None:
         async with self._session_factory() as session:

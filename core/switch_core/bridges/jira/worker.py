@@ -16,7 +16,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from sqlalchemy import and_, func, or_, select, true, update
@@ -35,11 +35,20 @@ from switch_core.db.models import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from switch_core.bridges.jira.rooms import CardUpdater, TicketRooms
+
 POLL_JOB_KIND = "watermark_poll"
 SWITCH_WAIT_CHANNEL = "switch"
 JIRA_COMMENTS_WAIT_CHANNEL = "jira_comments"
 
 _TERMINAL_TICKET_STATUSES = ("done", "cancelled", "canceled")
+
+
+def is_terminal_ticket_status(status: str) -> bool:
+    """Whether a Jira status ends the v1 ticket flow (Done, or cancelled)."""
+    return status.strip().casefold() in _TERMINAL_TICKET_STATUSES
+
 
 SleepFn = Callable[[float], Awaitable[None]]
 ClockFn = Callable[[], datetime]
@@ -812,6 +821,8 @@ class JiraWorkerScheduler:
         clock: ClockFn | None = None,
         sleep: SleepFn | None = None,
         owner: str = "scheduler",
+        ticket_rooms: TicketRooms | None = None,
+        card_updater: CardUpdater | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._config = config
@@ -819,6 +830,8 @@ class JiraWorkerScheduler:
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._owner = owner
+        self._ticket_rooms = ticket_rooms
+        self._card_updater = card_updater
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -883,6 +896,7 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
+        await self.sweep_reporter_invites()
         for job in jobs:
             try:
                 await self._handle_job(job)
@@ -902,6 +916,45 @@ class JiraWorkerScheduler:
                         now=self._clock(),
                     )
                     await session.commit()
+
+    async def sync_ticket_room(self, *, instance: str, issue_key: str) -> str | None:
+        """Step-3 room sync for one ticket. No-op without a provisioner."""
+        if self._ticket_rooms is None:
+            return None
+        from switch_core.bridges.jira.rooms import sync_ticket_room
+
+        async with self._session_factory() as session:
+            try:
+                room_id = await sync_ticket_room(
+                    session,
+                    instance=instance,
+                    issue_key=issue_key,
+                    rooms=self._ticket_rooms,
+                    jira_agent_name=self._config.jira_agent_name,
+                    cards=self._card_updater,
+                )
+                await session.commit()
+            except Exception:
+                logger.exception("Jira ticket room sync failed for %s", issue_key)
+                await session.rollback()
+                return None
+            return room_id
+
+    async def sweep_reporter_invites(self) -> int:
+        """Consume pending invite follow-ups (mapping-added path, crash recovery)."""
+        if self._ticket_rooms is None:
+            return 0
+        from switch_core.bridges.jira.rooms import consume_reporter_invites
+
+        async with self._session_factory() as session:
+            try:
+                done = await consume_reporter_invites(session, rooms=self._ticket_rooms)
+                await session.commit()
+            except Exception:
+                logger.exception("Jira reporter-invite sweep failed")
+                await session.rollback()
+                return 0
+            return done
 
     async def _handle_job(self, job: JiraWorkerJob) -> None:
         if job.kind != POLL_JOB_KIND:
@@ -933,9 +986,15 @@ class JiraWorkerScheduler:
                 project_key=job.project_key, updated_since=watermark
             )
             async with self._session_factory() as session:
+                new_keys: list[str] = []
                 for issue in issues:
-                    await record_polled_issue(session, issue, instance=job.instance)
+                    if await record_polled_issue(session, issue, instance=job.instance):
+                        key = str(issue.get("key") or "")
+                        if key:
+                            new_keys.append(key)
                 await session.commit()
+            for issue_key in new_keys:
+                await self.sync_ticket_room(instance=job.instance, issue_key=issue_key)
             stamps = [
                 str(issue.get("fields", {}).get("updated") or "")
                 for issue in issues

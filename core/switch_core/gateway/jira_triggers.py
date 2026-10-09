@@ -17,6 +17,7 @@ from switch_core.bridges.jira.parse import (
     StatusTransition,
     parse_jira_payload,
 )
+from switch_core.bridges.jira.rooms import SwitchTicketRooms, consume_reporter_invites
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
 from switch_core.bridges.jira.worker import (
     list_identity_mappings,
@@ -37,6 +38,7 @@ from switch_core.gateway.dependencies import (
     get_room_group_store,
     get_room_store,
     get_session,
+    get_ticket_rooms,
 )
 from switch_core.gateway.schemas import (
     JiraDeliveryDetail,
@@ -519,6 +521,9 @@ async def put_worker_identity_mapping(
     session: Annotated[AsyncSession, Depends(get_session)],
     config: Annotated[SwitchConfig, Depends(get_config)],
     _admin: Annotated[User, Depends(require_admin)],
+    ticket_rooms: Annotated[SwitchTicketRooms | None, Depends(get_ticket_rooms)] = (
+        None
+    ),
 ) -> JiraWorkerIdentityMappingResponse:
     instance = instance.strip()
     jira_account_id = jira_account_id.strip()
@@ -540,6 +545,17 @@ async def put_worker_identity_mapping(
     )
     await session.commit()
     await session.refresh(mapping)
+    if ticket_rooms is not None:
+        try:
+            await consume_reporter_invites(
+                session, rooms=ticket_rooms, switch_user_id=switch_user_id
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "Jira reporter-invite consume failed for %s", switch_user_id
+            )
+            await session.rollback()
     return _identity_mapping_response(
         mapping, updated_ticket_count=updated_ticket_count
     )
