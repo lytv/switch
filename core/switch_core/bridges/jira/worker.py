@@ -29,7 +29,7 @@ from switch_core.bridges.jira.activity import (
     park_ticket,
     record_event,
 )
-from switch_core.bridges.jira.admin import reconcile_admin_cards
+from switch_core.bridges.jira.admin import reconcile_admin_cards, wait_send_cancelled
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
@@ -879,6 +879,7 @@ class JiraWorkerScheduler:
             clients=self._poll_clients,
             clock=self._clock,
             rooms=ticket_rooms,
+            before_wait_send=self._before_wait_send,
         )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
@@ -891,6 +892,21 @@ class JiraWorkerScheduler:
             clock=self._clock,
         )
         self._task: asyncio.Task[None] | None = None
+
+    async def _before_wait_send(self, ticket_id: str) -> bool:
+        """Read new ticket input, then say whether a wait send must stop."""
+        refreshed = await self.activity.read_ticket(ticket_id)
+        async with self._session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            if ticket is None or await wait_send_cancelled(
+                session, ticket, self._config
+            ):
+                return True
+            if not refreshed:
+                raise RuntimeError(
+                    f"Jira ticket {ticket.issue_key} input was not read before a wait send"
+                )
+        return False
 
     @property
     def running(self) -> bool:
@@ -965,6 +981,7 @@ class JiraWorkerScheduler:
                 board=self._admin_board,
                 config=self._config,
                 now=self._clock(),
+                before_wait_send=self._before_wait_send,
             )
         await self._outbox.run_once()
         for job in jobs:

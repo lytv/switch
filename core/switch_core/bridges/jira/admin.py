@@ -7,6 +7,7 @@ message. A disabled project is not read or written.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
@@ -22,7 +23,11 @@ from switch_core.bridges.jira.activity import (
     request_wake,
     ticket_turn_lock,
 )
-from switch_core.bridges.jira.outbox import enqueue_jira_command, needs_person
+from switch_core.bridges.jira.outbox import (
+    WAIT_COMMAND_PREFIXES,
+    enqueue_jira_command,
+    needs_person,
+)
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -36,6 +41,8 @@ from switch_core.db.stores.agent_store import AgentStore
 from switch_core.room_service import RoomCreateConfig, RoomService
 
 logger = logging.getLogger(__name__)
+
+WaitRefresh = Callable[[str], Awaitable[bool]]
 
 ADMIN_ROOM_MARKER = "jira_worker_admin_room"
 ADMIN_ROOM_LOCK = "jira-worker-admin-room"
@@ -344,6 +351,7 @@ async def reconcile_admin_cards(
     board: AdminBoard,
     config: SwitchConfig,
     now: datetime | None = None,
+    before_wait_send: WaitRefresh | None = None,
 ) -> int:
     """Post or edit one card per ticket that currently needs one."""
     if not any(config.jira_worker_enabled_projects.values()):
@@ -369,6 +377,7 @@ async def reconcile_admin_cards(
                 config=config,
                 ticket_id=ticket_id,
                 now=moment,
+                before_wait_send=before_wait_send,
             )
         except Exception:
             logger.exception("Jira admin card sync failed for %s", ticket_id)
@@ -386,6 +395,7 @@ async def sync_admin_card(
     config: SwitchConfig,
     ticket_id: str,
     now: datetime | None = None,
+    before_wait_send: WaitRefresh | None = None,
 ) -> bool:
     async with ticket_turn_lock(engine, f"admin-card:{ticket_id}") as locked:
         if not locked:
@@ -396,6 +406,7 @@ async def sync_admin_card(
             config=config,
             ticket_id=ticket_id,
             now=now or datetime.now(UTC),
+            before_wait_send=before_wait_send,
         )
 
 
@@ -587,6 +598,7 @@ async def _sync_admin_card(
     config: SwitchConfig,
     ticket_id: str,
     now: datetime,
+    before_wait_send: WaitRefresh | None,
 ) -> bool:
     reminders: list[tuple[str, str]] = []
     needs_card = False
@@ -613,7 +625,7 @@ async def _sync_admin_card(
         await session.commit()
     if not needs_card:
         await _send_switch_reminders(
-            session_factory, board, config, ticket_id, reminders
+            session_factory, board, config, ticket_id, reminders, before_wait_send
         )
         return True
     async with session_factory() as session:
@@ -654,11 +666,42 @@ async def _sync_admin_card(
         await _consume_follow_ups(session, ticket.id)
         _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
-    await _deliver_reason_alerts(session_factory, board, instance, issue_key, room_id)
-    await _send_switch_reminders(
-        session_factory, board, config, ticket_id, reminders
-    )
+    try:
+        await _deliver_reason_alerts(
+            session_factory, board, instance, issue_key, room_id
+        )
+    finally:
+        await _send_switch_reminders(
+            session_factory, board, config, ticket_id, reminders, before_wait_send
+        )
     return True
+
+
+async def wait_send_cancelled(
+    session: AsyncSession, ticket: JiraWorkerTicket, config: SwitchConfig
+) -> bool:
+    """True when a queued wait reminder or Blocked must not be sent."""
+    statuses = config.jira_worker_statuses
+    if ticket.status not in (statuses.waiting_for_input, statuses.waiting_for_approval):
+        return True
+    return (
+        ticket.status == statuses.waiting_for_input
+        and ticket.wait_anchor is not None
+        and await _latest_wait_reply(session, ticket, ticket.wait_anchor) is not None
+    )
+
+
+async def _clear_reminder_fired(
+    session_factory: async_sessionmaker[AsyncSession], ticket_id: str
+) -> None:
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
+        if ticket is None:
+            return
+        fired = dict(ticket.wait_fired or {})
+        fired.pop("reminder", None)
+        ticket.wait_fired = fired
+        await session.commit()
 
 
 async def _send_switch_reminders(
@@ -667,26 +710,27 @@ async def _send_switch_reminders(
     config: SwitchConfig,
     ticket_id: str,
     reminders: list[tuple[str, str]],
+    before_wait_send: WaitRefresh | None,
 ) -> None:
     if not reminders:
         return
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
-        if ticket is None:
+    try:
+        if before_wait_send is not None and await before_wait_send(ticket_id):
+            await _clear_reminder_fired(session_factory, ticket_id)
             return
-        anchor = ticket.wait_anchor
-        if (
-            ticket.status == config.jira_worker_statuses.waiting_for_input
-            and anchor is not None
-            and await _latest_wait_reply(session, ticket, anchor) is not None
-        ):
-            fired = dict(ticket.wait_fired or {})
-            fired.pop("reminder", None)
-            ticket.wait_fired = fired or None
-            await session.commit()
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            cancelled = ticket is None or await wait_send_cancelled(
+                session, ticket, config
+            )
+        if cancelled:
+            await _clear_reminder_fired(session_factory, ticket_id)
             return
-    for room_id, body in reminders:
-        await board.remind_reporter(room_id=room_id, body=body)
+        for room_id, body in reminders:
+            await board.remind_reporter(room_id=room_id, body=body)
+    except Exception:
+        await _clear_reminder_fired(session_factory, ticket_id)
+        raise
 
 
 async def _apply_state(
@@ -780,8 +824,10 @@ async def _cancel_wait_commands(
                 JiraWorkerOutbox.issue_key == ticket.issue_key,
                 JiraWorkerOutbox.status.in_(("pending", "claimed")),
                 or_(
-                    JiraWorkerOutbox.command_key.like("wait-reminder:%"),
-                    JiraWorkerOutbox.command_key.like("wait-blocked:%"),
+                    *(
+                        JiraWorkerOutbox.command_key.like(f"{prefix}%")
+                        for prefix in WAIT_COMMAND_PREFIXES
+                    )
                 ),
             )
             .with_for_update()

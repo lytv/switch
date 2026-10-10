@@ -16,6 +16,7 @@ from switch_core.bridges.jira.activity import (
     TurnResult,
     park_ticket,
 )
+from switch_core.bridges.jira.outbox import enqueue_jira_command
 from switch_core.bridges.jira.rooms import reconcile_ticket_room
 from switch_core.bridges.jira.worker import (
     JiraWorkerScheduler,
@@ -23,7 +24,12 @@ from switch_core.bridges.jira.worker import (
     record_webhook_event,
 )
 from switch_core.config import JiraWorkerLimits
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerEvent,
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+)
 from tests.switch_core.bridges.jira import test_worker
 from tests.switch_core.bridges.jira.test_outbox import BASE, JiraMock, client_for
 from tests.switch_core.bridges.jira.test_rooms import FakeRooms, _webhook_event
@@ -1293,6 +1299,57 @@ async def test_switch_channel_reporter_edit_does_not_wake(session_factory) -> No
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None and row.agent_state == "waiting"
     assert [e.event_kind for e in await events(session_factory)] == ["ignored_input"]
+
+
+async def test_wait_send_reads_the_room_first(session_factory) -> None:
+    key = await seed(session_factory)
+    rooms, jira = ThreadRooms(), JiraMock()
+    config = _config(
+        jira_worker_enabled_projects={"acme": ["KAN"]},
+        frontend_base_url="https://switch.example.invalid",
+    )
+
+    async def queue(command_key: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerTicket, key)
+            assert row is not None
+            row.wait_anchor = datetime(2000, 1, 1, tzinfo=UTC)
+            command_id = await enqueue_jira_command(
+                session,
+                config=config,
+                ticket=row,
+                command_key=command_key,
+                command="transition",
+                data="BLOCKED",
+                based_updated=BASE,
+                based_changelog_id="",
+            )
+            await session.commit()
+        assert command_id is not None
+        return command_id
+
+    async def status(command_id: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerOutbox, command_id)
+        assert row is not None
+        return row.status
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config,
+        poll_clients={"acme": client_for(jira)},
+        ticket_rooms=rooms,
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+    )
+    first = await queue(f"wait-blocked:{key}:first")
+    await scheduler._outbox.run_once()
+    assert await status(first) == "done"
+    assert len(jira.writes) == 1
+    second = await queue(f"wait-blocked:{key}:second")
+    rooms.messages = [message(1)]
+    await scheduler._outbox.run_once()
+    assert await status(second) == "cancelled"
+    assert len(jira.writes) == 1
 
 
 async def test_accepted_input_wakes_a_live_turn(session_factory) -> None:

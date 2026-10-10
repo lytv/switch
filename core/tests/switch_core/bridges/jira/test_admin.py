@@ -1209,9 +1209,7 @@ async def test_admin_room_is_created_by_marker_not_name(
 
 @pytest.mark.asyncio
 class _RoomBoard(FakeAdminBoard):
-    def __init__(
-        self, factory: async_sessionmaker[AsyncSession], room_id: str
-    ) -> None:
+    def __init__(self, factory: async_sessionmaker[AsyncSession], room_id: str) -> None:
         super().__init__()
         self.factory = factory
         self.room_id = room_id
@@ -1405,6 +1403,93 @@ async def test_set_admin_card_reason_posts_one_alert(
 
 
 @pytest.mark.asyncio
+async def test_alert_failure_still_sends_the_reminder_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        admin_card_event_id="admin-card-1",
+        wait_anchor=NOW - timedelta(hours=5),
+        wait_fired={},
+    )
+
+    class FailingAlertBoard(FakeAdminBoard):
+        fail = True
+
+        async def post_alert(self, room_id: str, *, body: str) -> None:
+            if self.fail:
+                raise RuntimeError("admin room unavailable")
+            await super().post_alert(room_id, body=body)
+
+    board = FailingAlertBoard()
+    board.cards["admin-card-1"] = "old"
+    with pytest.raises(RuntimeError):
+        await sync_admin_card(
+            session_factory,
+            engine=await _engine(session_factory),
+            board=board,
+            config=_worker_config(),
+            ticket_id=ticket_id,
+            now=NOW,
+        )
+    assert len(board.reminders) == 1
+    assert "reminder" in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    board.fail = False
+    await sync_admin_card(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        ticket_id=ticket_id,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert len(board.reminders) == 1
+    assert len(board.alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_refresh_cancels_the_room_reminder(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        admin_card_event_id="admin-card-1",
+        wait_anchor=NOW - timedelta(hours=3),
+        wait_fired={},
+    )
+    calls: list[str] = []
+
+    async def refresh(refreshed_id: str) -> bool:
+        calls.append(refreshed_id)
+        return True
+
+    board = FakeAdminBoard()
+    board.cards["admin-card-1"] = "old"
+    await sync_admin_card(
+        session_factory,
+        engine=await _engine(session_factory),
+        board=board,
+        config=_worker_config(),
+        ticket_id=ticket_id,
+        now=NOW,
+        before_wait_send=refresh,
+    )
+    assert calls == [ticket_id]
+    assert board.reminders == []
+    assert "reminder" not in (
+        (await _ticket(session_factory, ticket_id)).wait_fired or {}
+    )
+
+
+@pytest.mark.asyncio
 async def test_reply_before_reminder_send_is_not_posted(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1439,7 +1524,9 @@ async def test_reply_before_reminder_send_is_not_posted(
         now=NOW,
     )
     assert board.reminders == []
-    assert "reminder" not in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    assert "reminder" not in (
+        (await _ticket(session_factory, ticket_id)).wait_fired or {}
+    )
 
 
 @pytest.mark.asyncio

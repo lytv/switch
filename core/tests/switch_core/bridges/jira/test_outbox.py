@@ -249,6 +249,41 @@ async def test_restart_and_double_claim_send_once(
     assert (await rows(session_factory))[0].status == "done"
 
 
+async def test_wait_command_is_cancelled_when_the_refresh_ends_the_wait(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    jira = JiraMock()
+    calls: list[str] = []
+
+    async def refresh(ticket_id: str) -> bool:
+        calls.append(ticket_id)
+        return True
+
+    wait_id = await enqueue(
+        session_factory,
+        key="wait-blocked:ticket:1",
+        command="transition",
+        data="BLOCKED",
+    )
+    other_id = await enqueue(session_factory, key="summary-2")
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        clients={"acme": client_for(jira)},
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+        before_wait_send=refresh,
+    )
+    await sender.run_once()
+    await sender.run_once()
+    assert len(calls) == 1
+    by_id = {row.id: row.status for row in await rows(session_factory)}
+    assert by_id[wait_id] == "cancelled"
+    assert by_id[other_id] == "done"
+    assert len(jira.writes) == 1
+    assert jira.writes[0].url.path.endswith("/comment")
+    assert jira.status == "To Do"
+
+
 @pytest.mark.asyncio
 async def test_cancelled_claim_is_not_sent_after_version_check(
     session_factory: async_sessionmaker[AsyncSession],

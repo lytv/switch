@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
+WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -246,6 +248,7 @@ class JiraOutboxSender:
         clients: dict[str, JiraPollClient],
         clock: ClockFn,
         rooms: TicketRooms | None = None,
+        before_wait_send: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._factory = session_factory
         self._engine = cast(AsyncEngine, session_factory.kw["bind"])
@@ -254,6 +257,7 @@ class JiraOutboxSender:
         self._clock = clock
         self._accounts: dict[str, str] = {}
         self._rooms = rooms
+        self._before_wait_send = before_wait_send
 
     async def run_once(self) -> None:
         scopes = [
@@ -405,6 +409,17 @@ class JiraOutboxSender:
             row.attempts += 1
         row.status = "claimed"
         await session.commit()
+        if self._before_wait_send is not None and (row.command_key or "").startswith(
+            WAIT_COMMAND_PREFIXES
+        ):
+            cancelled = await self._before_wait_send(ticket.id)
+            await session.refresh(ticket)
+            if cancelled:
+                if await _still_claimed(session, row):
+                    row.status = "cancelled"
+                    row.error = "Wait ended before send"
+                    await session.commit()
+                return
         client = self._clients[row.instance]
         sending = False
         try:
