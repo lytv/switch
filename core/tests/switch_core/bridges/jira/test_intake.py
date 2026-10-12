@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from typing import Any
 
 import httpx
@@ -17,6 +18,7 @@ from switch_core.bridges.jira.admin import INTAKE_REASON
 from switch_core.bridges.jira.intake import (
     IntakeDecision,
     IntakeModel,
+    RetryableModelError,
     build_intake_orchestrator,
 )
 from switch_core.bridges.jira.outbox import INTAKE_QUESTION_COMMAND
@@ -213,16 +215,39 @@ async def test_five_questions_then_admin_reason_and_clear_on_completion(
     assert INTAKE_REASON in row.admin_reasons
     assert any("intake_questions" in body for body in board.cards.values())
     assert len(board.alerts) == 1
-    await scheduler(session_factory, jira, rooms, model, board=board).run_once()
+    assert sum("question" in item for item in row.intake_state["history"]) == 5
+    worker = scheduler(session_factory, jira, rooms, model, board=board)
+    await worker.run_once()
     assert len(model.calls) == 6
-    model.actions = ["complete"]
     rooms.messages.append(message(6))
     await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.intake_state["questions"] == 6
+    assert sum("question" in item for item in row.intake_state["history"]) == 5
+    assert INTAKE_REASON in row.admin_reasons
+    assert len(rooms.questions) == 5
+    model.actions = ["complete"]
+    rooms.messages.append(message(7))
+    await worker.run_once()
+    assert all(
+        sum("question" in item for item in data["history"]) == 5
+        for data, _ in model.calls[5:]
+    )
     assert INTAKE_REASON not in (
         (await ticket(session_factory, key)).admin_reasons or {}
     )
     assert jira.status == "Waiting for approval"
     assert len(rooms.questions) == 5
+    jira.transition("Waiting for input", "approver-account")
+    await worker.activity.read_ticket(key, force_jira=True)
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.intake_state["phase"] == "limit"
+    assert row.intake_state["cycle"] == 1
+    assert row.intake_state["questions"] == 6
+    assert sum("question" in item for item in row.intake_state["history"]) == 5
+    assert len(rooms.questions) == 5 and len(model.calls) == 8
+    assert INTAKE_REASON in row.admin_reasons
 
 
 async def test_summary_and_approval_once_with_double_claim_and_restart(
@@ -864,11 +889,26 @@ async def test_model_and_history_receive_only_untrusted_body_text(
 
 
 @pytest.mark.parametrize(
-    "failure", [429, 503, "timeout", "connection", "unfinished", "unknown_usage"]
+    ("failure", "retry_after", "delays"),
+    [
+        (429, None, (300, 1800)),
+        (503, None, (300, 1800)),
+        ("timeout", None, (300, 1800)),
+        ("connection", None, (300, 1800)),
+        ("unfinished", None, (300, 1800)),
+        ("unknown_usage", None, (300, 1800)),
+        (429, "600", (600, 600)),
+        (429, "7200", (3600, 3600)),
+        (503, "http-date", (720, 720)),
+        (503, "capped-date", (3600, 3600)),
+        (503, "past-date", (0, 0)),
+        (429, "invalid", (300, 1800)),
+        ("unfinished", "600", (600, 600)),
+    ],
 )
 @pytest.mark.parametrize("recover", [False, True])
 async def test_transient_model_retries_preserve_answers_and_usage(
-    session_factory, monkeypatch, failure, recover
+    session_factory, monkeypatch, caplog, failure, retry_after, delays, recover
 ) -> None:
     key = await start_ticket(session_factory)
     jira, rooms, board = IntakeJira(), IntakeRooms(), FakeAdminBoard()
@@ -885,8 +925,15 @@ async def test_transient_model_retries_preserve_answers_and_usage(
         data = json.loads(request.content)
         calls.append(json.loads(data["messages"][1]["content"]))
         failing = len(calls) > 1 and (len(calls) < 4 or not recover)
+        header = retry_after
+        if retry_after in ("http-date", "capped-date", "past-date"):
+            seconds = {"http-date": 720, "capped-date": 7200, "past-date": -60}[
+                retry_after
+            ]
+            header = format_datetime(now + timedelta(seconds=seconds), usegmt=True)
+        headers = {"Retry-After": header} if header is not None else {}
         if failing and failure in (429, 503):
-            return httpx.Response(failure)
+            return httpx.Response(failure, headers=headers)
         if failing and failure in ("timeout", "connection"):
             error = httpx.ReadTimeout if failure == "timeout" else httpx.ConnectError
             raise error("mock transient failure", request=request)
@@ -914,6 +961,7 @@ async def test_transient_model_retries_preserve_answers_and_usage(
                     }
                 ],
             },
+            headers=headers,
         )
 
     def mock_client(**options):
@@ -951,13 +999,73 @@ async def test_transient_model_retries_preserve_answers_and_usage(
             assert len(calls) == 4
         else:
             assert row.worker_parked_reason is None
-            assert row.wake_at == now + timedelta(seconds=5 * 2 ** (attempt - 1))
-            await worker.run_once()
-            assert len(calls) == 1 + attempt
-            now = row.wake_at
+            assert row.wake_at == now + timedelta(seconds=delays[attempt - 1])
             worker = scheduler(
-                session_factory, jira, rooms, model, board=board, clock=lambda: now
+                session_factory,
+                jira,
+                rooms,
+                model,
+                board=board,
+                clock=lambda: now,
+                settings=config(jira_worker_write_backoff_seconds=1),
             )
+            if delays[attempt - 1] > 0:
+                now = row.wake_at - timedelta(seconds=1)
+                await worker.run_once()
+                assert len(calls) == 1 + attempt
+                assert (await ticket(session_factory, key)).wake_at == row.wake_at
+            now = row.wake_at
     assert all(
         call["replies"] == ["The staging environment fails"] for call in calls[1:]
     )
+    if retry_after == "invalid":
+        assert "invalid Retry-After header" in caplog.text
+
+
+@pytest.mark.parametrize("during_model", [False, True])
+async def test_new_reporter_input_does_not_shorten_model_retry(
+    session_factory, during_model
+) -> None:
+    class RetryModel(ModelMock):
+        async def decide(
+            self, data: dict[str, Any], token_budget: int
+        ) -> IntakeDecision:
+            decision = await super().decide(data, token_budget)
+            if len(self.calls) == 2:
+                raise RetryableModelError("mock transient failure", 0, None)
+            return decision
+
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), RetryModel("question", "complete")
+    now = NOW
+    worker = scheduler(session_factory, jira, rooms, model, clock=lambda: now)
+    await worker.run_once()
+    rooms.messages.append({**message(1), "body": "First answer"})
+    if during_model:
+        model.started, model.release = asyncio.Event(), asyncio.Event()
+        running = asyncio.create_task(worker.run_once())
+        await model.started.wait()
+        rooms.messages.append({**message(2), "body": "More context"})
+        await worker.activity.read_ticket(key)
+        model.release.set()
+        await running
+    else:
+        await worker.run_once()
+        rooms.messages.append({**message(2), "body": "More context"})
+    row = await ticket(session_factory, key)
+    assert row.wake_at == NOW + timedelta(minutes=5)
+    assert row.intake_state["model_failures"] == 1
+    now = NOW + timedelta(minutes=5) - timedelta(seconds=1)
+    worker = scheduler(session_factory, jira, rooms, model, clock=lambda: now)
+    await worker.run_once()
+    assert len(model.calls) == 2
+    assert (await ticket(session_factory, key)).wake_at == row.wake_at
+    now = row.wake_at
+    await worker.run_once()
+    assert len(model.calls) == 3
+    assert model.calls[-1][0]["replies"] == ["First answer", "More context"]
+    row = await ticket(session_factory, key)
+    assert row.tokens_used == 20
+    assert row.intake_state.get("model_failures", 0) == 0
+    assert row.worker_parked_reason is None
+    assert jira.status == "Waiting for approval"

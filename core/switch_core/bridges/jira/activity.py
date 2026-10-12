@@ -516,6 +516,7 @@ class TicketActivity:
                     {"due_at": due},
                     reporter=True,
                 )
+                request_wake(ticket)
                 ticket.wake_at = None
             if ticket.worker_parked_reason:
                 ticket.agent_state = "parked"
@@ -802,6 +803,17 @@ class TicketActivity:
                             JiraWorkerTicket.agent_state.in_(
                                 ("wake_requested", "parked")
                             ),
+                            or_(
+                                func.coalesce(
+                                    JiraWorkerTicket.intake_state[
+                                        "model_failures"
+                                    ].as_integer(),
+                                    0,
+                                )
+                                == 0,
+                                JiraWorkerTicket.wake_at.is_(None),
+                                JiraWorkerTicket.wake_at <= self._clock(),
+                            ),
                             ~select(JiraWorkerOutbox.id)
                             .where(
                                 JiraWorkerOutbox.instance == JiraWorkerTicket.instance,
@@ -886,6 +898,11 @@ class TicketActivity:
                 or ticket.worker_parked_reason
                 or is_terminal_ticket_status(ticket.status)
                 or ticket.agent_state not in ("wake_requested", "parked")
+                or (
+                    (ticket.intake_state or {}).get("model_failures", 0) > 0
+                    and ticket.wake_at is not None
+                    and ticket.wake_at > self._clock()
+                )
             ):
                 return None
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:

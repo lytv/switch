@@ -137,7 +137,12 @@ plus 256 tokens for framing, before allocating the remaining output budget.
 It makes no request when the prompt cannot fit. It records actual response usage,
 not the reservation. Missing usage, an invalid decision, or a violated budget
 parks the ticket with a visible failure. HTTP 429 and 5xx responses, transport
-failures, and unfinished decisions retry with exponential backoff. The worker
+failures, and unfinished decisions retry after 5 minutes before the second
+attempt and 30 minutes before the third attempt. A valid `Retry-After` header
+replaces that delay, up to 1 hour. The worker accepts delay seconds or an HTTP
+date; a past date permits an immediate retry. An invalid header logs a warning
+and uses the fixed delay. The retry deadline uses the durable wake timer.
+New reporter input does not shorten that delay. The worker
 stores consecutive failures and pending reporter text across restarts, records
 known usage (zero when unknown), and parks after three consecutive failures.
 A successful turn resets the failure count. Model errors never select a fallback
@@ -156,7 +161,8 @@ new turn from consuming replies before delivery completes. An unknown question
 send outcome parks the worker and does not replay automatically.
 
 After five questions, a request for another question raises `intake_questions`
-on the admin card and sends no further question. Reporter or admin-accepted
+on the admin card and sends no further question. The transcript does not record
+an unsent over-limit question. Reporter or admin-accepted
 input can resolve the missing requirements. A completed intake clears that
 reason. The question count remains cumulative for the ticket, including Reject.
 
