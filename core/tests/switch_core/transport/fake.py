@@ -122,9 +122,7 @@ class FakeTransport:
             content=content,
         )
 
-    async def edit_message(
-        self, room_id: str, event_id: str, new_content: str
-    ) -> None:
+    async def edit_message(self, room_id: str, event_id: str, new_content: str) -> None:
         self.edits.append((room_id, event_id, new_content))
 
     async def send_event(

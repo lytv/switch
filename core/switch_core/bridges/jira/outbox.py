@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
 WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
+INTAKE_QUESTION_COMMAND = "intake_question"
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -277,7 +278,9 @@ class JiraOutboxSender:
                                 ),
                                 and_(
                                     JiraWorkerOutbox.channel == "switch",
-                                    JiraWorkerOutbox.command == "wrong_place_notice",
+                                    JiraWorkerOutbox.command.in_(
+                                        ("wrong_place_notice", INTAKE_QUESTION_COMMAND)
+                                    ),
                                     literal(self._rooms is not None),
                                 ),
                             ),
@@ -350,8 +353,28 @@ class JiraOutboxSender:
             ticket.instance, []
         ):
             return
+        payload = row.payload or {}
+        if row.status != "sending" and "intake_generation" in payload:
+            if (
+                ticket.worker_parked_reason
+                or payload["intake_generation"] != ticket.agent_generation
+            ):
+                row.status = "cancelled"
+                row.error = ticket.worker_parked_reason or "Intake generation changed"
+                await session.commit()
+                return
+            predecessor = payload.get("after_command")
+            if predecessor:
+                previous = await session.get(JiraWorkerOutbox, predecessor)
+                if previous is None:
+                    raise ValueError("Intake predecessor command is missing")
+                if previous.status != "done":
+                    return
         if row.channel == "switch":
-            await self._send_switch_notice(session, row)
+            if row.command == INTAKE_QUESTION_COMMAND:
+                await self._send_switch_question(session, row, ticket)
+            else:
+                await self._send_switch_notice(session, row)
             return
         if row.status == "sending":
             row.status = "uncertain"
@@ -512,6 +535,62 @@ class JiraOutboxSender:
                         and "based_changelog_id" in payload
                     ):
                         await self._enqueue_failure(session, ticket, row)
+        else:
+            row.status = "done"
+            row.error = None
+            if row.command == "transition" and "intake_generation" in payload:
+                ticket.status = payload["data"]
+        await session.commit()
+
+    async def _send_switch_question(
+        self, session: AsyncSession, row: JiraWorkerOutbox, ticket: JiraWorkerTicket
+    ) -> None:
+        if self._rooms is None:
+            raise ValueError("Intake question sender requires ticket rooms")
+        if row.status == "sending":
+            row.status = "uncertain"
+            row.error = "Restart found a question with an unknown outcome; automatic replay is unsafe"
+            park_ticket(ticket, row.error)
+            await session.commit()
+            return
+        payload = row.payload or {}
+        row.attempts += 1
+        try:
+            client = self._clients[row.instance]
+            version = await read_jira_version(client, row.issue_key)
+            account = ticket.jira_worker_account_id
+            if not account:
+                raise ValueError("Intake question requires the Jira worker identity")
+            check_jira_version(version, payload, account)
+        except HumanChange as exc:
+            row.status = "parked"
+            row.error = str(exc)
+            park_ticket(ticket, row.error)
+            await session.commit()
+            return
+        except Exception as exc:
+            row.error = f"{type(exc).__name__}: Question version check failed"
+            logger.exception("Intake question %s version check failed", row.id)
+            if row.attempts >= 3:
+                row.status = "failed"
+                park_ticket(ticket, row.error)
+            else:
+                row.due_at = self._clock() + timedelta(
+                    seconds=self._config.jira_worker_write_backoff_seconds
+                )
+            await session.commit()
+            return
+        row.status = "sending"
+        await session.commit()
+        try:
+            await self._rooms.post_question(
+                payload["room_id"], thread_id=payload["thread_id"], body=payload["data"]
+            )
+        except Exception as exc:
+            row.status = "uncertain"
+            row.error = f"{type(exc).__name__}: Question outcome is unknown; automatic replay is unsafe"
+            park_ticket(ticket, row.error)
+            logger.exception("Intake question %s delivery failed", row.id)
         else:
             row.status = "done"
             row.error = None

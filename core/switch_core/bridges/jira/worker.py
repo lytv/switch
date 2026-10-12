@@ -2,7 +2,7 @@
 
 One module inside the Jira bridge (option C). It records webhook and poll
 events, reconciles ticket rooms, and sends Jira commands through the outbox.
-The intake orchestrator is a later step.
+Configured intake turns ask questions and queue approval milestones.
 
 With no project enabled (the default) the intake hook returns immediately and
 the existing Jira bridge behaves exactly as today.
@@ -34,6 +34,7 @@ from switch_core.bridges.jira.admin import (
     reconcile_admin_cards,
     wait_send_cancelled,
 )
+from switch_core.bridges.jira.intake import build_intake_orchestrator
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
@@ -351,6 +352,7 @@ async def upsert_ticket(
     reporter_switch_user_id: str | None,
     wait_channel: str,
     updated_at: datetime,
+    fields: dict[str, Any],
     issue_id: str = "",
     project_key: str = "",
     summary: str = "",
@@ -363,6 +365,7 @@ async def upsert_ticket(
         issue_id=issue_id,
         project_key=project_key,
         summary=summary,
+        **({"description": fields["description"]} if "description" in fields else {}),
         status=status,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -414,6 +417,8 @@ async def upsert_ticket(
     ticket.issue_id = issue_id
     ticket.project_key = project_key
     ticket.summary = summary
+    if "description" in fields:
+        ticket.description = fields["description"]
     ticket.status = status
     if is_terminal_ticket_status(status):
         park_ticket(ticket, "Jira ticket completed or cancelled")
@@ -510,6 +515,8 @@ async def record_webhook_event(
     issue_id = ""
     if isinstance(raw.get("issue"), dict):
         issue_id = str(raw["issue"].get("id") or "")
+    issue = raw.get("issue")
+    fields = issue.get("fields") if isinstance(issue, dict) else None
     ticket, created, reporter_resolution_changed = await upsert_ticket(
         session,
         instance=instance,
@@ -517,6 +524,7 @@ async def record_webhook_event(
         issue_id=issue_id,
         project_key=event.project,
         summary=event.summary,
+        fields=fields if isinstance(fields, dict) else {},
         status=event.status,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -592,6 +600,7 @@ async def record_polled_issue(
         issue_id=str(issue.get("id") or ""),
         project_key=project_key,
         summary=str(fields.get("summary") or ""),
+        fields=fields,
         status=status_name,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -816,7 +825,7 @@ class JiraPollClient:
         while True:
             params: dict[str, str | int] = {
                 "jql": jql,
-                "fields": "summary,status,updated,project,reporter",
+                "fields": "summary,description,status,updated,project,reporter",
                 "maxResults": 50,
             }
             if next_page_token is not None:
@@ -897,6 +906,12 @@ class JiraWorkerScheduler:
             config=config,
             clients=self._poll_clients,
             rooms=ticket_rooms,
+            clock=self._clock,
+        )
+        self._orchestrator = build_intake_orchestrator(
+            session_factory=session_factory,
+            config=config,
+            board=admin_board,
             clock=self._clock,
         )
         self._task: asyncio.Task[None] | None = None
@@ -980,6 +995,11 @@ class JiraWorkerScheduler:
             await session.commit()
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
+        if self._orchestrator is not None:
+            try:
+                await self.activity.run_one_turn(self._orchestrator)
+            except Exception:
+                logger.exception("Jira intake turn failed; the ticket is parked")
         if self._admin_board is not None:
             await reconcile_admin_cards(
                 self._session_factory,

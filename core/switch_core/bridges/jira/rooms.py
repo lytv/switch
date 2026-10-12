@@ -118,6 +118,10 @@ class TicketRooms(Protocol):
 
     async def post_notice(self, room_id: str, *, body: str) -> str: ...
 
+    async def post_question(
+        self, room_id: str, *, thread_id: str, body: str
+    ) -> str: ...
+
 
 class CardUpdater(Protocol):
     """In-place ticket-card refresh via the room description.
@@ -645,6 +649,11 @@ class SwitchTicketRooms:
     async def post_notice(self, room_id: str, *, body: str) -> str:
         return await self._protocol.send_message(
             await self._jira_agent_id(), room_id, body
+        )
+
+    async def post_question(self, room_id: str, *, thread_id: str, body: str) -> str:
+        return await self._protocol.send_message(
+            await self._jira_agent_id(), room_id, body, thread_id=thread_id
         )
 
     async def post_card(self, room_id: str, *, body: str) -> str:
