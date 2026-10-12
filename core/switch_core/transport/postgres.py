@@ -393,9 +393,7 @@ class PostgresTransport:
         )
         return await self._send(room_id, "m.room.message", content, sender_name)
 
-    async def edit_message(
-        self, room_id: str, event_id: str, new_content: str
-    ) -> None:
+    async def edit_message(self, room_id: str, event_id: str, new_content: str) -> None:
         """Replace the body of a message this connection authored.
 
         The row keeps its id and `seq`. Readers that render the row, including
