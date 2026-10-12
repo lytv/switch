@@ -86,8 +86,9 @@ def _plain_text(value: Any) -> str:
         return value
     if not isinstance(value, dict):
         return ""
-    if isinstance(value.get("text"), str):
-        return value["text"]
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
     if value.get("type") == "hardBreak":
         return "\n"
     separator = (
