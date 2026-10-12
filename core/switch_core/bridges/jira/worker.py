@@ -29,7 +29,11 @@ from switch_core.bridges.jira.activity import (
     park_ticket,
     record_event,
 )
-from switch_core.bridges.jira.admin import reconcile_admin_cards, wait_send_cancelled
+from switch_core.bridges.jira.admin import (
+    enqueue_admin_card_follow_up,
+    reconcile_admin_cards,
+    wait_send_cancelled,
+)
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
@@ -199,7 +203,9 @@ async def _set_open_ticket_reporter_resolution(
             JiraWorkerTicket.instance == instance,
             JiraWorkerTicket.project_key.in_(enabled_projects),
             JiraWorkerTicket.reporter_account_id == jira_account_id,
-            func.lower(JiraWorkerTicket.status).not_in(_TERMINAL_TICKET_STATUSES),
+            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                _TERMINAL_TICKET_STATUSES
+            ),
         )
         .with_for_update()
     )
@@ -411,6 +417,7 @@ async def upsert_ticket(
     ticket.status = status
     if is_terminal_ticket_status(status):
         park_ticket(ticket, "Jira ticket completed or cancelled")
+        await enqueue_admin_card_follow_up(session, ticket)
     ticket.reporter_account_id = reporter_account_id
     ticket.reporter_switch_user_id = reporter_switch_user_id
     ticket.wait_channel = wait_channel
@@ -428,7 +435,7 @@ async def _enqueue_ticket_intake_follow_ups(
     reporter_resolution_changed: bool,
     switch_user_id: str | None,
 ) -> None:
-    if ticket.status.lower() in _TERMINAL_TICKET_STATUSES:
+    if is_terminal_ticket_status(ticket.status):
         return
     if created:
         if switch_user_id:

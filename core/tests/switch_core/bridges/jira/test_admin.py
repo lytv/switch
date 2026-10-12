@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -32,7 +33,12 @@ from switch_core.bridges.jira.admin import (
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND as ROOMS_ADMIN_CARD_COMMAND,
 )
-from switch_core.bridges.jira.worker import JiraWorkerScheduler
+from switch_core.bridges.jira.worker import (
+    JiraWorkerScheduler,
+    record_polled_issue,
+    record_webhook_event,
+    set_identity_mapping,
+)
 from switch_core.config import (
     JiraWorkerCalendar,
     JiraWorkerCredentials,
@@ -48,7 +54,11 @@ from switch_core.db.models import (
 )
 from switch_core.room_service import RoomCreateConfig
 from tests.switch_core.bridges.jira.test_outbox import JiraMock, enqueue, sender_for
-from tests.switch_core.bridges.jira.test_worker import _config, _run_migrations
+from tests.switch_core.bridges.jira.test_worker import (
+    _config,
+    _run_migrations,
+    _webhook_event,
+)
 
 NOW = datetime(2026, 10, 2, 16, 0, tzinfo=UTC)
 
@@ -1772,6 +1782,190 @@ async def test_reconcile_stops_visiting_closed_tickets_after_final_update(
         await session.commit()
     assert await reconcile() == 1
     assert len(board.posts) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["room", "credentials", "edit"])
+async def test_closed_card_edit_remains_pending_after_failure(
+    session_factory: async_sessionmaker[AsyncSession], failure: str
+) -> None:
+    class FailingBoard(FakeAdminBoard):
+        fail = False
+
+        async def ensure_room(self) -> str:
+            if self.fail and failure == "room":
+                raise RuntimeError("Admin room unavailable")
+            return await super().ensure_room()
+
+        async def edit_card(self, room_id: str, event_id: str, *, body: str) -> None:
+            if self.fail and failure == "edit":
+                raise RuntimeError("Agent client not running")
+            await super().edit_card(room_id, event_id, body=body)
+
+    ticket_id = await _seed(session_factory)
+    board = FailingBoard()
+    config = _worker_config()
+    engine = session_factory.kw["bind"]
+    assert (
+        await reconcile_admin_cards(
+            session_factory, engine=engine, board=board, config=config, now=NOW
+        )
+        == 1
+    )
+    original_body = board.cards["admin-card-1"]
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, ticket_id)
+        assert stored is not None
+        stored.status = "Done"
+        await session.commit()
+    board.fail = True
+    failing_config = (
+        _worker_config(jira_worker_credentials={})
+        if failure == "credentials"
+        else config
+    )
+    for _ in range(2):
+        assert (
+            await reconcile_admin_cards(
+                session_factory,
+                engine=engine,
+                board=board,
+                config=failing_config,
+                now=NOW,
+            )
+            == 0
+        )
+        assert (await _ticket(session_factory, ticket_id)).admin_reasons is None
+        async with session_factory() as session:
+            pending = list(
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.command == ADMIN_CARD_COMMAND,
+                        JiraWorkerOutbox.status == "pending",
+                    )
+                )
+            )
+        assert len(pending) == 1
+        assert pending[0].payload["ticket_id"] == ticket_id
+        assert board.cards["admin-card-1"] == original_body
+
+    restarted = FakeAdminBoard()
+    restarted.cards = dict(board.cards)
+    assert (
+        await reconcile_admin_cards(
+            session_factory, engine=engine, board=restarted, config=config, now=NOW
+        )
+        == 1
+    )
+    assert restarted.posts == []
+    assert len(restarted.edits) == 1
+    assert "Status: Done" in restarted.cards["admin-card-1"]
+    assert "Reasons:\n- none" in restarted.cards["admin-card-1"]
+    assert (
+        await _ticket(session_factory, ticket_id)
+    ).admin_card_event_id == "admin-card-1"
+    assert (
+        await reconcile_admin_cards(
+            session_factory, engine=engine, board=restarted, config=config, now=NOW
+        )
+        == 0
+    )
+    async with session_factory() as session:
+        follow_up = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == ADMIN_CARD_COMMAND
+            )
+        )
+        assert follow_up is not None and follow_up.status == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["poll", "webhook"])
+@pytest.mark.parametrize("status", ["Done", " cancelled ", "CANCELED"])
+async def test_close_refreshes_a_card_without_reasons(
+    session_factory: async_sessionmaker[AsyncSession], source: str, status: str
+) -> None:
+    ticket_id = await _seed(session_factory)
+    board = FakeAdminBoard()
+    config = _worker_config()
+    engine = session_factory.kw["bind"]
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, ticket_id)
+        assert stored is not None
+        stored.reporter_switch_user_id = "user-1"
+        await session.commit()
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    assert (await _ticket(session_factory, ticket_id)).admin_reasons is None
+    assert "Status: In Progress" in board.cards["admin-card-1"]
+
+    issue = {
+        "id": "10001",
+        "key": "KAN-1",
+        "fields": {
+            "project": {"key": "KAN"},
+            "status": {"name": status},
+            "reporter": {"accountId": "reporter-account"},
+            "summary": "Closed ticket",
+            "updated": (NOW + timedelta(minutes=1)).isoformat(),
+        },
+    }
+    async with session_factory() as session:
+        if source == "poll":
+            assert await record_polled_issue(session, issue, instance="acme")
+        else:
+            assert await record_webhook_event(
+                session,
+                replace(
+                    _webhook_event(),
+                    status=status,
+                    summary="Closed ticket",
+                    raw={"issue": issue},
+                ),
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier="closed-ticket",
+            )
+        await session.commit()
+        pending = list(
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command == ADMIN_CARD_COMMAND,
+                    JiraWorkerOutbox.status == "pending",
+                )
+            )
+        )
+        assert len(pending) == 1
+
+    assert (
+        await reconcile_admin_cards(
+            session_factory, engine=engine, board=board, config=config, now=NOW
+        )
+        == 1
+    )
+    assert len(board.posts) == 1
+    assert f"Status: {status}" in board.cards["admin-card-1"]
+    assert "[KAN-1] Closed ticket" in board.cards["admin-card-1"]
+    assert "Reasons:\n- none" in board.cards["admin-card-1"]
+    async with session_factory() as session:
+        reporter = User(name="Reporter", email="reporter@example.invalid", role="user")
+        session.add(reporter)
+        await session.flush()
+        _, changed = await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="reporter-account",
+            switch_user_id=reporter.id,
+            enabled_projects=["KAN"],
+        )
+        assert changed == 0
+        await session.commit()
+    assert (
+        await reconcile_admin_cards(
+            session_factory, engine=engine, board=board, config=config, now=NOW
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

@@ -346,6 +346,35 @@ class SwitchAdminBoard:
         await self._protocol.send_message(await self._agent_id(), room_id, body)
 
 
+async def enqueue_admin_card_follow_up(
+    session: AsyncSession, ticket: JiraWorkerTicket
+) -> None:
+    if ticket.admin_card_event_id is None:
+        return
+    pending = await session.scalar(
+        select(JiraWorkerOutbox.id)
+        .where(
+            JiraWorkerOutbox.channel == "switch",
+            JiraWorkerOutbox.command == ADMIN_CARD_COMMAND,
+            JiraWorkerOutbox.status == "pending",
+            JiraWorkerOutbox.payload["ticket_id"].astext == ticket.id,
+        )
+        .limit(1)
+    )
+    if pending is not None:
+        return
+    session.add(
+        JiraWorkerOutbox(
+            channel="switch",
+            command=ADMIN_CARD_COMMAND,
+            instance=ticket.instance,
+            issue_key=ticket.issue_key,
+            payload={"ticket_id": ticket.id},
+        )
+    )
+    await session.flush()
+
+
 async def reconcile_admin_cards(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -769,6 +798,7 @@ async def _apply_state(
         if key not in _DERIVED
     }
     if is_terminal_ticket_status(ticket.status):
+        await enqueue_admin_card_follow_up(session, ticket)
         ticket.admin_reasons = None
         await _apply_wait(session, ticket, config, now, {}, reminders)
         return
