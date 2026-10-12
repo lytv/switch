@@ -135,8 +135,12 @@ The API must support non-streaming Chat Completions, JSON-object responses,
 limit. The worker reserves a conservative UTF-8 byte bound for prompt tokens,
 plus 256 tokens for framing, before allocating the remaining output budget.
 It makes no request when the prompt cannot fit. It records actual response usage,
-not the reservation. Missing usage, an invalid response, or a violated budget
-parks the ticket with a visible failure. Model errors never select a fallback
+not the reservation. Missing usage, an invalid decision, or a violated budget
+parks the ticket with a visible failure. HTTP 429 and 5xx responses, transport
+failures, and unfinished decisions retry with exponential backoff. The worker
+stores consecutive failures and pending reporter text across restarts, records
+known usage (zero when unknown), and parks after three consecutive failures.
+A successful turn resets the failure count. Model errors never select a fallback
 provider. This interface does not support APIs that require `max_completion_tokens`
 instead of `max_tokens`.
 
@@ -144,7 +148,10 @@ A turn makes at most one model call. It asks one question on the ticket wait
 channel through the outbox. Switch questions reply to the ticket card thread.
 An unmapped reporter receives Jira comments. A question starts a Waiting for
 input milestone when needed. The transcript, question count, and approval cycle
-remain in the ticket row across restarts. A pending intake delivery prevents a
+remain in the ticket row across restarts. The model receives only plain-text
+summary, description, and reply bodies, marked as untrusted data. ADF descriptions
+and comments become text; author and profile metadata do not enter the model
+prompt or intake history. A pending intake delivery prevents a
 new turn from consuming replies before delivery completes. An unknown question
 send outcome parks the worker and does not replay automatically.
 
@@ -156,7 +163,8 @@ reason. The question count remains cumulative for the ticket, including Reject.
 Completion queues one Jira summary comment per approval cycle, then a dependent
 Waiting for approval transition. Both use the existing compare-read-write
 outbox. Room text never approves a ticket. A Jira move to Done archives the room
-through the existing reconciliation path. Jira enforces the approvers-group
+through the existing reconciliation path. Approval reads use the poll-interval
+refresh schedule. Jira enforces the approvers-group
 restriction on Approve and Reject; the worker does not grant approval rights.
 
 A clean Jira status change from Waiting for approval to Waiting for input

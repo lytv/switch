@@ -352,11 +352,11 @@ async def upsert_ticket(
     reporter_switch_user_id: str | None,
     wait_channel: str,
     updated_at: datetime,
+    fields: dict[str, Any],
     issue_id: str = "",
     project_key: str = "",
     summary: str = "",
     status: str = "",
-    description: dict | str | None = None,
 ) -> tuple[JiraWorkerTicket, bool, bool]:
     stmt = insert(JiraWorkerTicket).values(
         id=str(uuid.uuid4()),
@@ -365,7 +365,7 @@ async def upsert_ticket(
         issue_id=issue_id,
         project_key=project_key,
         summary=summary,
-        description=description,
+        **({"description": fields["description"]} if "description" in fields else {}),
         status=status,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -417,7 +417,8 @@ async def upsert_ticket(
     ticket.issue_id = issue_id
     ticket.project_key = project_key
     ticket.summary = summary
-    ticket.description = description
+    if "description" in fields:
+        ticket.description = fields["description"]
     ticket.status = status
     if is_terminal_ticket_status(status):
         park_ticket(ticket, "Jira ticket completed or cancelled")
@@ -523,7 +524,7 @@ async def record_webhook_event(
         issue_id=issue_id,
         project_key=event.project,
         summary=event.summary,
-        description=fields.get("description") if isinstance(fields, dict) else None,
+        fields=fields if isinstance(fields, dict) else {},
         status=event.status,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -599,7 +600,7 @@ async def record_polled_issue(
         issue_id=str(issue.get("id") or ""),
         project_key=project_key,
         summary=str(fields.get("summary") or ""),
-        description=fields.get("description"),
+        fields=fields,
         status=status_name,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,

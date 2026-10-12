@@ -52,6 +52,42 @@ class IntakeDecision:
     tokens_used: int
 
 
+class RetryableModelError(Exception):
+    def __init__(self, message: str, tokens_used: int) -> None:
+        super().__init__(message)
+        self.tokens_used = tokens_used
+
+
+def _plain_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    if isinstance(value.get("text"), str):
+        return value["text"]
+    if value.get("type") == "hardBreak":
+        return "\n"
+    separator = (
+        "\n"
+        if value.get("type")
+        in (
+            "doc",
+            "bulletList",
+            "orderedList",
+            "listItem",
+            "blockquote",
+            "table",
+            "tableRow",
+        )
+        else ""
+    )
+    return separator.join(_plain_text(node) for node in value.get("content", []))
+
+
+def _reply_text(value: Any) -> str:
+    return _plain_text(value.get("body") if isinstance(value, dict) else value).strip()
+
+
 class IntakeModel:
     def __init__(self, *, base_url: str, api_key: str, model: str) -> None:
         self._url = base_url.rstrip("/") + "/chat/completions"
@@ -70,21 +106,32 @@ class IntakeModel:
         output_limit = min(2048, token_budget - input_bound)
         if output_limit <= 0:
             return IntakeDecision("budget", "", 0)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                self._url,
-                headers={"Authorization": f"Bearer {self._key}"},
-                json={
-                    "model": self._model,
-                    "messages": messages,
-                    "max_tokens": output_limit,
-                    "response_format": {"type": "json_object"},
-                    "stream": False,
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
-        usage = result["usage"]
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    self._url,
+                    headers={"Authorization": f"Bearer {self._key}"},
+                    json={
+                        "model": self._model,
+                        "messages": messages,
+                        "max_tokens": output_limit,
+                        "response_format": {"type": "json_object"},
+                        "stream": False,
+                    },
+                )
+                response.raise_for_status()
+                result = response.json()
+        except httpx.TransportError as exc:
+            raise RetryableModelError(type(exc).__name__, 0) from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 429 or 500 <= status < 600:
+                raise RetryableModelError(f"HTTP {status}", 0) from exc
+            raise
+        choice = result["choices"][0]
+        usage = result.get("usage")
+        if choice["finish_reason"] != "stop" and usage is None:
+            raise RetryableModelError("Intake model did not finish its decision", 0)
         counts = [
             usage[name]
             for name in ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -101,9 +148,8 @@ class IntakeModel:
             raise ValueError(
                 "Intake model violated its token budget or tokenizer contract"
             )
-        choice = result["choices"][0]
         if choice["finish_reason"] != "stop":
-            raise ValueError("Intake model did not finish its decision")
+            raise RetryableModelError("Intake model did not finish its decision", total)
         decision = json.loads(choice["message"]["content"])
         if not isinstance(decision, dict) or set(decision) != {"action", "content"}:
             raise ValueError("Intake model must return one action and content")
@@ -114,8 +160,6 @@ class IntakeModel:
             or not content.strip()
         ):
             raise ValueError("Intake model returned an invalid decision")
-        if action == "question" and content.count("?") > 1:
-            raise ValueError("Intake model returned more than one question")
         return IntakeDecision(action, content.strip(), total)
 
 
@@ -148,17 +192,29 @@ class IntakeOrchestrator:
                 == self._config.jira_worker_statuses.waiting_for_approval
             ):
                 return TurnResult(0, None)
-            replies = [
-                event["untrusted_data"]
+            replies = list(state.get("pending_replies", []))
+            replies.extend(
+                text
                 for event in turn.untrusted_data["events"]
                 if event
                 and event.get("reporter_input")
                 and not event.get("wrong_place_type")
-            ]
+                and (text := _reply_text(event.get("untrusted_data")))
+            )
             if phase in ("question", "limit") and not replies:
                 return TurnResult(0, None)
             generation = ticket.agent_generation
-            history = list(state.get("history", []))
+            history = [
+                {
+                    key: _reply_text(value)
+                    if key == "reply"
+                    else _plain_text(value).strip()
+                }
+                for item in state.get("history", [])
+                for key, value in item.items()
+                if key in ("reply", "question", "complete", "jira_rejection")
+            ]
+        failure = None
         if phase == "intake" and state.get("cycle", 0) > 0:
             decision = IntakeDecision(
                 "question",
@@ -166,15 +222,23 @@ class IntakeOrchestrator:
                 0,
             )
         else:
-            decision = await self._model.decide(
-                {
-                    "ticket": turn.untrusted_data["ticket_text"],
-                    "description": turn.untrusted_data.get("description"),
-                    "history": history,
-                    "replies": replies,
-                },
-                turn.token_budget,
-            )
+            try:
+                decision = await self._model.decide(
+                    {
+                        "ticket": _plain_text(
+                            turn.untrusted_data["ticket_text"]
+                        ).strip(),
+                        "description": _plain_text(
+                            turn.untrusted_data.get("description")
+                        ).strip(),
+                        "history": history,
+                        "replies": replies,
+                    },
+                    turn.token_budget,
+                )
+            except RetryableModelError as exc:
+                failure = exc
+                decision = IntakeDecision("retry", "", exc.tokens_used)
         if (
             type(decision.tokens_used) is not int
             or not 0 <= decision.tokens_used <= turn.token_budget
@@ -195,6 +259,30 @@ class IntakeOrchestrator:
                 or ticket.intake_state != original_state
             ):
                 return TurnResult(decision.tokens_used, None)
+            if failure is not None:
+                attempts = state.get("model_failures", 0) + 1
+                ticket.intake_state = {
+                    **state,
+                    "history": history,
+                    "pending_replies": replies,
+                    "model_failures": attempts,
+                }
+                logger.warning(
+                    "Jira intake model failed for %s; attempt %d of 3: %s",
+                    ticket.issue_key,
+                    attempts,
+                    failure,
+                )
+                wake_at = None
+                if attempts >= 3:
+                    park_ticket(ticket, "Intake model failed 3 consecutive attempts")
+                else:
+                    wake_at = self._clock() + timedelta(
+                        seconds=self._config.jira_worker_write_backoff_seconds
+                        * 2 ** (attempts - 1)
+                    )
+                await session.commit()
+                return TurnResult(decision.tokens_used, wake_at)
             if decision.action == "budget":
                 park_ticket(ticket, TOKEN_LIMIT)
                 await session.commit()
@@ -266,17 +354,24 @@ class IntakeOrchestrator:
             }
             instance, issue_key = ticket.instance, ticket.issue_key
             await session.commit()
-        await set_admin_card_reason(
-            self._factory,
-            engine=self._factory.kw["bind"],
-            board=self._board,
-            config=self._config,
-            instance=instance,
-            issue_key=issue_key,
-            reason=INTAKE_REASON,
-            detail=reason,
-            now=self._clock(),
-        )
+        try:
+            await set_admin_card_reason(
+                self._factory,
+                engine=self._factory.kw["bind"],
+                board=self._board,
+                config=self._config,
+                instance=instance,
+                issue_key=issue_key,
+                reason=INTAKE_REASON,
+                detail=reason,
+                now=self._clock(),
+            )
+        except Exception:
+            logger.warning(
+                "Jira intake admin card update failed for %s",
+                issue_key,
+                exc_info=True,
+            )
         return TurnResult(decision.tokens_used, None)
 
     async def _queue(

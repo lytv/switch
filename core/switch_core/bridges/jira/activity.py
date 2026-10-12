@@ -411,11 +411,7 @@ class TicketActivity:
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
                 park_ticket(ticket, TOKEN_LIMIT)
-            version, observation = await self._read_jira(
-                ticket,
-                force=force_jira
-                or (ticket.intake_state or {}).get("phase") == "approval",
-            )
+            version, observation = await self._read_jira(ticket, force=force_jira)
             fell_back = False
             if (
                 (
@@ -527,13 +523,19 @@ class TicketActivity:
             return True
 
     def _comment_refresh_due(self, ticket: JiraWorkerTicket) -> bool:
-        if ticket.wait_channel != "jira_comments":
+        if (
+            ticket.wait_channel != "jira_comments"
+            and (ticket.intake_state or {}).get("phase") != "approval"
+        ):
             return False
         due = self._comment_refresh_at.get(ticket.id)
         return due is None or due <= self._clock()
 
     def _schedule_comment_refresh(self, ticket: JiraWorkerTicket) -> None:
-        if ticket.wait_channel != "jira_comments":
+        if (
+            ticket.wait_channel != "jira_comments"
+            and (ticket.intake_state or {}).get("phase") != "approval"
+        ):
             return
         interval = max(1, self._config.jira_worker_poll_interval_seconds)
         self._comment_refresh_at[ticket.id] = self._clock() + timedelta(
