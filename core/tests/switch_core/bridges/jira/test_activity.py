@@ -1352,6 +1352,66 @@ async def test_wait_send_reads_the_room_first(session_factory) -> None:
     assert len(jira.writes) == 1
 
 
+@pytest.mark.parametrize(
+    ("prefix", "command", "data"),
+    [
+        ("wait-blocked", "transition", "BLOCKED"),
+        ("wait-reminder", "comment", "reminder"),
+    ],
+)
+async def test_wait_send_forces_jira_comments_before_refresh_is_due(
+    session_factory, prefix, command, data
+) -> None:
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    config = _config(jira_worker_enabled_projects={"acme": ["KAN"]})
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config,
+        poll_clients={"acme": client_for(jira)},
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+    )
+    await scheduler.activity.read_once()
+
+    async def queue(suffix: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerTicket, key)
+            assert row is not None
+            row.wait_anchor = datetime(2000, 1, 1, tzinfo=UTC)
+            command_id = await enqueue_jira_command(
+                session,
+                config=config,
+                ticket=row,
+                command_key=f"{prefix}:{key}:{suffix}",
+                command=command,
+                data=data,
+                based_updated=row.jira_read_updated,
+                based_changelog_id=row.jira_read_changelog_id,
+            )
+            await session.commit()
+        assert command_id is not None
+        return command_id
+
+    first = await queue("first")
+    await scheduler._outbox.run_once()
+    async with session_factory() as session:
+        sent = await session.get(JiraWorkerOutbox, first)
+        assert sent is not None and sent.status == "done"
+    assert len(jira.writes) == 1
+
+    jira.change("reporter-account", comment=True)
+    second = await queue("second")
+    await scheduler._outbox.run_once()
+    async with session_factory() as session:
+        cancelled = await session.get(JiraWorkerOutbox, second)
+        assert cancelled is not None and cancelled.status == "cancelled"
+    assert len(jira.writes) == 1
+    assert any(
+        event.event_kind == "jira_comment" and event.payload["reporter_input"]
+        for event in await events(session_factory)
+    )
+
+
 async def test_accepted_input_wakes_a_live_turn(session_factory) -> None:
     key = await seed(session_factory)
     rooms, jira = ThreadRooms(), JiraMock()

@@ -80,16 +80,17 @@ reason edits the card. The card stays. A new reason also posts one short
 alert line after the card commit. A clear does not. Follow-up: propagate
 message edits to bridge channels.
 
-Reasons come from an unmapped reporter, a Jira write that failed 3 times, a
-park that needs a person (human Jira action, token limit, uncertain write),
+Reasons come from an unmapped reporter, a Jira write that failed 3 times or
+parked the worker, any park except a completed or cancelled ticket,
 and the wait rules. `set_admin_card_reason` is the raise/clear call for an
 intake question count. Step 8 calls it. Intake decisions themselves remain
 step 8 work.
 
 Wait timers count work hours on `JIRA_WORKER_CALENDAR` (default Monday-Friday
 09:00-17:00 UTC). The reminder is 2 work hours and goes to the reporter on the
-ticket wait channel. The admin alert is 4 work hours. Blocked is 8 work hours,
-one default work day. A disabled project is left unchanged.
+ticket wait channel. The admin alert is 4 work hours. Blocked follows one
+work day, using the calendar's daily window. These thresholds are fixed.
+A disabled project is left unchanged.
 
 An admin accepts a stored `ignored_input` event with
 `POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new

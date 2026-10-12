@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import null, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -32,7 +32,12 @@ from switch_core.bridges.jira.admin import (
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND as ROOMS_ADMIN_CARD_COMMAND,
 )
-from switch_core.config import JiraWorkerCalendar, JiraWorkerCredentials
+from switch_core.bridges.jira.worker import JiraWorkerScheduler
+from switch_core.config import (
+    JiraWorkerCalendar,
+    JiraWorkerCredentials,
+    JiraWorkerStatuses,
+)
 from switch_core.db.models import (
     JiraWorkerEvent,
     JiraWorkerOutbox,
@@ -42,6 +47,7 @@ from switch_core.db.models import (
     User,
 )
 from switch_core.room_service import RoomCreateConfig
+from tests.switch_core.bridges.jira.test_outbox import JiraMock, enqueue, sender_for
 from tests.switch_core.bridges.jira.test_worker import _config, _run_migrations
 
 NOW = datetime(2026, 10, 2, 16, 0, tzinfo=UTC)
@@ -375,6 +381,8 @@ async def test_each_reason_raises_and_clears(
         "TimeoutError: Jira write outcome is unknown; automatic replay is unsafe",
         "Unattributed Jira action",
         "Interrupted orchestrator turn; outcome and token usage unknown",
+        "The command's changelog baseline is missing",
+        "Jira version is older than the command baseline",
     ):
         async with session_factory() as session:
             ticket = await session.get(JiraWorkerTicket, ticket_id)
@@ -395,13 +403,13 @@ async def test_each_reason_raises_and_clears(
         assert ticket is not None
         ticket.worker_parked_reason = "Jira changelog baseline is missing"
         await session.commit()
-    assert "parked:" not in await sync()
+    assert "parked: Jira changelog baseline is missing" in await sync()
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, ticket_id)
         assert ticket is not None
         ticket.worker_parked_reason = None
         await session.commit()
-    await sync()
+    assert "parked:" not in await sync()
 
     await set_admin_card_reason(
         session_factory,
@@ -751,17 +759,31 @@ async def test_approval_room_message_does_not_reset_the_wait(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["Waiting for input", "Waiting for approval"])
+@pytest.mark.parametrize(
+    "fired",
+    [
+        {},
+        {
+            "reminder": NOW.isoformat(),
+            "admin": NOW.isoformat(),
+            "blocked": NOW.isoformat(),
+        },
+    ],
+)
 async def test_parked_ticket_does_not_fire_wait_milestones(
     session_factory: async_sessionmaker[AsyncSession],
+    status: str,
+    fired: dict[str, str],
 ) -> None:
     ticket_id = await _seed(
         session_factory,
-        status="Waiting for input",
+        status=status,
         reporter_switch_user_id="user-1",
         wait_channel="switch",
         room_id="room-1",
         wait_anchor=NOW - timedelta(hours=10),
-        wait_fired={},
+        wait_fired=fired,
         worker_parked_reason="Human Jira action",
         jira_read_updated="2026-10-02T16:00:00.000+0000",
         jira_read_changelog_id="200",
@@ -770,13 +792,24 @@ async def test_parked_ticket_does_not_fire_wait_milestones(
     await _sync_at(session_factory, ticket_id, board, NOW)
     assert board.reminders == []
     ticket = await _ticket(session_factory, ticket_id)
-    assert "wait_admin" not in (ticket.admin_reasons or {})
-    assert "wait_blocked" not in (ticket.admin_reasons or {})
+    assert ("wait_admin" in (ticket.admin_reasons or {})) == ("admin" in fired)
+    assert ("wait_blocked" in (ticket.admin_reasons or {})) == ("blocked" in fired)
+    assert ticket.wait_fired == fired
     async with session_factory() as session:
         blocked = await session.scalar(
             select(JiraWorkerOutbox).where(JiraWorkerOutbox.command == "transition")
         )
     assert blocked is None
+    if status == "Waiting for input":
+        await _input_event(
+            session_factory,
+            kind="explicit_input",
+            received_at=NOW - timedelta(hours=1),
+        )
+        await _sync_at(session_factory, ticket_id, board, NOW)
+        ticket = await _ticket(session_factory, ticket_id)
+        assert "wait_admin" not in (ticket.admin_reasons or {})
+        assert "wait_blocked" not in (ticket.admin_reasons or {})
 
 
 async def _wait_command(
@@ -874,11 +907,27 @@ async def test_reply_cancels_pending_wait_commands(
 
 
 @pytest.mark.asyncio
-async def test_accept_cancels_claimed_wait_command(
-    session_factory: async_sessionmaker[AsyncSession],
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("Waiting for input", "cancelled"),
+        ("Waiting for approval", "claimed"),
+        ("Need input", "cancelled"),
+    ],
+)
+async def test_accept_only_cancels_input_wait_commands(
+    session_factory: async_sessionmaker[AsyncSession], status: str, expected: str
 ) -> None:
+    config = _worker_config(
+        jira_worker_statuses=JiraWorkerStatuses(
+            waiting_for_input="Need input"
+            if status == "Need input"
+            else "Waiting for input"
+        )
+    )
     await _seed(
         session_factory,
+        status=status,
         reporter_switch_user_id="user-1",
         wait_channel="switch",
         agent_state="waiting",
@@ -913,13 +962,13 @@ async def test_accept_cancels_claimed_wait_command(
             session,
             event_id=event.id,
             admin_user_id=admin.id,
-            enabled_projects={"acme": ["KAN"]},
+            config=config,
         )
         await session.commit()
     async with session_factory() as session:
         rows = list(await session.scalars(select(JiraWorkerOutbox)))
     by_key = {row.command_key: row.status for row in rows}
-    assert by_key["wait-blocked:accept:claimed"] == "cancelled"
+    assert by_key["wait-blocked:accept:claimed"] == expected
     assert by_key["wait-reminder:accept:sending"] == "sending"
 
 
@@ -1099,13 +1148,13 @@ async def test_admin_override_writes_a_new_event(
                 session,
                 event_id=event_id,
                 admin_user_id=stranger_id,
-                enabled_projects={"acme": ["KAN"]},
+                config=_worker_config(),
             )
         new_id = await accept_ignored_input(
             session,
             event_id=event_id,
             admin_user_id=admin_id,
-            enabled_projects={"acme": ["KAN"]},
+            config=_worker_config(),
         )
         await session.commit()
     async with session_factory() as session:
@@ -1527,6 +1576,271 @@ async def test_reply_before_reminder_send_is_not_posted(
     assert "reminder" not in (
         (await _ticket(session_factory, ticket_id)).wait_fired or {}
     )
+
+
+@pytest.mark.asyncio
+async def test_nontransient_failure_posts_and_clears_admin_reasons(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _seed(session_factory, reporter_switch_user_id="user-1")
+    jira = JiraMock()
+    command_id = await enqueue(
+        session_factory, command="transition", data="In Progress"
+    )
+    sender = sender_for(session_factory, jira)
+    jira.unavailable_transition = True
+    await sender.run_once()
+    async with session_factory() as session:
+        failed = await session.get(JiraWorkerOutbox, command_id)
+        assert failed is not None and failed.status == "failed"
+        assert failed.attempts == 1
+    jira.unavailable_transition = False
+    await sender.run_once()
+    await sender.run_once()
+    assert jira.status == "BLOCKED"
+
+    board = FakeAdminBoard()
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    stored = await _ticket(session_factory, ticket_id)
+    assert set(stored.admin_reasons or {}) == {"parked", "blocked_writes"}
+    assert len(board.posts) == 1
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, ticket_id)
+        assert stored is not None
+        stored.worker_parked_reason = None
+        await session.commit()
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    assert (await _ticket(session_factory, ticket_id)).admin_reasons is None
+    assert "- none" in board.cards["admin-card-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["Waiting for input", "Waiting for approval"])
+async def test_accept_repeat_preserves_a_later_wait(
+    session_factory: async_sessionmaker[AsyncSession], status: str
+) -> None:
+    ticket_id = await _seed(
+        session_factory,
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        agent_state="waiting",
+    )
+    config = _worker_config()
+    async with session_factory() as session:
+        admin = User(name="Admin", email="retry-admin@example.invalid", role="admin")
+        event = JiraWorkerEvent(
+            instance="acme",
+            idempotency_key="ignored-retry",
+            issue_key="KAN-1",
+            project_key="KAN",
+            event_kind="ignored_input",
+        )
+        session.add_all([admin, event])
+        await session.commit()
+        admin_id, event_id = admin.id, event.id
+        accepted_id = await accept_ignored_input(
+            session, event_id=event_id, admin_user_id=admin_id, config=config
+        )
+        await session.commit()
+
+    anchor = datetime.now(UTC) + timedelta(hours=1)
+    fired = {
+        "reminder": anchor.isoformat(),
+        "admin": anchor.isoformat(),
+        "blocked": anchor.isoformat(),
+    }
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, ticket_id)
+        assert stored is not None
+        stored.status = status
+        stored.agent_state = "waiting"
+        stored.wait_anchor = anchor
+        stored.wait_fired = fired
+        await session.commit()
+    for prefix, command in (
+        ("wait-reminder", "comment"),
+        ("wait-blocked", "transition"),
+    ):
+        await _wait_command(
+            session_factory,
+            issue_key="KAN-1",
+            command_key=f"{prefix}:{ticket_id}:later",
+            command=command,
+            status="pending",
+        )
+    async with session_factory() as session:
+        assert (
+            await accept_ignored_input(
+                session, event_id=event_id, admin_user_id=admin_id, config=config
+            )
+            == accepted_id
+        )
+        await session.commit()
+    await _sync_at(session_factory, ticket_id, FakeAdminBoard(), anchor)
+    stored = await _ticket(session_factory, ticket_id)
+    assert stored.agent_state == "waiting"
+    assert stored.wait_anchor == anchor
+    assert stored.wait_fired == fired
+    async with session_factory() as session:
+        commands = list(
+            await session.scalars(
+                select(JiraWorkerOutbox).where(JiraWorkerOutbox.channel == "jira")
+            )
+        )
+        explicit = list(
+            await session.scalars(
+                select(JiraWorkerEvent).where(
+                    JiraWorkerEvent.event_kind == "explicit_input"
+                )
+            )
+        )
+    assert len(explicit) == 1
+    assert len(commands) == 2
+    assert all(row.status == "pending" for row in commands)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stops_visiting_closed_tickets_after_final_update(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    active = await _seed(session_factory)
+    closed: list[str] = []
+    for number, (status, reasons) in enumerate(
+        [("Done", None), (" cancelled ", {}), ("CANCELED", null())], start=2
+    ):
+        closed.append(
+            await _seed(
+                session_factory,
+                issue_key=f"KAN-{number}",
+                status=status,
+                admin_reasons=reasons,
+            )
+        )
+    board = FakeAdminBoard()
+    config = _worker_config()
+    engine = session_factory.kw["bind"]
+
+    async def reconcile() -> int:
+        return await reconcile_admin_cards(
+            session_factory, engine=engine, board=board, config=config, now=NOW
+        )
+
+    assert await reconcile() == 1
+    assert len(board.posts) == 1
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, active)
+        assert stored is not None
+        stored.status = " Done "
+        stored.worker_parked_reason = "Human Jira action"
+        session.add(
+            JiraWorkerOutbox(
+                channel="jira",
+                command="comment",
+                instance="acme",
+                issue_key="KAN-1",
+                status="failed",
+                attempts=3,
+                payload={},
+            )
+        )
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                command=ADMIN_CARD_COMMAND,
+                instance="acme",
+                issue_key="KAN-2",
+                status="pending",
+                payload={"ticket_id": closed[0]},
+            )
+        )
+        await session.commit()
+    assert await reconcile() == 2
+    assert (await _ticket(session_factory, active)).admin_reasons is None
+    assert "- none" in board.cards["admin-card-1"]
+    assert await reconcile() == 0
+    async with session_factory() as session:
+        follow_up = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == ADMIN_CARD_COMMAND
+            )
+        )
+        assert follow_up is not None and follow_up.status == "done"
+        stored = await session.get(JiraWorkerTicket, closed[0])
+        assert stored is not None
+        stored.status = "In Progress"
+        await session.commit()
+    assert await reconcile() == 1
+    assert len(board.posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reuses_engine_without_a_session_for_card_reconciliation(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    class CountingSessions(async_sessionmaker[AsyncSession]):
+        calls = 0
+
+        def __call__(self, **local_kw: Any) -> AsyncSession:
+            self.calls += 1
+            return super().__call__(**local_kw)
+
+    sessions = CountingSessions(bind=session_factory.kw["bind"], expire_on_commit=False)
+    scheduler = JiraWorkerScheduler(
+        session_factory=sessions,
+        config=_worker_config(jira_worker_enabled_projects={}),
+        admin_board=FakeAdminBoard(),
+    )
+    await scheduler.run_once()
+    assert sessions.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day_hours", [6, 8])
+async def test_wait_thresholds_follow_the_configured_work_day(
+    session_factory: async_sessionmaker[AsyncSession], day_hours: int
+) -> None:
+    anchor = datetime(2026, 10, 5, 9, tzinfo=UTC)
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=anchor,
+        wait_fired={},
+        jira_read_updated="2026-10-02T16:00:00.000+0000",
+        jira_read_changelog_id="200",
+    )
+    board = FakeAdminBoard()
+    config = _worker_config(
+        jira_worker_calendar=JiraWorkerCalendar(end_hour=9 + day_hours)
+    )
+    engine = session_factory.kw["bind"]
+
+    async def sync(hours: float) -> JiraWorkerTicket:
+        await sync_admin_card(
+            session_factory,
+            engine=engine,
+            board=board,
+            config=config,
+            ticket_id=ticket_id,
+            now=anchor + timedelta(hours=hours),
+        )
+        return await _ticket(session_factory, ticket_id)
+
+    assert (await sync(2 - 1 / 60)).wait_fired == {}
+    assert "reminder" in ((await sync(2)).wait_fired or {})
+    assert len(board.reminders) == 1
+    assert "wait_admin" not in ((await sync(4 - 1 / 60)).admin_reasons or {})
+    assert "wait_admin" in ((await sync(4)).admin_reasons or {})
+    assert "wait_blocked" not in ((await sync(day_hours - 1 / 60)).admin_reasons or {})
+    assert "wait_blocked" in ((await sync(day_hours)).admin_reasons or {})
+    async with session_factory() as session:
+        blocked = await session.scalar(
+            select(JiraWorkerOutbox).where(JiraWorkerOutbox.command == "transition")
+        )
+        assert blocked is not None and blocked.payload["data"] == "BLOCKED"
 
 
 @pytest.mark.asyncio

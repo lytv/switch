@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, or_, select, text
+from sqlalchemy import JSON, and_, delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -50,6 +50,8 @@ ADMIN_ROOM_NAME = "Jira admin"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
 ADMIN_ALERT_COMMAND = "admin_reason_alert"
 INTAKE_REASON = "intake_questions"
+WAIT_REMINDER_HOURS = 2
+WAIT_ADMIN_HOURS = 4
 _WAIT_INPUT_KIND = {"switch": "thread_message", "jira_comments": "jira_comment"}
 _DERIVED = (
     "unmapped_reporter",
@@ -358,11 +360,28 @@ async def reconcile_admin_cards(
         return 0
     moment = now or datetime.now(UTC)
     async with session_factory() as session:
+        pending_follow_ups = select(JiraWorkerOutbox.payload["ticket_id"].astext).where(
+            JiraWorkerOutbox.channel == "switch",
+            JiraWorkerOutbox.command == ADMIN_CARD_COMMAND,
+            JiraWorkerOutbox.status == "pending",
+        )
         ids = list(
             (
                 await session.scalars(
                     select(JiraWorkerTicket.id)
-                    .where(_scope(config))
+                    .where(
+                        _scope(config),
+                        or_(
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                ("done", "cancelled", "canceled")
+                            ),
+                            and_(
+                                JiraWorkerTicket.admin_reasons.is_not(None),
+                                JiraWorkerTicket.admin_reasons.not_in((JSON.NULL, {})),
+                            ),
+                            JiraWorkerTicket.id.in_(pending_follow_ups),
+                        ),
+                    )
                     .order_by(JiraWorkerTicket.first_seen_at, JiraWorkerTicket.id)
                 )
             ).all()
@@ -466,7 +485,7 @@ async def accept_ignored_input(
     *,
     event_id: str,
     admin_user_id: str,
-    enabled_projects: dict[str, list[str]],
+    config: SwitchConfig,
 ) -> str:
     """Record a new explicit input event. The ignored_input row is not rewritten."""
     admin = await session.get(User, admin_user_id)
@@ -475,7 +494,9 @@ async def accept_ignored_input(
     event = await session.get(JiraWorkerEvent, event_id)
     if event is None or event.event_kind != "ignored_input":
         raise ValueError("ignored_input event not found")
-    if event.project_key not in enabled_projects.get(event.instance, []):
+    if event.project_key not in config.jira_worker_enabled_projects.get(
+        event.instance, []
+    ):
         raise ValueError("project is not enabled")
     key = f"accept:{event.id}"
     payload = {
@@ -495,14 +516,15 @@ async def accept_ignored_input(
         payload=payload,
     )
     if new_id is None:
-        new_id = await session.scalar(
+        existing_id = await session.scalar(
             select(JiraWorkerEvent.id).where(
                 JiraWorkerEvent.instance == event.instance,
                 JiraWorkerEvent.idempotency_key == key,
             )
         )
-    if new_id is None:
-        raise RuntimeError("accepted input event was not stored")
+        if existing_id is None:
+            raise RuntimeError("accepted input event was not stored")
+        return existing_id
     ticket = await session.scalar(
         select(JiraWorkerTicket)
         .where(
@@ -513,7 +535,8 @@ async def accept_ignored_input(
     )
     if ticket is not None:
         request_wake(ticket)
-        await _cancel_wait_commands(session, ticket)
+        if ticket.status == config.jira_worker_statuses.waiting_for_input:
+            await _cancel_wait_commands(session, ticket)
     return new_id
 
 
@@ -745,24 +768,34 @@ async def _apply_state(
         for key, value in (ticket.admin_reasons or {}).items()
         if key not in _DERIVED
     }
-    if ticket.reporter_switch_user_id is None and not is_terminal_ticket_status(
-        ticket.status
-    ):
+    if is_terminal_ticket_status(ticket.status):
+        ticket.admin_reasons = None
+        await _apply_wait(session, ticket, config, now, {}, reminders)
+        return
+    if ticket.reporter_switch_user_id is None:
         reasons["unmapped_reporter"] = "Reporter has no Switch user"
     failed = await session.scalar(
-        select(JiraWorkerOutbox.id)
+        select(JiraWorkerOutbox)
         .where(
             JiraWorkerOutbox.instance == ticket.instance,
             JiraWorkerOutbox.issue_key == ticket.issue_key,
             JiraWorkerOutbox.channel == "jira",
             JiraWorkerOutbox.status == "failed",
-            JiraWorkerOutbox.attempts >= 3,
+            or_(
+                JiraWorkerOutbox.attempts >= 3,
+                "Jira command failed: " + JiraWorkerOutbox.id
+                == ticket.worker_parked_reason,
+            ),
             JiraWorkerOutbox.payload["failure_of"].astext.is_(None),
         )
         .limit(1)
     )
     if failed:
-        reasons["blocked_writes"] = "Jira write failed 3 times"
+        reasons["blocked_writes"] = (
+            "Jira write failed 3 times"
+            if failed.attempts >= 3
+            else "Jira write failed; worker parked"
+        )
     if needs_person(ticket.worker_parked_reason):
         reasons["parked"] = ticket.worker_parked_reason or "parked"
     await _apply_wait(session, ticket, config, now, reasons, reminders)
@@ -865,6 +898,11 @@ async def _apply_wait(
         if ticket.wait_anchor is None:
             ticket.wait_anchor = now
             ticket.wait_fired = {}
+        fired = ticket.wait_fired or {}
+        if "admin" in fired:
+            reasons["wait_admin"] = "No reply after the admin wait"
+        if "blocked" in fired:
+            reasons["wait_blocked"] = "No reply after one work day"
         return
     if ticket.wait_anchor is None:
         ticket.wait_anchor = now
@@ -875,7 +913,7 @@ async def _apply_wait(
     fired = dict(ticket.wait_fired or {})
     calendar = config.jira_worker_calendar
     if "reminder" not in fired and now >= add_work_time(
-        anchor, config.jira_worker_wait_reminder_hours, calendar
+        anchor, WAIT_REMINDER_HOURS, calendar
     ):
         try:
             await _send_reminder(session, ticket, config, anchor, reminders)
@@ -885,14 +923,14 @@ async def _apply_wait(
             if ticket.wait_channel == "jira_comments":
                 fired["reminder"] = now.isoformat()
     if "admin" not in fired and now >= add_work_time(
-        anchor, config.jira_worker_wait_admin_hours, calendar
+        anchor, WAIT_ADMIN_HOURS, calendar
     ):
         reasons["wait_admin"] = "No reply after the admin wait"
         fired["admin"] = now.isoformat()
     elif "admin" in fired:
         reasons["wait_admin"] = "No reply after the admin wait"
     if "blocked" not in fired and now >= add_work_time(
-        anchor, config.jira_worker_wait_blocked_hours, calendar
+        anchor, calendar.end_hour - calendar.start_hour, calendar
     ):
         try:
             await _enqueue_blocked(session, ticket, config, anchor)

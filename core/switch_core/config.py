@@ -196,11 +196,6 @@ class SwitchConfig(BaseSettings):
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
     jira_worker_notice_window_seconds: int = Field(default=86_400, ge=1)
     jira_worker_calendar: JiraWorkerCalendar = JiraWorkerCalendar()
-    # Durations are work hours on jira_worker_calendar, not clock hours.
-    # 8 matches one default 09:00-17:00 work day.
-    jira_worker_wait_reminder_hours: float = Field(default=2, gt=0)
-    jira_worker_wait_admin_hours: float = Field(default=4, gt=0)
-    jira_worker_wait_blocked_hours: float = Field(default=8, gt=0)
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

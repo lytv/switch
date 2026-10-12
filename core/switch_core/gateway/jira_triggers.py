@@ -679,7 +679,7 @@ async def accept_worker_ignored_input(
             session,
             event_id=event_id,
             admin_user_id=admin.id,
-            enabled_projects=config.jira_worker_enabled_projects,
+            config=config,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc

@@ -171,24 +171,10 @@ NON_WORKER_SUPERSEDED = "A non-worker Jira action superseded the command"
 INTERRUPTED_TURN = "Interrupted orchestrator turn; outcome and token usage unknown"
 TURN_FAILED = "Orchestrator turn failed; outcome and token usage unknown"
 UNCERTAIN_REPLAY = "automatic replay is unsafe"
-_PERSON_REASONS = frozenset(
-    {
-        HUMAN_JIRA_ACTION,
-        UNATTRIBUTED_JIRA_ACTION,
-        TOKEN_LIMIT,
-        ISSUE_CHANGED_DURING_READ,
-        STAMP_MISMATCH,
-        NON_WORKER_SUPERSEDED,
-        INTERRUPTED_TURN,
-        TURN_FAILED,
-    }
-)
 
 
 def needs_person(reason: str | None) -> bool:
-    if not reason:
-        return False
-    return reason in _PERSON_REASONS or UNCERTAIN_REPLAY in reason
+    return bool(reason) and reason != "Jira ticket completed or cancelled"
 
 
 def check_jira_version(

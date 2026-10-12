@@ -868,6 +868,7 @@ class JiraWorkerScheduler:
         admin_board: AdminBoard | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._engine = cast(AsyncEngine, session_factory.kw["bind"])
         self._config = config
         self._poll_clients = poll_clients or {}
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
@@ -895,7 +896,7 @@ class JiraWorkerScheduler:
 
     async def _before_wait_send(self, ticket_id: str) -> bool:
         """Read new ticket input, then say whether a wait send must stop."""
-        refreshed = await self.activity.read_ticket(ticket_id)
+        refreshed = await self.activity.read_ticket(ticket_id, force_jira=True)
         async with self._session_factory() as session:
             ticket = await session.get(JiraWorkerTicket, ticket_id)
             if ticket is None or await wait_send_cancelled(
@@ -973,11 +974,9 @@ class JiraWorkerScheduler:
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
         if self._admin_board is not None:
-            async with self._session_factory() as session:
-                engine = cast(AsyncEngine, session.bind)
             await reconcile_admin_cards(
                 self._session_factory,
-                engine=engine,
+                engine=self._engine,
                 board=self._admin_board,
                 config=self._config,
                 now=self._clock(),
