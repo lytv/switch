@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
+WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -146,7 +148,7 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
         "fields"
     ]["updated"]
     if _stamp(before) != _stamp(updated):
-        raise HumanChange("Issue changed while the version check read its history")
+        raise HumanChange(ISSUE_CHANGED_DURING_READ)
     histories.sort(key=lambda item: (_stamp(item["created"]), int(item["id"])))
     return {
         "updated": updated,
@@ -158,6 +160,21 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
 
 class HumanChange(Exception):
     """A non-worker or unattributed change must park the ticket."""
+
+
+HUMAN_JIRA_ACTION = "Human Jira action"
+UNATTRIBUTED_JIRA_ACTION = "Unattributed Jira action"
+TOKEN_LIMIT = "Ticket token limit"
+ISSUE_CHANGED_DURING_READ = "Issue changed while the version check read its history"
+STAMP_MISMATCH = "Jira updated stamp has no attributable worker change"
+NON_WORKER_SUPERSEDED = "A non-worker Jira action superseded the command"
+INTERRUPTED_TURN = "Interrupted orchestrator turn; outcome and token usage unknown"
+TURN_FAILED = "Orchestrator turn failed; outcome and token usage unknown"
+UNCERTAIN_REPLAY = "automatic replay is unsafe"
+
+
+def needs_person(reason: str | None) -> bool:
+    return bool(reason) and reason != "Jira ticket completed or cancelled"
 
 
 def check_jira_version(
@@ -183,8 +200,8 @@ def check_jira_version(
     if observation.park == "regressed":
         raise HumanChange("Jira version is older than the command baseline")
     if observation.park == "stamp_mismatch":
-        raise HumanChange("Jira updated stamp has no attributable worker change")
-    raise HumanChange("A non-worker Jira action superseded the command")
+        raise HumanChange(STAMP_MISMATCH)
+    raise HumanChange(NON_WORKER_SUPERSEDED)
 
 
 def park_ticket(ticket: JiraWorkerTicket, reason: str) -> None:
@@ -198,6 +215,16 @@ def _failure_reason(command_id: str) -> str:
     return f"Jira command failed: {command_id}"
 
 
+async def _still_claimed(session: AsyncSession, row: JiraWorkerOutbox) -> bool:
+    fresh = await session.get(
+        JiraWorkerOutbox,
+        row.id,
+        with_for_update=True,
+        populate_existing=True,
+    )
+    return fresh is not None and fresh.status == "claimed"
+
+
 class JiraOutboxSender:
     def __init__(
         self,
@@ -207,6 +234,7 @@ class JiraOutboxSender:
         clients: dict[str, JiraPollClient],
         clock: ClockFn,
         rooms: TicketRooms | None = None,
+        before_wait_send: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._factory = session_factory
         self._engine = cast(AsyncEngine, session_factory.kw["bind"])
@@ -215,6 +243,7 @@ class JiraOutboxSender:
         self._clock = clock
         self._accounts: dict[str, str] = {}
         self._rooms = rooms
+        self._before_wait_send = before_wait_send
 
     async def run_once(self) -> None:
         scopes = [
@@ -326,7 +355,9 @@ class JiraOutboxSender:
             return
         if row.status == "sending":
             row.status = "uncertain"
-            row.error = "Restart found a write with an unknown outcome; automatic replay is unsafe"
+            row.error = (
+                f"Restart found a write with an unknown outcome; {UNCERTAIN_REPLAY}"
+            )
             park_ticket(ticket, row.error)
             await session.commit()
             return
@@ -364,6 +395,17 @@ class JiraOutboxSender:
             row.attempts += 1
         row.status = "claimed"
         await session.commit()
+        if self._before_wait_send is not None and (row.command_key or "").startswith(
+            WAIT_COMMAND_PREFIXES
+        ):
+            cancelled = await self._before_wait_send(ticket.id)
+            await session.refresh(ticket)
+            if cancelled:
+                if await _still_claimed(session, row):
+                    row.status = "cancelled"
+                    row.error = "Wait ended before send"
+                    await session.commit()
+                return
         client = self._clients[row.instance]
         sending = False
         try:
@@ -414,15 +456,21 @@ class JiraOutboxSender:
             # Resolve transitions first. The version check is the last Jira read.
             version = await read_jira_version(client, row.issue_key)
             check_jira_version(version, payload, account_id)
+            if not await _still_claimed(session, row):
+                return
             row.status = "sending"
             await session.commit()
             sending = True
             await client.request(method, path, json=body)
         except HumanChange as exc:
+            if not await _still_claimed(session, row):
+                return
             row.status = "parked"
             row.error = str(exc)
             park_ticket(ticket, str(exc))
         except Exception as exc:
+            if not sending and not await _still_claimed(session, row):
+                return
             if sending and (
                 isinstance(exc, httpx.TransportError)
                 or (
@@ -431,7 +479,7 @@ class JiraOutboxSender:
                 )
             ):
                 row.status = "uncertain"
-                row.error = f"{type(exc).__name__}: Jira write outcome is unknown; automatic replay is unsafe"
+                row.error = f"{type(exc).__name__}: Jira write outcome is unknown; {UNCERTAIN_REPLAY}"
                 park_ticket(ticket, row.error)
             else:
                 transient = isinstance(exc, httpx.TransportError) or (

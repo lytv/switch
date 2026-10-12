@@ -66,8 +66,37 @@ A Switch notice with an unknown send outcome becomes `uncertain` and logs an
 error; the worker does not replay it automatically. Jira notices retain the
 existing outbox version check, retry, and uncertain-write rules.
 
-Admin override and admin cards remain step 7 work. Intake decisions remain step 8
-work. No UI is part of this boundary.
+## Admin cards
+
+One admin room holds every alert. The worker finds it by the
+`jira_worker_admin_room` marker, not by name. The configured admin user owns
+the room. The room uses the default bridge channel, the same way a ticket
+room does. The Jira system agent posts there.
+
+One card per ticket is posted once, then edited in place. The message keeps
+its id and position. The card shows the current reasons, ticket key, summary,
+status, reporter mapping state, Jira link, and ticket room link. Clearing a
+reason edits the card. The card stays. A new reason also posts one short
+alert line after the card commit. A clear does not. Follow-up: propagate
+message edits to bridge channels.
+
+Reasons come from an unmapped reporter, a Jira write that failed 3 times or
+parked the worker, any park except a completed or cancelled ticket,
+and the wait rules. `set_admin_card_reason` is the raise/clear call for an
+intake question count. Step 8 calls it. Intake decisions themselves remain
+step 8 work.
+
+Wait timers count work hours on `JIRA_WORKER_CALENDAR` (default Monday-Friday
+09:00-17:00 UTC). The reminder is 2 work hours and goes to the reporter on the
+ticket wait channel. The admin alert is 4 work hours. Blocked follows one
+work day, using the calendar's daily window. These thresholds are fixed.
+A disabled project is left unchanged.
+
+An admin accepts a stored `ignored_input` event with
+`POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new
+`explicit_input` event. The old event is not rewritten.
+
+No UI is part of this boundary.
 
 ## One-turn integration
 
@@ -84,5 +113,5 @@ Completion records usage and consumes the turn's input events. Input that arrive
 during the turn requests another wake. A concurrent human park invalidates the
 turn's completion; it cannot clear that park or consume the pending input.
 
-This boundary does not implement intake prompts, Jira approval decisions,
-or admin cards.
+This boundary does not implement intake prompts or Jira approval decisions.
+Admin cards are a separate step.

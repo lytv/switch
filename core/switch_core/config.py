@@ -2,6 +2,7 @@ import re
 import ssl
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,25 @@ class JiraWorkerLimits(BaseModel):
     live_sessions: int = Field(default=5, ge=1)
     room_creates_per_hour: int = Field(default=20, ge=1)
     tokens_per_ticket: int = Field(default=50_000, ge=1)
+
+
+class JiraWorkerCalendar(BaseModel):
+    """One simple work-hours window. Timers advance only inside it."""
+
+    timezone: str = "UTC"
+    # Monday is 0.
+    weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    start_hour: int = Field(default=9, ge=0, le=23)
+    end_hour: int = Field(default=17, ge=1, le=24)
+
+    @model_validator(mode="after")
+    def _window(self) -> "JiraWorkerCalendar":
+        if self.end_hour <= self.start_hour:
+            raise ValueError("end_hour must be after start_hour")
+        if not self.weekdays or any(day < 0 or day > 6 for day in self.weekdays):
+            raise ValueError("weekdays must be between 0 and 6")
+        ZoneInfo(self.timezone)
+        return self
 
 
 class SwitchConfig(BaseSettings):
@@ -175,6 +195,7 @@ class SwitchConfig(BaseSettings):
     jira_worker_limits: JiraWorkerLimits = JiraWorkerLimits()
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
     jira_worker_notice_window_seconds: int = Field(default=86_400, ge=1)
+    jira_worker_calendar: JiraWorkerCalendar = JiraWorkerCalendar()
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

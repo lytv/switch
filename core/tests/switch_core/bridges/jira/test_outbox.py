@@ -49,6 +49,9 @@ class JiraMock:
         self.read_change = False
         self.write_started: asyncio.Event | None = None
         self.write_release: asyncio.Event | None = None
+        self.issue_read_started: asyncio.Event | None = None
+        self.issue_read_release: asyncio.Event | None = None
+        self._held_issue_read = False
 
     def change(self, author: str, *, comment: bool = False) -> None:
         self.updated = (
@@ -126,6 +129,11 @@ class JiraMock:
                 return httpx.Response(200, json={"issues": [], "isLast": True})
             if self.read_change:
                 self.change("human-account")
+            if self.issue_read_started is not None and not self._held_issue_read:
+                self._held_issue_read = True
+                self.issue_read_started.set()
+                if self.issue_read_release is not None:
+                    await self.issue_read_release.wait()
             return httpx.Response(200, json={"fields": {"updated": self.updated}})
         self.writes.append(request)
         if self.write_started:
@@ -239,6 +247,71 @@ async def test_restart_and_double_claim_send_once(
     await sender_for(session_factory, jira).run_once()
     assert len(jira.writes) == 1
     assert (await rows(session_factory))[0].status == "done"
+
+
+async def test_wait_command_is_cancelled_when_the_refresh_ends_the_wait(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    jira = JiraMock()
+    calls: list[str] = []
+
+    async def refresh(ticket_id: str) -> bool:
+        calls.append(ticket_id)
+        return True
+
+    wait_id = await enqueue(
+        session_factory,
+        key="wait-blocked:ticket:1",
+        command="transition",
+        data="BLOCKED",
+    )
+    other_id = await enqueue(session_factory, key="summary-2")
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        clients={"acme": client_for(jira)},
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+        before_wait_send=refresh,
+    )
+    await sender.run_once()
+    await sender.run_once()
+    assert len(calls) == 1
+    by_id = {row.id: row.status for row in await rows(session_factory)}
+    assert by_id[wait_id] == "cancelled"
+    assert by_id[other_id] == "done"
+    assert len(jira.writes) == 1
+    assert jira.writes[0].url.path.endswith("/comment")
+    assert jira.status == "To Do"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claim_is_not_sent_after_version_check(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    jira = JiraMock()
+    command_id = await enqueue(
+        session_factory,
+        key="wait-blocked:race:1",
+        command="transition",
+        data="BLOCKED",
+    )
+    jira.issue_read_started = asyncio.Event()
+    jira.issue_read_release = asyncio.Event()
+    sender = asyncio.create_task(sender_for(session_factory, jira).run_once())
+    await asyncio.wait_for(jira.issue_read_started.wait(), timeout=5)
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, command_id)
+        assert row is not None
+        row.status = "cancelled"
+        await session.commit()
+    jira.issue_read_release.set()
+    await sender
+    assert jira.writes == []
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, command_id)
+        ticket = await session.scalar(select(JiraWorkerTicket))
+    assert row is not None and row.status == "cancelled"
+    assert ticket is not None and ticket.worker_parked_reason is None
 
 
 async def test_restart_after_remote_commit_never_replays(

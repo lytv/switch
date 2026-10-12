@@ -16,18 +16,23 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from sqlalchemy import and_, case, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.jira.activity import (
     TicketActivity,
     is_terminal_ticket_status,
     park_ticket,
     record_event,
+)
+from switch_core.bridges.jira.admin import (
+    enqueue_admin_card_follow_up,
+    reconcile_admin_cards,
+    wait_send_cancelled,
 )
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
@@ -42,6 +47,7 @@ from switch_core.db.models import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from switch_core.bridges.jira.admin import AdminBoard
     from switch_core.bridges.jira.rooms import CardUpdater, TicketRooms
 
 POLL_JOB_KIND = "watermark_poll"
@@ -197,7 +203,9 @@ async def _set_open_ticket_reporter_resolution(
             JiraWorkerTicket.instance == instance,
             JiraWorkerTicket.project_key.in_(enabled_projects),
             JiraWorkerTicket.reporter_account_id == jira_account_id,
-            func.lower(JiraWorkerTicket.status).not_in(_TERMINAL_TICKET_STATUSES),
+            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                _TERMINAL_TICKET_STATUSES
+            ),
         )
         .with_for_update()
     )
@@ -409,6 +417,7 @@ async def upsert_ticket(
     ticket.status = status
     if is_terminal_ticket_status(status):
         park_ticket(ticket, "Jira ticket completed or cancelled")
+        await enqueue_admin_card_follow_up(session, ticket)
     ticket.reporter_account_id = reporter_account_id
     ticket.reporter_switch_user_id = reporter_switch_user_id
     ticket.wait_channel = wait_channel
@@ -426,7 +435,7 @@ async def _enqueue_ticket_intake_follow_ups(
     reporter_resolution_changed: bool,
     switch_user_id: str | None,
 ) -> None:
-    if ticket.status.lower() in _TERMINAL_TICKET_STATUSES:
+    if is_terminal_ticket_status(ticket.status):
         return
     if created:
         if switch_user_id:
@@ -863,8 +872,10 @@ class JiraWorkerScheduler:
         owner: str = "scheduler",
         ticket_rooms: TicketRooms | None = None,
         card_updater: CardUpdater | None = None,
+        admin_board: AdminBoard | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._engine = cast(AsyncEngine, session_factory.kw["bind"])
         self._config = config
         self._poll_clients = poll_clients or {}
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
@@ -876,9 +887,11 @@ class JiraWorkerScheduler:
             clients=self._poll_clients,
             clock=self._clock,
             rooms=ticket_rooms,
+            before_wait_send=self._before_wait_send,
         )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
+        self._admin_board = admin_board
         self.activity = TicketActivity(
             session_factory=session_factory,
             config=config,
@@ -887,6 +900,21 @@ class JiraWorkerScheduler:
             clock=self._clock,
         )
         self._task: asyncio.Task[None] | None = None
+
+    async def _before_wait_send(self, ticket_id: str) -> bool:
+        """Read new ticket input, then say whether a wait send must stop."""
+        refreshed = await self.activity.read_ticket(ticket_id, force_jira=True)
+        async with self._session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            if ticket is None or await wait_send_cancelled(
+                session, ticket, self._config
+            ):
+                return True
+            if not refreshed:
+                raise RuntimeError(
+                    f"Jira ticket {ticket.issue_key} input was not read before a wait send"
+                )
+        return False
 
     @property
     def running(self) -> bool:
@@ -914,7 +942,7 @@ class JiraWorkerScheduler:
             await self._sleep(interval)
 
     async def run_once(self) -> None:
-        """Seed poll jobs, send due Jira commands, reconcile rooms, and poll."""
+        """Seed poll jobs, read input, reconcile cards, send commands, and poll."""
         now = self._clock()
         projects = self._config.jira_worker_enabled_projects
         scopes = [
@@ -950,9 +978,18 @@ class JiraWorkerScheduler:
                 scopes=scopes,
             )
             await session.commit()
-        await self._outbox.run_once()
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
+        if self._admin_board is not None:
+            await reconcile_admin_cards(
+                self._session_factory,
+                engine=self._engine,
+                board=self._admin_board,
+                config=self._config,
+                now=self._clock(),
+                before_wait_send=self._before_wait_send,
+            )
+        await self._outbox.run_once()
         for job in jobs:
             try:
                 await self._handle_job(job)

@@ -57,6 +57,7 @@ from switch_core.transport.types import (
     InboundMembership,
     InboundMessage,
     MessageFormat,
+    NotAuthorError,
     RoomRef,
     SendResult,
     TransportError,
@@ -391,6 +392,30 @@ class PostgresTransport:
             extra_content=extra_content,
         )
         return await self._send(room_id, "m.room.message", content, sender_name)
+
+    async def edit_message(self, room_id: str, event_id: str, new_content: str) -> None:
+        """Replace the body of a message this connection authored.
+
+        The row keeps its id and `seq`. Readers that render the row, including
+        `read_context` and room history, show the new body in the same place.
+        """
+        async with self._session_factory() as session:
+            switch_room_id = await self._resolve_room(session, room_id)
+            message = await self._message_store.get_by_transport_event_id(
+                session, event_id
+            )
+            if message is None or message.room_id != switch_room_id:
+                raise TransportError(f"Message {event_id} is not in this room")
+            if message.sender_id != self.user_id:
+                raise NotAuthorError("Only the author may edit this message")
+            content = dict(message.content or {})
+            content["body"] = new_content
+            message.body = new_content
+            if message.formatted_body is not None:
+                message.formatted_body = new_content
+                content["formatted_body"] = new_content
+            message.content = content
+            await session.commit()
 
     async def send_event(
         self,

@@ -5,18 +5,30 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+import httpx
 import pytest
-from fastapi import HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response
+from httpx import ASGITransport
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.bridges.jira import routes as jira_webhook_routes
 from switch_core.config import SwitchConfig
-from switch_core.db.models import Agent, ApiKey, Client, Room, RoomGroup, User
+from switch_core.db.models import (
+    Agent,
+    ApiKey,
+    Client,
+    JiraWorkerEvent,
+    Room,
+    RoomGroup,
+    User,
+)
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.jira_trigger_store import JiraTriggerStore
 from switch_core.db.stores.room_group_store import RoomGroupStore
 from switch_core.db.stores.room_store import RoomStore
-from switch_core.gateway.auth import require_admin
+from switch_core.gateway.auth import get_current_user, require_admin
+from switch_core.gateway.dependencies import get_config, get_session
 from switch_core.gateway.jira_triggers import (
     create_trigger,
     delete_trigger,
@@ -510,3 +522,78 @@ async def test_list_deliveries(
         row = next(d for d in listed.deliveries if d.issue_key == "DEL-1")
         assert row.matched_rule_ids == [trigger.id]
         assert row.room_results[0].event_id == "$x"
+
+
+def _accept_client(
+    session_factory, user: User, config: SwitchConfig
+) -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(router, prefix="/jira-triggers")
+
+    async def _session():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = _session
+    app.dependency_overrides[get_config] = lambda: config
+    app.dependency_overrides[get_current_user] = lambda: user
+    return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.mark.asyncio
+async def test_accept_ignored_input_route(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        admin = await _make_user(session, "accept-admin")
+        member = await _make_user(session, "accept-member", role="user")
+        ignored = JiraWorkerEvent(
+            instance="acme",
+            idempotency_key="ignored-route",
+            issue_key="KAN-9",
+            project_key="KAN",
+            event_kind="ignored_input",
+            payload={"untrusted_data": {"body": "use this"}},
+        )
+        other = JiraWorkerEvent(
+            instance="acme",
+            idempotency_key="thread-route",
+            issue_key="KAN-9",
+            project_key="KAN",
+            event_kind="thread_message",
+            payload={"untrusted_data": {"body": "no"}},
+        )
+        session.add_all([ignored, other])
+        await session.commit()
+        ignored_id = ignored.id
+        other_id = other.id
+    config = _config(jira_worker_enabled_projects={"acme": ["KAN"]})
+    path = f"/jira-triggers/worker/inputs/{ignored_id}/accept"
+    async with _accept_client(session_factory, member, config) as client:
+        refused = await client.post(path)
+    assert refused.status_code == 403
+    assert refused.json()["detail"] == "Admin access required"
+    async with _accept_client(session_factory, admin, config) as client:
+        missing = await client.post("/jira-triggers/worker/inputs/missing-event/accept")
+        wrong_kind = await client.post(
+            f"/jira-triggers/worker/inputs/{other_id}/accept"
+        )
+        assert missing.status_code == 400
+        assert wrong_kind.status_code == 400
+        first = await client.post(path)
+        second = await client.post(path)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    body = first.json()
+    assert body["id"] == second.json()["id"]
+    assert body["event_kind"] == "explicit_input"
+    assert body["payload"]["reporter_input"] is True
+    assert body["payload"]["accepted_from"] == ignored_id
+    assert body["payload"]["untrusted_data"]["body"] == "use this"
+    async with session_factory() as session:
+        rows = list(await session.scalars(select(JiraWorkerEvent)))
+    explicit = [row for row in rows if row.event_kind == "explicit_input"]
+    assert len(explicit) == 1
+    old = next(row for row in rows if row.id == ignored_id)
+    assert old.event_kind == "ignored_input"
+    assert old.payload == {"untrusted_data": {"body": "use this"}}

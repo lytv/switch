@@ -16,6 +16,7 @@ from switch_core.bridges.jira.activity import (
     TurnResult,
     park_ticket,
 )
+from switch_core.bridges.jira.outbox import enqueue_jira_command
 from switch_core.bridges.jira.rooms import reconcile_ticket_room
 from switch_core.bridges.jira.worker import (
     JiraWorkerScheduler,
@@ -23,7 +24,12 @@ from switch_core.bridges.jira.worker import (
     record_webhook_event,
 )
 from switch_core.config import JiraWorkerLimits
-from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerEvent,
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+)
 from tests.switch_core.bridges.jira import test_worker
 from tests.switch_core.bridges.jira.test_outbox import BASE, JiraMock, client_for
 from tests.switch_core.bridges.jira.test_rooms import FakeRooms, _webhook_event
@@ -1223,7 +1229,7 @@ def _edited_later_stamp() -> str:
     return (datetime.fromisoformat(BASE) + timedelta(seconds=100)).isoformat()
 
 
-async def test_reporter_edit_of_seen_comment_wakes_without_new_event_row(
+async def test_reporter_edit_of_seen_comment_wakes_and_records_input(
     session_factory,
 ) -> None:
     key = await seed(session_factory, mapped=False)
@@ -1241,7 +1247,9 @@ async def test_reporter_edit_of_seen_comment_wakes_without_new_event_row(
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = await events(session_factory)
+    assert [event.event_kind for event in recorded] == ["jira_comment"]
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_worker_edit_of_seen_comment_is_ignored(session_factory) -> None:
@@ -1291,6 +1299,158 @@ async def test_switch_channel_reporter_edit_does_not_wake(session_factory) -> No
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None and row.agent_state == "waiting"
     assert [e.event_kind for e in await events(session_factory)] == ["ignored_input"]
+
+
+async def test_wait_send_reads_the_room_first(session_factory) -> None:
+    key = await seed(session_factory)
+    rooms, jira = ThreadRooms(), JiraMock()
+    config = _config(
+        jira_worker_enabled_projects={"acme": ["KAN"]},
+        frontend_base_url="https://switch.example.invalid",
+    )
+
+    async def queue(command_key: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerTicket, key)
+            assert row is not None
+            row.wait_anchor = datetime(2000, 1, 1, tzinfo=UTC)
+            command_id = await enqueue_jira_command(
+                session,
+                config=config,
+                ticket=row,
+                command_key=command_key,
+                command="transition",
+                data="BLOCKED",
+                based_updated=BASE,
+                based_changelog_id="",
+            )
+            await session.commit()
+        assert command_id is not None
+        return command_id
+
+    async def status(command_id: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerOutbox, command_id)
+        assert row is not None
+        return row.status
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config,
+        poll_clients={"acme": client_for(jira)},
+        ticket_rooms=rooms,
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+    )
+    first = await queue(f"wait-blocked:{key}:first")
+    await scheduler._outbox.run_once()
+    assert await status(first) == "done"
+    assert len(jira.writes) == 1
+    second = await queue(f"wait-blocked:{key}:second")
+    rooms.messages = [message(1)]
+    await scheduler._outbox.run_once()
+    assert await status(second) == "cancelled"
+    assert len(jira.writes) == 1
+
+
+@pytest.mark.parametrize(
+    ("prefix", "command", "data"),
+    [
+        ("wait-blocked", "transition", "BLOCKED"),
+        ("wait-reminder", "comment", "reminder"),
+    ],
+)
+async def test_wait_send_forces_jira_comments_before_refresh_is_due(
+    session_factory, prefix, command, data
+) -> None:
+    key = await seed(session_factory, mapped=False)
+    jira = JiraMock()
+    config = _config(jira_worker_enabled_projects={"acme": ["KAN"]})
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config,
+        poll_clients={"acme": client_for(jira)},
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
+    )
+    await scheduler.activity.read_once()
+
+    async def queue(suffix: str) -> str:
+        async with session_factory() as session:
+            row = await session.get(JiraWorkerTicket, key)
+            assert row is not None
+            row.wait_anchor = datetime(2000, 1, 1, tzinfo=UTC)
+            command_id = await enqueue_jira_command(
+                session,
+                config=config,
+                ticket=row,
+                command_key=f"{prefix}:{key}:{suffix}",
+                command=command,
+                data=data,
+                based_updated=row.jira_read_updated,
+                based_changelog_id=row.jira_read_changelog_id,
+            )
+            await session.commit()
+        assert command_id is not None
+        return command_id
+
+    first = await queue("first")
+    await scheduler._outbox.run_once()
+    async with session_factory() as session:
+        sent = await session.get(JiraWorkerOutbox, first)
+        assert sent is not None and sent.status == "done"
+    assert len(jira.writes) == 1
+
+    jira.change("reporter-account", comment=True)
+    second = await queue("second")
+    await scheduler._outbox.run_once()
+    async with session_factory() as session:
+        cancelled = await session.get(JiraWorkerOutbox, second)
+        assert cancelled is not None and cancelled.status == "cancelled"
+    assert len(jira.writes) == 1
+    assert any(
+        event.event_kind == "jira_comment" and event.payload["reporter_input"]
+        for event in await events(session_factory)
+    )
+
+
+async def test_accepted_input_wakes_a_live_turn(session_factory) -> None:
+    key = await seed(session_factory)
+    rooms, jira = ThreadRooms(), JiraMock()
+    rooms.messages = [message(1)]
+    reader = activity(session_factory, jira, rooms)
+    turns: list[TicketTurn] = []
+    inserted = False
+
+    async def fake(turn: TicketTurn) -> TurnResult:
+        nonlocal inserted
+        turns.append(turn)
+        if not inserted:
+            inserted = True
+            async with session_factory() as session:
+                session.add(
+                    JiraWorkerEvent(
+                        instance="acme",
+                        idempotency_key="accept:live",
+                        issue_key="KAN-1",
+                        project_key="KAN",
+                        event_kind="explicit_input",
+                        payload={
+                            "reporter_input": True,
+                            "untrusted_data": {"body": "use this answer"},
+                        },
+                    )
+                )
+                await session.commit()
+        return TurnResult(1, None)
+
+    assert await reader.run_one_turn(fake) == key
+    assert (await ticket(session_factory, key)).agent_state == "wake_requested"
+    assert await reader.run_one_turn(fake) == key
+    bodies = [
+        item.get("untrusted_data", {}).get("body")
+        for item in turns[1].untrusted_data["events"]
+        if isinstance(item, dict)
+    ]
+    assert "use this answer" in bodies
 
 
 async def test_claimed_turn_excludes_raw_intake_events(session_factory) -> None:
@@ -1367,7 +1527,13 @@ async def test_mixed_worker_comment_and_reporter_edit_wakes(session_factory) -> 
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.event_kind == "jira_comment"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_mixed_worker_history_and_reporter_edit_wakes(session_factory) -> None:
@@ -1388,7 +1554,13 @@ async def test_mixed_worker_history_and_reporter_edit_wakes(session_factory) -> 
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
     assert row.agent_state == "wake_requested"
-    assert len(await events(session_factory)) == 0
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.event_kind == "jira_comment"
+    ]
+    assert len(recorded) == 1
+    assert recorded[0].payload["reporter_input"] is True
 
 
 async def test_mixed_worker_comment_and_other_edit_parks(session_factory) -> None:

@@ -21,6 +21,11 @@ from switch_core.bridges.jira.observe import (
     observe_jira,
 )
 from switch_core.bridges.jira.outbox import (
+    HUMAN_JIRA_ACTION,
+    INTERRUPTED_TURN,
+    TOKEN_LIMIT,
+    TURN_FAILED,
+    UNATTRIBUTED_JIRA_ACTION,
     HumanChange,
     enqueue_jira_command,
     park_ticket,
@@ -41,7 +46,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 ROOM_CREATE = "ticket_room_create"
 TURN = "orchestrator_turn"
-INPUT_KINDS = ("thread_message", "jira_comment", "wake_timer")
+EXPLICIT_INPUT = "explicit_input"
+INPUT_KINDS = ("thread_message", "jira_comment", "wake_timer", EXPLICIT_INPUT)
 
 
 def is_terminal_ticket_status(status: str) -> bool:
@@ -404,7 +410,7 @@ class TicketActivity:
             ):
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
-                park_ticket(ticket, "Ticket token limit")
+                park_ticket(ticket, TOKEN_LIMIT)
             version, observation = await self._read_jira(ticket, force=force_jira)
             fell_back = False
             if (
@@ -467,6 +473,15 @@ class TicketActivity:
                         reporter=bool(actor) and actor == ticket.reporter_account_id,
                     )
                 if observation is not None and observation.reporter_edits:
+                    for comment in observation.reporter_edits:
+                        await self._input(
+                            session,
+                            ticket,
+                            "jira_comment",
+                            f"jira-comment:{ticket.issue_key}:{comment['id']}:{comment['updated']}",
+                            comment,
+                            reporter=True,
+                        )
                     request_wake(ticket)
             else:
                 for comment in (
@@ -574,9 +589,9 @@ class TicketActivity:
         elif observation.park is not None and observation.park != "regressed":
             park_ticket(
                 ticket,
-                "Unattributed Jira action"
+                UNATTRIBUTED_JIRA_ACTION
                 if observation.park == "unattributed"
-                else "Human Jira action",
+                else HUMAN_JIRA_ACTION,
             )
         return version, observation
 
@@ -673,9 +688,7 @@ class TicketActivity:
                     )
                     assert ticket is not None
                     row.status = "error"
-                    row.error = (
-                        "Interrupted orchestrator turn; outcome and token usage unknown"
-                    )
+                    row.error = INTERRUPTED_TURN
                     park_ticket(ticket, row.error)
                     await session.commit()
 
@@ -749,9 +762,7 @@ class TicketActivity:
                         job = await session.get(JiraWorkerJob, job_id)
                         assert ticket is not None and job is not None
                         job.status = "error"
-                        job.error = (
-                            "Orchestrator turn failed; outcome and token usage unknown"
-                        )
+                        job.error = TURN_FAILED
                         park_ticket(ticket, job.error)
                         await session.commit()
                     raise
@@ -777,7 +788,7 @@ class TicketActivity:
             ):
                 return None
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
-                park_ticket(ticket, "Ticket token limit")
+                park_ticket(ticket, TOKEN_LIMIT)
                 await session.commit()
                 return None
             live = await session.scalar(
@@ -855,7 +866,7 @@ class TicketActivity:
             job.status = "done"
             ticket.tokens_used += result.tokens_used
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
-                park_ticket(ticket, "Ticket token limit")
+                park_ticket(ticket, TOKEN_LIMIT)
             elif (
                 ticket.agent_generation == generation
                 and not ticket.worker_parked_reason
