@@ -50,6 +50,9 @@ ADMIN_ROOM_NAME = "Jira admin"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
 ADMIN_ALERT_COMMAND = "admin_reason_alert"
 INTAKE_REASON = "intake_questions"
+INTAKE_LIMIT_DETAIL = (
+    "Intake needs more than 5 questions; an admin must resolve the missing requirements"
+)
 WAIT_REMINDER_HOURS = 2
 WAIT_ADMIN_HOURS = 4
 _WAIT_INPUT_KIND = {"switch": "thread_message", "jira_comments": "jira_comment"}
@@ -802,6 +805,11 @@ async def _apply_state(
         ticket.admin_reasons = None
         await _apply_wait(session, ticket, config, now, {}, reminders)
         return
+    if ticket.intake_state is not None:
+        if ticket.intake_state.get("phase") == "limit":
+            reasons[INTAKE_REASON] = INTAKE_LIMIT_DETAIL
+        else:
+            reasons.pop(INTAKE_REASON, None)
     if ticket.reporter_switch_user_id is None:
         reasons["unmapped_reporter"] = "Reporter has no Switch user"
     failed = await session.scalar(

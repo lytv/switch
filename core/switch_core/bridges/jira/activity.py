@@ -411,7 +411,11 @@ class TicketActivity:
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
                 park_ticket(ticket, TOKEN_LIMIT)
-            version, observation = await self._read_jira(ticket, force=force_jira)
+            version, observation = await self._read_jira(
+                ticket,
+                force=force_jira
+                or (ticket.intake_state or {}).get("phase") == "approval",
+            )
             fell_back = False
             if (
                 (
@@ -581,6 +585,16 @@ class TicketActivity:
             worker_account=account,
             reporter_account=ticket.reporter_account_id,
         )
+        observation = self._resume_rejection(ticket, version, observation)
+        if observation.park != "regressed":
+            for entry in version["histories"]:
+                for item in entry.get("items", []):
+                    if item.get("field") == "status" and isinstance(
+                        item.get("toString"), str
+                    ):
+                        ticket.status = item["toString"]
+            if is_terminal_ticket_status(ticket.status):
+                park_ticket(ticket, "Jira ticket completed or cancelled")
         ticket.jira_seen_comment_ids = list(observation.seen_ids)
         ticket.jira_read_changelog_id = observation.changelog_id
         ticket.jira_read_updated = version["updated"]
@@ -594,6 +608,78 @@ class TicketActivity:
                 else HUMAN_JIRA_ACTION,
             )
         return version, observation
+
+    def _resume_rejection(
+        self,
+        ticket: JiraWorkerTicket,
+        version: dict[str, Any],
+        observation: Observation,
+    ) -> Observation:
+        state = dict(ticket.intake_state or {})
+        if state.get("phase") != "approval" or ticket.worker_parked_reason:
+            return observation
+        base_id = ticket.jira_read_changelog_id
+        if base_id is None:
+            return observation
+        histories = version["histories"]
+        index = next(
+            (i for i, entry in enumerate(histories) if str(entry["id"]) == base_id), -1
+        )
+        if base_id and index < 0:
+            return observation
+        humans = [
+            entry
+            for entry in histories[index + 1 :]
+            if entry.get("author", {}).get("accountId") != ticket.jira_worker_account_id
+        ]
+        if len(humans) != 1:
+            return observation
+        items = humans[0].get("items", [])
+        if (
+            len(items) != 1
+            or not humans[0].get("author", {}).get("accountId")
+            or items[0].get("field") != "status"
+            or items[0].get("fromString")
+            != self._config.jira_worker_statuses.waiting_for_approval
+            or items[0].get("toString")
+            != self._config.jira_worker_statuses.waiting_for_input
+        ):
+            return observation
+        allowed = {
+            **version,
+            "histories": [
+                {**entry, "author": {"accountId": ticket.jira_worker_account_id}}
+                if entry is humans[0]
+                else entry
+                for entry in histories
+            ],
+        }
+        checked = observe_jira(
+            allowed,
+            seen_ids=set(ticket.jira_seen_comment_ids or []),
+            changelog_id=base_id,
+            base_stamp=_stamp(
+                ticket.jira_read_updated or ticket.last_event_at.isoformat()
+            ),
+            worker_account=ticket.jira_worker_account_id or "",
+            reporter_account=ticket.reporter_account_id,
+        )
+        if checked.park:
+            return observation
+        ticket.intake_state = {
+            **state,
+            "phase": "intake",
+            "cycle": state.get("cycle", 0) + 1,
+            "history": [
+                *state.get("history", []),
+                {"jira_rejection": "The approver rejected the intake summary."},
+            ],
+        }
+        ticket.agent_generation += 1
+        ticket.wait_anchor = None
+        ticket.wait_fired = None
+        request_wake(ticket)
+        return checked
 
     async def _read_thread(
         self, session: AsyncSession, ticket: JiraWorkerTicket
@@ -714,6 +800,19 @@ class TicketActivity:
                             JiraWorkerTicket.agent_state.in_(
                                 ("wake_requested", "parked")
                             ),
+                            ~select(JiraWorkerOutbox.id)
+                            .where(
+                                JiraWorkerOutbox.instance == JiraWorkerTicket.instance,
+                                JiraWorkerOutbox.issue_key
+                                == JiraWorkerTicket.issue_key,
+                                JiraWorkerOutbox.payload["intake_generation"].is_not(
+                                    None
+                                ),
+                                JiraWorkerOutbox.status.in_(
+                                    ("pending", "claimed", "sending")
+                                ),
+                            )
+                            .exists(),
                             func.lower(func.trim(JiraWorkerTicket.status)).not_in(
                                 ("done", "cancelled", "canceled")
                             ),
@@ -842,6 +941,7 @@ class TicketActivity:
                 ticket.status,
                 {
                     "ticket_text": ticket.summary,
+                    "description": ticket.description,
                     "events": [event.payload for event in events],
                 },
                 self._config.jira_worker_limits.tokens_per_ticket - ticket.tokens_used,

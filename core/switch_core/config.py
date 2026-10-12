@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # A Postgres time value: a bare count of milliseconds, or a count with a unit.
@@ -196,6 +196,9 @@ class SwitchConfig(BaseSettings):
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
     jira_worker_notice_window_seconds: int = Field(default=86_400, ge=1)
     jira_worker_calendar: JiraWorkerCalendar = JiraWorkerCalendar()
+    jira_worker_llm_base_url: str | None = None
+    jira_worker_llm_api_key: SecretStr | None = None
+    jira_worker_llm_model: str | None = None
 
     # Upper bound on a single attachment an agent may post to a room (and that
     # a collaboration bridge will relay out). Uploads over this raise instead

@@ -83,8 +83,8 @@ message edits to bridge channels.
 Reasons come from an unmapped reporter, a Jira write that failed 3 times or
 parked the worker, any park except a completed or cancelled ticket,
 and the wait rules. `set_admin_card_reason` is the raise/clear call for an
-intake question count. Step 8 calls it. Intake decisions themselves remain
-step 8 work.
+intake question count. The intake orchestrator raises this reason when it needs
+a sixth question, without sending that question. Completion clears the reason.
 
 Wait timers count work hours on `JIRA_WORKER_CALENDAR` (default Monday-Friday
 09:00-17:00 UTC). The reminder is 2 work hours and goes to the reporter on the
@@ -100,8 +100,9 @@ No UI is part of this boundary.
 
 ## One-turn integration
 
-Step 8 can call `scheduler.activity.run_one_turn(callback)`. This method claims
-one ticket and holds a database session claim until the callback returns.
+The worker loop calls `scheduler.activity.run_one_turn(callback)` when intake
+model configuration is complete. This method claims one ticket and holds a
+database session claim until the callback returns.
 
 The callback receives a `TicketTurn`. Ticket text and event payloads appear under
 `untrusted_data`; they are data, not instructions. The callback receives no Jira
@@ -113,5 +114,54 @@ Completion records usage and consumes the turn's input events. Input that arrive
 during the turn requests another wake. A concurrent human park invalidates the
 turn's completion; it cannot clear that park or consume the pending input.
 
-This boundary does not implement intake prompts or Jira approval decisions.
-Admin cards are a separate step.
+## Intake orchestrator
+
+Configure these environment variables to enable model calls for enabled projects:
+
+| Variable | Value |
+| --- | --- |
+| `JIRA_WORKER_LLM_BASE_URL` | OpenAI-compatible API root, including `/v1` when the provider requires it |
+| `JIRA_WORKER_LLM_API_KEY` | Deployment secret for that API |
+| `JIRA_WORKER_LLM_MODEL` | Model identifier selected by the operator |
+
+No provider or model is selected by default. If any variable is missing or empty,
+intake turns stay disabled and the worker logs the missing variable names. The
+server still starts. Polling, room reconciliation, notices, and existing outbox
+work remain available. The per-project switch still defaults to off.
+
+The API must support non-streaming Chat Completions, JSON-object responses,
+`max_tokens`, and explicit `prompt_tokens`, `completion_tokens`, and
+`total_tokens` usage. It must use a byte-level tokenizer and honor the output
+limit. The worker reserves a conservative UTF-8 byte bound for prompt tokens,
+plus 256 tokens for framing, before allocating the remaining output budget.
+It makes no request when the prompt cannot fit. It records actual response usage,
+not the reservation. Missing usage, an invalid response, or a violated budget
+parks the ticket with a visible failure. Model errors never select a fallback
+provider. This interface does not support APIs that require `max_completion_tokens`
+instead of `max_tokens`.
+
+A turn makes at most one model call. It asks one question on the ticket wait
+channel through the outbox. Switch questions reply to the ticket card thread.
+An unmapped reporter receives Jira comments. A question starts a Waiting for
+input milestone when needed. The transcript, question count, and approval cycle
+remain in the ticket row across restarts. A pending intake delivery prevents a
+new turn from consuming replies before delivery completes. An unknown question
+send outcome parks the worker and does not replay automatically.
+
+After five questions, a request for another question raises `intake_questions`
+on the admin card and sends no further question. Reporter or admin-accepted
+input can resolve the missing requirements. A completed intake clears that
+reason. The question count remains cumulative for the ticket, including Reject.
+
+Completion queues one Jira summary comment per approval cycle, then a dependent
+Waiting for approval transition. Both use the existing compare-read-write
+outbox. Room text never approves a ticket. A Jira move to Done archives the room
+through the existing reconciliation path. Jira enforces the approvers-group
+restriction on Approve and Reject; the worker does not grant approval rights.
+
+A clean Jira status change from Waiting for approval to Waiting for input
+resumes intake with a question about the required corrections, before another
+summary can be queued. That question also counts toward the five-question limit.
+Any accompanying human field change, unrelated comment, or
+existing human park still stops the worker. The worker never clears that park.
+Role agents, code work, routing, attachments, and linked tickets remain out of scope.
