@@ -71,7 +71,12 @@ class _FakeAdapter:
         self._new_channel_id = new_channel_id
 
     async def create_channel(
-        self, name: str, topic: str, *, channel_type: str = "channel_public"
+        self,
+        name: str,
+        topic: str,
+        *,
+        channel_type: str = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         self._events.append(("create_channel", name, topic, channel_type))
         return self._new_channel_id

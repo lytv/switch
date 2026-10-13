@@ -660,6 +660,7 @@ class CollaborationAdapter(ABC):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         """Provision a channel on the platform and return its external id.
 

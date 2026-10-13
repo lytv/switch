@@ -1353,6 +1353,7 @@ class SlackAdapter(CollaborationAdapter):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         if not self._web_client:
             raise RuntimeError("Slack client not connected")

@@ -39,10 +39,12 @@ from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import (
+    CollaborationBridge,
     JiraWorkerIdentity,
     JiraWorkerJob,
     JiraWorkerOutbox,
     JiraWorkerTicket,
+    Room,
 )
 
 logger = logging.getLogger(__name__)
@@ -1060,10 +1062,21 @@ class JiraWorkerScheduler:
             )
             stmt = (
                 select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
+                .outerjoin(Room, Room.id == JiraWorkerTicket.room_id)
                 .where(
                     or_(
                         JiraWorkerTicket.room_id.is_(None),
                         JiraWorkerTicket.card_event_id.is_(None),
+                        and_(
+                            Room.id.is_not(None),
+                            Room.external_channel_id.is_(None),
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
+                            select(CollaborationBridge.id)
+                            .where(CollaborationBridge.is_default.is_(True))
+                            .exists(),
+                        ),
                         and_(
                             JiraWorkerTicket.room_claimed.is_(False),
                             func.lower(func.trim(JiraWorkerTicket.status)).not_in(

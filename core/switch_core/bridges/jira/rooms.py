@@ -49,6 +49,7 @@ from switch_core.db.models import (
     User,
 )
 from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.room_service import RoomCreateConfig, RoomService
 
 TICKET_ROOM_INSTANCE_KEY = "jira_instance"
@@ -73,10 +74,14 @@ class TicketRooms(Protocol):
         instance: str,
         issue_key: str,
     ) -> str:
-        """Create a private internal room marked for this ticket. Returns the room id."""
+        """Create a private room on the default bridge, marked for this ticket."""
         ...
 
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None: ...
+
+    async def ensure_reporter_access(
+        self, room_id: str, user_id: str | None
+    ) -> None: ...
 
     async def post_card(self, room_id: str, *, body: str) -> str:
         """Post the ticket card. Returns the transport event id."""
@@ -441,6 +446,8 @@ async def _reconcile_ticket_room(
                 continue
             body = await _render_card(session, rooms, ticket, owner_id)
         await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        if not is_terminal_ticket_status(ticket.status):
+            await rooms.ensure_reporter_access(room_id, owner_id)
         if is_terminal_ticket_status(ticket.status):
             ticket.room_claimed = False
             ticket.queue_reason = None
@@ -508,8 +515,8 @@ class SwitchTicketRooms:
 
     Room create/archive go through ``RoomService`` and card posts through
     ``ProtocolService.send_message`` as the Jira system agent (never the
-    public HTTP API). Rooms are private internal rooms owned by the mapped
-    reporter, or ownerless (admins only) for unmapped reporters."""
+    public HTTP API). Rooms use private channels on the default bridge and
+    belong to the mapped reporter, or only admins when the reporter is unmapped."""
 
     def __init__(
         self,
@@ -551,7 +558,8 @@ class SwitchTicketRooms:
                 name=name,
                 description=description,
                 agent_names=[self._config.jira_agent_name],
-                internal_only=True,
+                channel_type="channel_private",
+                invite_default_member=False,
                 created_by=owner_id,
                 owner_id=owner_id,
                 read_visibility="private",
@@ -559,6 +567,11 @@ class SwitchTicketRooms:
                 metadata=ticket_room_marker(instance, issue_key),
             )
         )
+        if not result.room.bridge_id:
+            logger.warning(
+                "Jira ticket room %s is internal-only: no default bridge configured",
+                result.room.id,
+            )
         logger.info("Jira ticket room created for %s: %s", name, result.room.id)
         return result.room.id
 
@@ -592,6 +605,29 @@ class SwitchTicketRooms:
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         await self._rooms.add_agents_to_room(room_id, agent_names=[agent_name])
         await self._rooms.invite_missing_member_clients(room_id)
+
+    async def ensure_reporter_access(self, room_id: str, user_id: str | None) -> None:
+        async with self._sessions() as session:
+            room = await session.get(Room, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            if room.archived_at is not None:
+                return
+            bridge_id = room.bridge_id
+            if bridge_id is None:
+                default = await CollaborationBridgeStore().get_default(session)
+                bridge_id = default.id if default is not None else None
+        if bridge_id is None:
+            logger.warning(
+                "Jira ticket room %s is internal-only: no default bridge configured",
+                room_id,
+            )
+            return
+        await self._rooms.link_bridge_to_room(
+            room_id, bridge_id, "channel_private", invite_default_member=False
+        )
+        if user_id is not None:
+            await self._rooms.add_claimed_user_to_room(room_id, user_id)
 
     async def read_context(self, room_id: str, *, after_seq: int) -> dict[str, Any]:
         return await self._protocol.read_context(

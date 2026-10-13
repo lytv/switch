@@ -1150,6 +1150,7 @@ class TeamsAdapter(CollaborationAdapter):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         if self._graph is None:
             raise RuntimeError("Teams adapter not started")

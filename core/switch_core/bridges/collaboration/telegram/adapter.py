@@ -1059,6 +1059,7 @@ class TelegramAdapter(CollaborationAdapter):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         raise ChannelCreationUnsupported(
             "Telegram bots cannot create chats — the Bot API has no such call. "

@@ -89,6 +89,9 @@ class FakeRooms:
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         self.rooms[room_id]["agents"].append(agent_name)
 
+    async def ensure_reporter_access(self, room_id: str, user_id: str | None) -> None:
+        return None
+
     async def post_card(self, room_id: str, *, body: str) -> str:
         if self.fail_post_once:
             self.fail_post_once = False
@@ -1129,9 +1132,10 @@ async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
         async def create_room(self, config: Any) -> Any:
             captured["metadata"] = config.metadata
             captured["name"] = config.name
+            captured["config"] = config
 
             class _Result:
-                room = type("Room", (), {"id": "room-9"})()
+                room = type("Room", (), {"id": "room-9", "bridge_id": None})()
 
             return _Result()
 
@@ -1153,6 +1157,10 @@ async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
         == "room-9"
     )
     assert captured["name"] == "KAN-1"
+    assert captured["config"].internal_only is False
+    assert captured["config"].channel_type == "channel_private"
+    assert captured["config"].read_visibility == "private"
+    assert captured["config"].write_visibility == "private"
     assert captured["metadata"] == {
         "jira_instance": INSTANCE,
         "jira_issue_key": "KAN-1",

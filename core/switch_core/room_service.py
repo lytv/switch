@@ -32,6 +32,7 @@ from switch_core.clients.client_lifecycle_service import ClientLifecycleService
 from switch_core.db.models import Room, RoomGroup, RoomRole
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
 from switch_core.db.stores.room_store import RoomStore
 from switch_core.provisioning import Provisioning
 
@@ -78,6 +79,7 @@ class RoomCreateConfig(BaseModel):
     # now means "use the default", so making a room agent-only has to be said
     # rather than implied.
     internal_only: bool = False
+    invite_default_member: bool = True
     external_channel_id: str | None = None
     instructions: str | None = None
     protection_config: dict[str, object] | None = None
@@ -484,6 +486,7 @@ class RoomService:
                     config.name,
                     config.description,
                     channel_type=channel_type,
+                    invite_default_member=config.invite_default_member,
                 )
 
         # Guard the channel from the moment it exists until the room↔channel
@@ -887,44 +890,87 @@ class RoomService:
             )
         return unresolved
 
+    async def add_claimed_user_to_room(self, room_id: str, user_id: str) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            users = await ExternalUserStore().get_by_user(session, user_id)
+        if not room.bridge_id or not room.external_channel_id:
+            raise ValueError(f"Room {room_id} is not bridged")
+        bridge_core = self._collab_lifecycle.get(room.bridge_id)
+        if bridge_core is None:
+            raise ValueError(f"Bridge not running: {room.bridge_id}")
+        accounts = [user for user in users if user.bridge_id == room.bridge_id]
+        if not accounts:
+            logger.warning(
+                "User %s has no claimed account on bridge %s for room %s",
+                user_id,
+                room.bridge_id,
+                room_id,
+            )
+            return
+        failed = await bridge_core.adapter.add_users_to_channel(
+            room.external_channel_id,
+            [user.external_username for user in accounts],
+            [user.external_user_id for user in accounts],
+        )
+        if failed:
+            raise ValueError(
+                f"Could not invite claimed accounts to room {room_id}: {failed}"
+            )
+
     async def link_bridge_to_room(
         self,
         room_id: str,
         bridge_id: str,
         channel_type: ChannelType,
         external_channel_id: str | None = None,
+        *,
+        invite_default_member: bool = True,
     ) -> None:
         async with self._session_factory() as session:
             room = await self._room_store.get(session, room_id)
             if room is None:
                 raise ValueError(f"Room not found: {room_id}")
-
+        if room.bridge_id and room.bridge_id != bridge_id:
+            raise ValueError(
+                f"Room {room_id} is already linked to bridge {room.bridge_id}"
+            )
         bridge_core = self._collab_lifecycle.get(bridge_id)
-
-        if external_channel_id is None and bridge_core is not None:
+        if bridge_core is None:
+            raise ValueError(f"Bridge not running: {bridge_id}")
+        external_channel_id = external_channel_id or room.external_channel_id
+        if external_channel_id is None:
             await self._require_channel_creation(bridge_id)
             external_channel_id = await bridge_core.adapter.create_channel(
-                room.name, room.description
-            )
-
-        async with self._session_factory() as session:
-            await self._room_store.update_bridge(
-                session,
-                room_id,
-                bridge_id=bridge_id,
+                room.name,
+                room.description,
                 channel_type=channel_type,
-                external_channel_id=external_channel_id,
+                invite_default_member=invite_default_member,
             )
-            await session.commit()
-
-        if bridge_core and external_channel_id:
+        bridge_core.begin_provisioning(external_channel_id)
+        try:
+            async with self._session_factory() as session:
+                await self._room_store.update_bridge(
+                    session,
+                    room_id,
+                    bridge_id=bridge_id,
+                    channel_type=channel_type,
+                    external_channel_id=external_channel_id,
+                )
+                await session.commit()
             bridge_core.add_room_mapping(
                 room.id, room.matrix_room_id, external_channel_id
             )
-            await self._ensure_channel_capture(
-                bridge_core, external_channel_id, channel_type
-            )
-
+        finally:
+            bridge_core.end_provisioning(external_channel_id)
+        await self._ensure_channel_capture(
+            bridge_core, external_channel_id, channel_type
+        )
+        await self._matrix_admin.invite_to_room(
+            room.matrix_room_id, bridge_core._bridge_client_matrix_user_id
+        )
         logger.info("Linked bridge %s to room %s", bridge_id, room_id)
 
     async def unlink_bridge_from_room(self, room_id: str) -> None:
