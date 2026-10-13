@@ -1133,6 +1133,9 @@ class JiraWorkerScheduler:
                         and_(
                             Room.external_channel_id.is_not(None),
                             JiraWorkerTicket.id.in_(pending_history),
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
                         ),
                     ),
                     scope,

@@ -80,6 +80,7 @@ class RoomCreateConfig(BaseModel):
     # rather than implied.
     internal_only: bool = False
     invite_default_member: bool = True
+    allow_unbridged_on_channel_failure: bool = False
     external_channel_id: str | None = None
     instructions: str | None = None
     protection_config: dict[str, object] | None = None
@@ -482,12 +483,24 @@ class RoomService:
                     user_external_id=user_external_id,
                 )
             else:
-                external_channel_id = await bridge_core.adapter.create_channel(
-                    config.name,
-                    config.description,
-                    channel_type=channel_type,
-                    invite_default_member=config.invite_default_member,
-                )
+                try:
+                    external_channel_id = await bridge_core.adapter.create_channel(
+                        config.name,
+                        config.description,
+                        channel_type=channel_type,
+                        invite_default_member=config.invite_default_member,
+                    )
+                except Exception:
+                    if not config.allow_unbridged_on_channel_failure:
+                        raise
+                    logger.warning(
+                        "Room %s will remain internal-only: channel creation failed on bridge %s",
+                        config.name,
+                        bridge_id,
+                        exc_info=True,
+                    )
+                    bridge_id = None
+                    bridge_core = None
 
         # Guard the channel from the moment it exists until the room↔channel
         # mapping is registered. Creating the channel makes the bot auto-join

@@ -336,27 +336,38 @@ async def _restore_ticket_history(
         ticket.card_event_id = payload["card_event_id"]
     questions = list(
         await session.scalars(
-            select(JiraWorkerOutbox).where(
+            select(JiraWorkerOutbox)
+            .where(
                 JiraWorkerOutbox.instance == ticket.instance,
                 JiraWorkerOutbox.issue_key == ticket.issue_key,
                 JiraWorkerOutbox.channel == "switch",
                 JiraWorkerOutbox.command == "intake_question",
-                JiraWorkerOutbox.status.in_(("pending", "claimed")),
                 JiraWorkerOutbox.payload["room_id"].astext == ticket.room_id,
             )
+            .order_by(JiraWorkerOutbox.created_at.desc(), JiraWorkerOutbox.id.desc())
         )
     )
-    for question in questions:
-        question.payload = {
-            **(question.payload or {}),
-            "thread_id": ticket.card_event_id,
-        }
-    state = ticket.intake_state or {}
-    history = state.get("history", [])
-    if state.get("phase") == "question" and not questions:
-        question_body = next(
-            (item["question"] for item in reversed(history) if "question" in item), None
+    if ticket.wait_channel == "switch":
+        for question in questions:
+            if question.status in ("pending", "claimed"):
+                question.payload = {
+                    **(question.payload or {}),
+                    "thread_id": ticket.card_event_id,
+                }
+    latest = questions[0] if questions else None
+    if (
+        ticket.wait_channel == "switch"
+        and (ticket.intake_state or {}).get("phase") == "question"
+        and latest is not None
+        and latest.status == "done"
+        and (latest.payload or {}).get("intake_generation", ticket.agent_generation)
+        == ticket.agent_generation
+        and not any(
+            question.status in ("pending", "claimed", "sending")
+            for question in questions
         )
+    ):
+        question_body = (latest.payload or {})["data"]
         if question_body:
             assert ticket.card_event_id is not None
             existing = await _find_history_message(
@@ -717,6 +728,7 @@ class SwitchTicketRooms:
             agent_names=[self._config.jira_agent_name],
             channel_type="channel_private",
             invite_default_member=False,
+            allow_unbridged_on_channel_failure=True,
             created_by=owner_id,
             owner_id=owner_id,
             read_visibility="private",

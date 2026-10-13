@@ -282,6 +282,20 @@ async def test_existing_room_repair_is_restart_and_double_claim_safe(
             "history": [{"question": "Which customer?"}],
         }
         await RoomStore().add_agents(session, room.id, ["jira"])
+        session.add(
+            JiraWorkerOutbox(
+                instance="acme",
+                issue_key="KAN-1",
+                channel="switch",
+                command="intake_question",
+                status="done",
+                payload={
+                    "room_id": room.id,
+                    "thread_id": "$old-card",
+                    "data": "Which customer?",
+                },
+            )
+        )
         await session.commit()
         room_id = room.id
     scheduler = JiraWorkerScheduler(
@@ -626,8 +640,9 @@ async def test_sync_preserves_an_existing_channel_binding(
         assert (await session.get(Room, room_id)).channel_type == "channel_public"
 
 
+@pytest.mark.parametrize("status", ["pending", "claimed"])
 async def test_history_restoration_retargets_queued_questions(
-    session_factory, ticket_bridge
+    session_factory, ticket_bridge, status
 ):
     rooms, _, adapter, _ = ticket_bridge
     async with session_factory() as session:
@@ -648,6 +663,7 @@ async def test_history_restoration_retargets_queued_questions(
             issue_key="KAN-1",
             channel="switch",
             command="intake_question",
+            status=status,
             payload={
                 "room_id": room_id,
                 "thread_id": "$card",
@@ -663,7 +679,7 @@ async def test_history_restoration_retargets_queued_questions(
     rooms._protocol.send_message.assert_awaited_once()
     async with session_factory() as session:
         question = await session.get(JiraWorkerOutbox, question_id)
-        assert question.status == "pending"
+        assert question.status == status
         assert question.payload["thread_id"] == "$new-card"
         assert (
             await session.scalar(select(JiraWorkerTicket))
@@ -689,6 +705,20 @@ async def test_history_restoration_reuses_messages_after_interrupted_send(
             "phase": "question",
             "history": [{"question": "Which customer?"}],
         }
+        session.add(
+            JiraWorkerOutbox(
+                instance="acme",
+                issue_key="KAN-1",
+                channel="switch",
+                command="intake_question",
+                status="done",
+                payload={
+                    "room_id": room_id,
+                    "thread_id": "$card",
+                    "data": "Which customer?",
+                },
+            )
+        )
         await session.commit()
     sent = []
     failed = False

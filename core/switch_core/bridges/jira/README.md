@@ -33,8 +33,8 @@ Repeated sync and worker restarts reuse that channel. The worker reposts the
 ticket card and current open intake question once after attachment. The new
 card becomes the thread root for later questions and card edits.
 Archived rooms receive no bridge or invitation until the existing reopen path
-reopens them. Missing, stopped, or channel-disabled default bridges leave ticket
-rooms internal-only. Access failures log a warning and add a reason to the
+reopens them. Missing, stopped, channel-disabled, or unreachable default bridges
+leave new ticket rooms internal-only. Access failures log a warning and add a reason to the
 admin card without blocking ticket sync. Mapping changes, claim changes, and
 ordinary ticket sync retry access and clear the reason after success.
 A mapped reporter needs a claimed account on the bridge to answer there.
