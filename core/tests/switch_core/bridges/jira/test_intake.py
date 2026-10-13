@@ -254,6 +254,42 @@ async def test_five_questions_then_admin_reason_and_clear_on_completion(
     assert INTAKE_REASON in row.admin_reasons
 
 
+class CommentDriftJira(IntakeJira):
+    def __init__(self, drift_ms: int) -> None:
+        super().__init__()
+        self.drift_ms = drift_ms
+
+    def change(self, author: str, *, comment: bool = False) -> None:
+        super().change(author, comment=comment)
+        if comment:
+            self.updated = (
+                datetime.fromisoformat(self.updated)
+                + timedelta(milliseconds=self.drift_ms)
+            ).isoformat()
+
+
+@pytest.mark.parametrize("drift_ms", [0, 52, 1000])
+async def test_three_room_answers_then_summary_drift_and_approval(
+    session_factory, drift_ms
+) -> None:
+    key = await start_ticket(session_factory)
+    jira, rooms = CommentDriftJira(drift_ms), IntakeRooms()
+    model = ModelMock("question", "question", "question", "complete")
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    for number in range(1, 4):
+        reply = message(number)
+        reply["body"] = f"Reporter answer {number}"
+        rooms.messages.append(reply)
+        await worker.run_once()
+    await scheduler(session_factory, jira, rooms, model).run_once()
+    row = await ticket(session_factory, key)
+    assert len(rooms.questions) == 3 and len(model.calls) == 4
+    assert jira.status == "Waiting for approval" and len(jira.comments) == 1
+    assert row.worker_parked_reason is None and row.tokens_used == 40
+    assert all(command.status == "done" for command in await commands(session_factory))
+
+
 async def test_summary_and_approval_once_with_double_claim_and_restart(
     session_factory,
 ) -> None:
