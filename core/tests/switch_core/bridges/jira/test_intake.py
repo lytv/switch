@@ -355,7 +355,10 @@ async def test_reject_resumes_intake_without_resetting_question_count(
     assert row.intake_state["cycle"] == 1 and row.intake_state["questions"] == 2
     assert len(rooms.questions) == 2
     assert len(model.calls) == 2
-    assert "need correction" in rooms.questions[-1][2]
+    assert (
+        rooms.questions[-1][2]
+        == "Which requirements in the intake summary need correction?"
+    )
     assert any("jira_rejection" in item for item in row.intake_state["history"])
     rooms.messages.append(message(2))
     await worker.run_once()

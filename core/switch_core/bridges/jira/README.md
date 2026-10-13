@@ -138,8 +138,12 @@ Release reads a fresh Jira status, summary, description, comment IDs, changelog 
 and updated stamp. It clears the park reason and updates the existing admin card.
 Other alert reasons remain. A known unsent command resumes only when its source
 status, summary, description, and visible Jira evidence still match.
-Commands without these baselines, stale commands, field updates, and failed
-commands are cancelled. The worker then plans from the accepted Jira state.
+Other stale commands, field updates, and obsolete wait commands are cancelled.
+For the current intake chain, release plans only the remaining steps against the
+fresh baseline. It includes successors cancelled when the ticket parked.
+A completed summary stays completed. Release preserves the intake phase, cycle,
+question count, history, and pending replies. It never creates an approver rejection.
+A question with no remaining delivery resumes the normal intake turn when replies exist.
 Release cancels obsolete wait commands and starts a fresh wait interval when
 Jira still waits for input or approval. The question count and token usage do not reset.
 Release preserves unread reporter input under the ticket's existing channel rules.
