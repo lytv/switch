@@ -164,6 +164,35 @@ async def _enqueue_room_sync(session: AsyncSession, ticket: JiraWorkerTicket) ->
     )
 
 
+async def enqueue_reporter_access_sync(
+    session: AsyncSession,
+    *,
+    switch_user_id: str,
+    enabled_projects: dict[str, list[str]],
+) -> None:
+    scope = [
+        and_(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.project_key.in_(projects),
+        )
+        for instance, projects in enabled_projects.items()
+        if projects
+    ]
+    if not scope:
+        return
+    tickets = await session.scalars(
+        select(JiraWorkerTicket).where(
+            or_(*scope),
+            JiraWorkerTicket.reporter_switch_user_id == switch_user_id,
+            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                _TERMINAL_TICKET_STATUSES
+            ),
+        )
+    )
+    for ticket in tickets:
+        await _enqueue_room_sync(session, ticket)
+
+
 async def _enqueue_room_sync_for_reporter(
     session: AsyncSession,
     *,
@@ -1060,6 +1089,14 @@ class JiraWorkerScheduler:
                 JiraWorkerOutbox.command.in_(follow_up_commands),
                 JiraWorkerOutbox.status == "pending",
             )
+            pending_history = select(
+                JiraWorkerOutbox.payload["ticket_id"].astext
+            ).where(
+                JiraWorkerOutbox.channel == "switch",
+                JiraWorkerOutbox.command == "restore_ticket_history",
+                JiraWorkerOutbox.status == "pending",
+                JiraWorkerOutbox.payload["room_id"].astext == Room.id,
+            )
             stmt = (
                 select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
                 .outerjoin(Room, Room.id == JiraWorkerTicket.room_id)
@@ -1070,6 +1107,9 @@ class JiraWorkerScheduler:
                         and_(
                             Room.id.is_not(None),
                             Room.external_channel_id.is_(None),
+                            JiraWorkerTicket.admin_reasons[
+                                "reporter_access"
+                            ].astext.is_(None),
                             func.lower(func.trim(JiraWorkerTicket.status)).not_in(
                                 _TERMINAL_TICKET_STATUSES
                             ),
@@ -1090,6 +1130,10 @@ class JiraWorkerScheduler:
                             ),
                         ),
                         JiraWorkerTicket.id.in_(pending_follow_ups),
+                        and_(
+                            Room.external_channel_id.is_not(None),
+                            JiraWorkerTicket.id.in_(pending_history),
+                        ),
                     ),
                     scope,
                 )

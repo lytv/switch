@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from alembic.config import Config
@@ -88,6 +90,9 @@ class FakeRooms:
 
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         self.rooms[room_id]["agents"].append(agent_name)
+
+    async def is_bridged(self, room_id: str) -> bool:
+        return True
 
     async def ensure_reporter_access(self, room_id: str, user_id: str | None) -> None:
         return None
@@ -687,9 +692,18 @@ class StubRoomService:
 @pytest.mark.asyncio
 async def test_production_card_updater_rewrites_room_description() -> None:
     service = StubRoomService()
-    updater = SwitchCardUpdater(room_service=service)  # type: ignore[arg-type]
+    protocol = SimpleNamespace(edit_message=AsyncMock())
+    rooms = SimpleNamespace(
+        _rooms=service,
+        _protocol=protocol,
+        _jira_agent_id=AsyncMock(return_value="jira-agent"),
+    )
+    updater = SwitchCardUpdater(ticket_rooms=rooms)  # type: ignore[arg-type]
     await updater.update_card("room-1", event_id="card-room-1", body="Status: Done")
     assert service.descriptions == {"room-1": "Status: Done"}
+    protocol.edit_message.assert_awaited_once_with(
+        "jira-agent", "room-1", "card-room-1", "Status: Done"
+    )
 
 
 @pytest.mark.asyncio
@@ -1129,6 +1143,9 @@ async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
     captured: dict[str, Any] = {}
 
     class _Recording:
+        async def _resolve_bridge_id(self, config: Any) -> None:
+            return None
+
         async def create_room(self, config: Any) -> Any:
             captured["metadata"] = config.metadata
             captured["name"] = config.name

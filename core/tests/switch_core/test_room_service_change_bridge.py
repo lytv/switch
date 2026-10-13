@@ -462,8 +462,8 @@ class TestLinkBridgeToRoom:
         bridge = _FakeBridgeCore(events, matrix_user_id="@bot:switch.local")
         svc, room_store = _build_service(
             room=self._room(),
-            agent_ids=[],
-            agent_names={},
+            agent_ids=["agent-1"],
+            agent_names={"agent-1": "jira"},
             bridges={"bridge-1": bridge},
             events=events,
         )
@@ -480,6 +480,10 @@ class TestLinkBridgeToRoom:
             "chan-existing"
         )
         assert ("ensure_capture", [("chan-existing", "channel_private")]) in events
+        assert ("add_agents", "chan-existing", ["jira"]) in events
+        assert events.index(("invite", "@bot:switch.local")) < events.index(
+            ("add_agents", "chan-existing", ["jira"])
+        )
 
     async def test_capture_follows_the_mapping(self) -> None:
         # Capture must not be established before the room↔channel mapping is

@@ -903,13 +903,9 @@ class RoomService:
             raise ValueError(f"Bridge not running: {room.bridge_id}")
         accounts = [user for user in users if user.bridge_id == room.bridge_id]
         if not accounts:
-            logger.warning(
-                "User %s has no claimed account on bridge %s for room %s",
-                user_id,
-                room.bridge_id,
-                room_id,
+            raise ValueError(
+                f"User {user_id} has no claimed account on bridge {room.bridge_id}"
             )
-            return
         failed = await bridge_core.adapter.add_users_to_channel(
             room.external_channel_id,
             [user.external_username for user in accounts],
@@ -933,6 +929,7 @@ class RoomService:
             room = await self._room_store.get(session, room_id)
             if room is None:
                 raise ValueError(f"Room not found: {room_id}")
+            agent_ids = await self._room_store.get_agent_ids(session, room_id)
         if room.bridge_id and room.bridge_id != bridge_id:
             raise ValueError(
                 f"Room {room_id} is already linked to bridge {room.bridge_id}"
@@ -971,6 +968,11 @@ class RoomService:
         await self._matrix_admin.invite_to_room(
             room.matrix_room_id, bridge_core._bridge_client_matrix_user_id
         )
+        if channel_type not in ("direct", "group"):
+            agent_names = await self._resolve_ids_to_names(agent_ids)
+            await bridge_core.adapter.add_agents_to_channel(
+                external_channel_id, agent_names
+            )
         logger.info("Linked bridge %s to room %s", bridge_id, room_id)
 
     async def unlink_bridge_from_room(self, room_id: str) -> None:

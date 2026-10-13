@@ -10,7 +10,14 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
-from switch_core.bridges.jira.rooms import SwitchTicketRooms, reconcile_ticket_room
+from switch_core.bridges.jira.admin import reconcile_admin_cards
+from switch_core.bridges.jira.rooms import (
+    REPORTER_ACCESS_REASON,
+    RESTORE_HISTORY_COMMAND,
+    SwitchCardUpdater,
+    SwitchTicketRooms,
+    reconcile_ticket_room,
+)
 from switch_core.bridges.jira.worker import JiraWorkerScheduler, set_identity_mapping
 from switch_core.db.models import (
     Agent,
@@ -23,14 +30,23 @@ from switch_core.db.models import (
     JiraWorkerIdentity,
     JiraWorkerOutbox,
     JiraWorkerTicket,
+    Message,
     Room,
     User,
 )
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
 from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.collaborations import (
+    claim_bridge_identity,
+    release_bridge_identity,
+)
+from switch_core.gateway.schemas import ClaimIdentityRequest
 from switch_core.room_service import RoomService
 from tests.switch_core.bridges.jira.test_activity import activity, message
+from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard, _worker_config
 from tests.switch_core.bridges.jira.test_outbox import JiraMock
 from tests.switch_core.bridges.jira.test_rooms import _switch_config
 
@@ -185,7 +201,9 @@ async def ticket_bridge(session_factory):
         resource_service=None,
         session_factory=session_factory,
     )
-    protocol = SimpleNamespace(send_message=AsyncMock(return_value="$card"))
+    protocol = SimpleNamespace(
+        send_message=AsyncMock(return_value="$card"), edit_message=AsyncMock()
+    )
     rooms = SwitchTicketRooms(
         room_service=service,
         protocol=protocol,
@@ -259,6 +277,11 @@ async def test_existing_room_repair_is_restart_and_double_claim_safe(
         ticket.room_id = room.id
         ticket.card_event_id = "$old-card"
         ticket.room_claimed = True
+        ticket.intake_state = {
+            "phase": "question",
+            "history": [{"question": "Which customer?"}],
+        }
+        await RoomStore().add_agents(session, room.id, ["jira"])
         await session.commit()
         room_id = room.id
     scheduler = JiraWorkerScheduler(
@@ -281,6 +304,44 @@ async def test_existing_room_repair_is_restart_and_double_claim_safe(
         for call in matrix.invite_to_room.await_args_list
     )
     assert adapter.add_users_to_channel.await_count >= 1
+    adapter.add_agents_to_channel.assert_awaited_once_with("private-channel", ["jira"])
+    assert rooms._protocol.send_message.await_count == 2
+    rooms._protocol.send_message.assert_any_await(
+        "jira", room_id, "Which customer?", thread_id="$card"
+    )
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert ticket.card_event_id == "$card"
+        restoration = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == RESTORE_HISTORY_COMMAND
+            )
+        )
+        assert restoration.status == "done"
+    rooms._protocol.read_context = AsyncMock(
+        return_value={
+            "next_seq": 1,
+            "truncated": False,
+            "threads": [
+                {"root": {"id": "$card"}, "replies": [message(1, "@first:test")]}
+            ],
+        }
+    )
+    await activity(session_factory, JiraMock(), rooms).read_once()
+    async with session_factory() as session:
+        event = await session.scalar(
+            select(JiraWorkerEvent).where(
+                JiraWorkerEvent.event_kind == "thread_message"
+            )
+        )
+        assert event.payload["reporter_input"] is True
+    rooms._protocol.edit_message.reset_mock()
+    await SwitchCardUpdater(ticket_rooms=rooms).update_card(
+        room_id, event_id="$card", body="Updated ticket"
+    )
+    rooms._protocol.edit_message.assert_awaited_once_with(
+        "jira", room_id, "$card", "Updated ticket"
+    )
 
 
 async def test_no_default_keeps_ticket_internal(session_factory, ticket_bridge, caplog):
@@ -410,6 +471,8 @@ async def test_mapping_follow_up_invites_reporter_to_existing_channel(
         assert pending.status == "pending"
     assert await sync(session_factory, rooms) == room_id
     adapter.create_channel.assert_awaited_once()
+    adapter.ensure_channel_subscriptions.assert_awaited_once()
+    adapter.add_agents_to_channel.assert_awaited_once()
     adapter.add_users_to_channel.assert_awaited_once()
     async with session_factory() as session:
         invite = await session.get(JiraWorkerOutbox, pending.id)
@@ -418,14 +481,328 @@ async def test_mapping_follow_up_invites_reporter_to_existing_channel(
         assert room.owner_id == "reporter"
 
 
-async def test_invitation_failure_retries_without_another_channel(
+async def test_invitation_failure_completes_sync_and_clears_admin_reason_on_retry(
+    session_factory, ticket_bridge, caplog
+):
+    rooms, _, adapter, _ = ticket_bridge
+    added = set()
+
+    async def invite(channel, names, ids):
+        added.update(set(ids) - {"ext-first"})
+        return ["ext-first"]
+
+    adapter.add_users_to_channel.side_effect = invite
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        session.add(
+            JiraWorkerOutbox(
+                instance="acme",
+                issue_key="KAN-1",
+                channel="switch",
+                command="invite_ticket_reporter",
+                payload={"ticket_id": ticket.id},
+            )
+        )
+        await session.commit()
+    room_id = await sync(session_factory, rooms)
+    assert room_id is not None
+    assert added == {"ext-second"}
+    assert "reporter access failed" in caplog.text
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert "ext-first" in ticket.admin_reasons[REPORTER_ACCESS_REASON]
+        pending = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == "invite_ticket_reporter"
+            )
+        )
+        assert pending.status == "done"
+    board = FakeAdminBoard()
+    config = _worker_config()
+    await reconcile_admin_cards(
+        session_factory, engine=session_factory.kw["bind"], board=board, config=config
+    )
+    assert "ext-first" in next(iter(board.cards.values()))
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory, config=config, ticket_rooms=rooms
+    )
+    assert await scheduler.sweep_ticket_rooms() == 0
+    adapter.add_users_to_channel.side_effect = None
+    adapter.add_users_to_channel.return_value = []
+    assert await sync(session_factory, rooms) == room_id
+    await reconcile_admin_cards(
+        session_factory, engine=session_factory.kw["bind"], board=board, config=config
+    )
+    assert "ext-first" not in next(iter(board.cards.values()))
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert REPORTER_ACCESS_REASON not in (ticket.admin_reasons or {})
+    adapter.create_channel.assert_awaited_once()
+    adapter.ensure_channel_subscriptions.assert_awaited_once()
+    assert adapter.add_users_to_channel.await_count == 2
+
+
+@pytest.mark.parametrize("failure", ["stopped", "disabled"])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_unavailable_default_does_not_block_sync_or_starve_sweep(
+    session_factory, ticket_bridge, failure, existing, caplog
+):
+    rooms, service, adapter, matrix = ticket_bridge
+    if existing:
+        async with session_factory() as session:
+            bridge = await session.get(CollaborationBridge, "mm")
+            bridge.is_default = False
+            await session.commit()
+        await sync(session_factory, rooms)
+        async with session_factory() as session:
+            bridge = await session.get(CollaborationBridge, "mm")
+            bridge.is_default = True
+            await session.commit()
+    bridge_core = service._collab_lifecycle.get("mm")
+    if failure == "stopped":
+        service._collab_lifecycle.get = lambda _: None
+    else:
+        async with session_factory() as session:
+            bridge = await session.get(CollaborationBridge, "mm")
+            bridge.channel_creation_enabled = False
+            await session.commit()
+    room_id = await sync(session_factory, rooms)
+    assert room_id is not None
+    async with session_factory() as session:
+        room = await session.get(Room, room_id)
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert room.external_channel_id is None
+        assert REPORTER_ACCESS_REASON in ticket.admin_reasons
+        session.add(
+            JiraWorkerTicket(
+                instance="acme", issue_key="KAN-2", project_key="KAN", status="To Do"
+            )
+        )
+        await session.commit()
+    matrix.create_room.return_value = "!second:test"
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_switch_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        ticket_rooms=rooms,
+    )
+    assert await scheduler.sweep_ticket_rooms(limit=1) == 1
+    assert await scheduler.sweep_ticket_rooms(limit=1) == 0
+    adapter.create_channel.assert_not_awaited()
+    assert "reporter access failed" in caplog.text
+    service._collab_lifecycle.get = lambda _: bridge_core
+    async with session_factory() as session:
+        bridge = await session.get(CollaborationBridge, "mm")
+        bridge.channel_creation_enabled = True
+        await session.commit()
+    assert await sync(session_factory, rooms) == room_id
+    adapter.create_channel.assert_awaited_once()
+    adapter.add_users_to_channel.assert_awaited_once()
+    async with session_factory() as session:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(JiraWorkerTicket.issue_key == "KAN-1")
+        )
+        assert REPORTER_ACCESS_REASON not in (ticket.admin_reasons or {})
+        assert ticket.card_event_id == "$card"
+
+
+async def test_sync_preserves_an_existing_channel_binding(
+    session_factory, ticket_bridge
+):
+    rooms, service, adapter, matrix = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    async with session_factory() as session:
+        room = await session.get(Room, room_id)
+        room.channel_type = "channel_public"
+        await session.commit()
+    service.link_bridge_to_room = AsyncMock(
+        side_effect=AssertionError("Must not relink")
+    )
+    matrix.invite_to_room.reset_mock()
+    assert await sync(session_factory, rooms) == room_id
+    service.link_bridge_to_room.assert_not_awaited()
+    matrix.invite_to_room.assert_not_awaited()
+    adapter.ensure_channel_subscriptions.assert_awaited_once()
+    async with session_factory() as session:
+        assert (await session.get(Room, room_id)).channel_type == "channel_public"
+
+
+async def test_history_restoration_retargets_queued_questions(
     session_factory, ticket_bridge
 ):
     rooms, _, adapter, _ = ticket_bridge
-    adapter.add_users_to_channel.return_value = ["ext-first"]
-    with pytest.raises(ValueError, match="Could not invite claimed accounts"):
-        await sync(session_factory, rooms)
-    adapter.add_users_to_channel.return_value = []
-    assert await sync(session_factory, rooms) is not None
+    async with session_factory() as session:
+        bridge = await session.get(CollaborationBridge, "mm")
+        bridge.is_default = False
+        await session.commit()
+    room_id = await sync(session_factory, rooms)
+    async with session_factory() as session:
+        bridge = await session.get(CollaborationBridge, "mm")
+        bridge.is_default = True
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.intake_state = {
+            "phase": "question",
+            "history": [{"question": "Which customer?"}],
+        }
+        question = JiraWorkerOutbox(
+            instance="acme",
+            issue_key="KAN-1",
+            channel="switch",
+            command="intake_question",
+            payload={
+                "room_id": room_id,
+                "thread_id": "$card",
+                "data": "Which customer?",
+            },
+        )
+        session.add(question)
+        await session.commit()
+        question_id = question.id
+    rooms._protocol.send_message.reset_mock()
+    rooms._protocol.send_message.return_value = "$new-card"
+    assert await sync(session_factory, rooms) == room_id
+    rooms._protocol.send_message.assert_awaited_once()
+    async with session_factory() as session:
+        question = await session.get(JiraWorkerOutbox, question_id)
+        assert question.status == "pending"
+        assert question.payload["thread_id"] == "$new-card"
+        assert (
+            await session.scalar(select(JiraWorkerTicket))
+        ).card_event_id == "$new-card"
     adapter.create_channel.assert_awaited_once()
-    assert adapter.add_users_to_channel.await_count == 2
+
+
+@pytest.mark.parametrize("interrupted", ["card", "question"])
+async def test_history_restoration_reuses_messages_after_interrupted_send(
+    session_factory, ticket_bridge, interrupted
+):
+    rooms, service, _, _ = ticket_bridge
+    async with session_factory() as session:
+        bridge = await session.get(CollaborationBridge, "mm")
+        bridge.is_default = False
+        await session.commit()
+    room_id = await sync(session_factory, rooms)
+    async with session_factory() as session:
+        bridge = await session.get(CollaborationBridge, "mm")
+        bridge.is_default = True
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.intake_state = {
+            "phase": "question",
+            "history": [{"question": "Which customer?"}],
+        }
+        await session.commit()
+    sent = []
+    failed = False
+
+    async def publish(agent_id, room_id, body, thread_id=None):
+        nonlocal failed
+        kind = "question" if thread_id else "card"
+        event_id = f"$restored-{kind}"
+        sent.append(kind)
+        async with session_factory() as session:
+            session.add(
+                Message(
+                    room_id=room_id,
+                    seq=len(sent),
+                    transport_event_id=event_id,
+                    sender_id="@jira:test",
+                    sender_client_id="jira",
+                    event_type="m.room.message",
+                    body=body,
+                    thread_root_event_id=thread_id,
+                    content={"body": body},
+                )
+            )
+            await session.commit()
+        if not failed and kind == interrupted:
+            failed = True
+            raise RuntimeError("Interrupted after send")
+        return event_id
+
+    rooms._protocol.send_message.side_effect = publish
+    with pytest.raises(RuntimeError, match="Interrupted after send"):
+        await sync(session_factory, rooms)
+    restarted = SwitchTicketRooms(
+        room_service=service,
+        protocol=rooms._protocol,
+        session_factory=session_factory,
+        agent_store=AgentStore(),
+        config=_switch_config(),
+    )
+    restarted.issue_url = rooms.issue_url
+    assert await sync(session_factory, restarted) == room_id
+    assert await sync(session_factory, restarted) == room_id
+    assert sent == ["card", "question"]
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert ticket.card_event_id == "$restored-card"
+        history = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == RESTORE_HISTORY_COMMAND
+            )
+        )
+        assert history.status == "done"
+
+
+async def test_claim_and_release_retry_access_without_revoking_channel_members(
+    session_factory, ticket_bridge
+):
+    rooms, service, adapter, _ = ticket_bridge
+    async with session_factory() as session:
+        claim = await session.get(ExternalUserClaim, ("second", "reporter"))
+        await session.delete(claim)
+        await session.commit()
+    adapter.add_users_to_channel.return_value = ["ext-first"]
+    room_id = await sync(session_factory, rooms)
+    config = _switch_config(jira_worker_enabled_projects={"acme": ["KAN"]})
+    async with session_factory() as session:
+        user = await session.get(User, "reporter")
+        await claim_bridge_identity(
+            bridge_id="mm",
+            payload=ClaimIdentityRequest(
+                external_user_id="ext-second", username="second"
+            ),
+            session=session,
+            bridge_store=CollaborationBridgeStore(),
+            external_user_store=ExternalUserStore(),
+            user_store=UserStore(),
+            collab_lifecycle=service._collab_lifecycle,
+            user=user,
+            config=config,
+        )
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        pending = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == "sync_ticket_room",
+                JiraWorkerOutbox.status == "pending",
+            )
+        )
+        assert pending.payload["ticket_id"] == ticket.id
+    adapter.add_users_to_channel.return_value = []
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory, config=config, ticket_rooms=rooms
+    )
+    assert await scheduler.sweep_ticket_rooms() == 1
+    assert set(adapter.add_users_to_channel.await_args.args[2]) == {
+        "ext-first",
+        "ext-second",
+    }
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert REPORTER_ACCESS_REASON not in (ticket.admin_reasons or {})
+        user = await session.get(User, "reporter")
+        await release_bridge_identity(
+            bridge_id="mm",
+            external_user_row_id="first",
+            session=session,
+            external_user_store=ExternalUserStore(),
+            user_store=UserStore(),
+            user=user,
+            config=config,
+        )
+    assert await scheduler.sweep_ticket_rooms() == 1
+    assert adapter.add_users_to_channel.await_args.args[2] == ["ext-second"]
+    adapter.create_channel.assert_awaited_once()
+    async with session_factory() as session:
+        assert (
+            await session.get(Room, room_id)
+        ).external_channel_id == "private-channel"

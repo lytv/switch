@@ -16,6 +16,8 @@ from switch_core.bridges.collaboration.models import (
     BridgeInstallLink,
     DirectoryUser,
 )
+from switch_core.bridges.jira.worker import enqueue_reporter_access_sync
+from switch_core.config import SwitchConfig
 from switch_core.db.models import CollaborationBridge, ExternalUser, User
 from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.db.stores.external_user_store import ExternalUserStore
@@ -25,6 +27,7 @@ from switch_core.gateway.auth import get_current_user, require_admin
 from switch_core.gateway.dependencies import (
     get_bridge_store,
     get_collab_lifecycle,
+    get_config,
     get_external_user_store,
     get_room_service,
     get_room_store,
@@ -529,6 +532,7 @@ async def claim_bridge_identity(
         CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
     ],
     user: Annotated[User, Depends(get_current_user)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
 ) -> ExternalUserSummary:
     """Claim a platform identity for a Switch user (CHOO-2137).
 
@@ -599,6 +603,11 @@ async def claim_bridge_identity(
             )
 
     await external_user_store.claim(session, external_user, target_user_id)
+    await enqueue_reporter_access_sync(
+        session,
+        switch_user_id=target_user_id,
+        enabled_projects=config.jira_worker_enabled_projects,
+    )
     await session.commit()
 
     return await _identity_summary(
@@ -635,6 +644,7 @@ async def release_bridge_identity(
     external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
     user_store: Annotated[UserStore, Depends(get_user_store)],
     user: Annotated[User, Depends(get_current_user)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
     user_id: str | None = None,
 ) -> ExternalUserSummary:
     """Drop a claim on a platform account — your own, or someone else's if you
@@ -658,6 +668,11 @@ async def release_bridge_identity(
             status_code=404,
             detail="That user has no claim on this messaging account",
         )
+    await enqueue_reporter_access_sync(
+        session,
+        switch_user_id=target_user_id,
+        enabled_projects=config.jira_worker_enabled_projects,
+    )
     await session.commit()
     return await _identity_summary(
         session, external_user_store, user_store, external_user

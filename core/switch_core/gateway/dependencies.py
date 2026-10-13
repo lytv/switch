@@ -171,7 +171,7 @@ def get_ticket_rooms() -> SwitchTicketRooms:
 
 
 def get_card_updater() -> SwitchCardUpdater:
-    return SwitchCardUpdater(room_service=_state["room_service"])
+    return SwitchCardUpdater(ticket_rooms=get_ticket_rooms())
 
 
 def get_resource_service() -> ResourceService:
