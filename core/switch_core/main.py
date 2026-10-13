@@ -430,18 +430,19 @@ async def run(config: SwitchConfig) -> None:
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     worker_scheduler: JiraWorkerScheduler | None = None
     if config.jira_worker_enabled_projects and config.jira_worker_credentials:
+        ticket_rooms = SwitchTicketRooms(
+            room_service=room_service,
+            protocol=protocol,
+            session_factory=session_factory,
+            agent_store=agent_store,
+            config=config,
+        )
         worker_scheduler = JiraWorkerScheduler(
             session_factory=session_factory,
             config=config,
             poll_clients=build_poll_clients(config),
-            ticket_rooms=SwitchTicketRooms(
-                room_service=room_service,
-                protocol=protocol,
-                session_factory=session_factory,
-                agent_store=agent_store,
-                config=config,
-            ),
-            card_updater=SwitchCardUpdater(room_service=room_service),
+            ticket_rooms=ticket_rooms,
+            card_updater=SwitchCardUpdater(ticket_rooms=ticket_rooms),
             admin_board=SwitchAdminBoard(
                 room_service=room_service,
                 protocol=protocol,

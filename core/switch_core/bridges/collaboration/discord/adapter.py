@@ -832,6 +832,7 @@ class DiscordAdapter(CollaborationAdapter):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         if channel_type in ("group", "direct"):
             raise ValueError(

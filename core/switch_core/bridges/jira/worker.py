@@ -39,10 +39,12 @@ from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import (
+    CollaborationBridge,
     JiraWorkerIdentity,
     JiraWorkerJob,
     JiraWorkerOutbox,
     JiraWorkerTicket,
+    Room,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,6 +162,35 @@ async def _enqueue_room_sync(session: AsyncSession, ticket: JiraWorkerTicket) ->
         ticket=ticket,
         switch_user_id=ticket.reporter_switch_user_id,
     )
+
+
+async def enqueue_reporter_access_sync(
+    session: AsyncSession,
+    *,
+    switch_user_id: str,
+    enabled_projects: dict[str, list[str]],
+) -> None:
+    scope = [
+        and_(
+            JiraWorkerTicket.instance == instance,
+            JiraWorkerTicket.project_key.in_(projects),
+        )
+        for instance, projects in enabled_projects.items()
+        if projects
+    ]
+    if not scope:
+        return
+    tickets = await session.scalars(
+        select(JiraWorkerTicket).where(
+            or_(*scope),
+            JiraWorkerTicket.reporter_switch_user_id == switch_user_id,
+            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                _TERMINAL_TICKET_STATUSES
+            ),
+        )
+    )
+    for ticket in tickets:
+        await _enqueue_room_sync(session, ticket)
 
 
 async def _enqueue_room_sync_for_reporter(
@@ -1058,12 +1089,34 @@ class JiraWorkerScheduler:
                 JiraWorkerOutbox.command.in_(follow_up_commands),
                 JiraWorkerOutbox.status == "pending",
             )
+            pending_history = select(
+                JiraWorkerOutbox.payload["ticket_id"].astext
+            ).where(
+                JiraWorkerOutbox.channel == "switch",
+                JiraWorkerOutbox.command == "restore_ticket_history",
+                JiraWorkerOutbox.status == "pending",
+                JiraWorkerOutbox.payload["room_id"].astext == Room.id,
+            )
             stmt = (
                 select(JiraWorkerTicket.instance, JiraWorkerTicket.issue_key)
+                .outerjoin(Room, Room.id == JiraWorkerTicket.room_id)
                 .where(
                     or_(
                         JiraWorkerTicket.room_id.is_(None),
                         JiraWorkerTicket.card_event_id.is_(None),
+                        and_(
+                            Room.id.is_not(None),
+                            Room.external_channel_id.is_(None),
+                            JiraWorkerTicket.admin_reasons[
+                                "reporter_access"
+                            ].astext.is_(None),
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
+                            select(CollaborationBridge.id)
+                            .where(CollaborationBridge.is_default.is_(True))
+                            .exists(),
+                        ),
                         and_(
                             JiraWorkerTicket.room_claimed.is_(False),
                             func.lower(func.trim(JiraWorkerTicket.status)).not_in(
@@ -1077,6 +1130,13 @@ class JiraWorkerScheduler:
                             ),
                         ),
                         JiraWorkerTicket.id.in_(pending_follow_ups),
+                        and_(
+                            Room.external_channel_id.is_not(None),
+                            JiraWorkerTicket.id.in_(pending_history),
+                            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
+                                _TERMINAL_TICKET_STATUSES
+                            ),
+                        ),
                     ),
                     scope,
                 )

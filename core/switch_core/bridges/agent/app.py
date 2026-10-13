@@ -146,6 +146,13 @@ def create_agent_bridge_app(
     app.include_router(operations_router)
     app.include_router(deeplink_router, tags=["deeplink"])
     app.include_router(version_router, tags=["version"])
+    ticket_rooms = SwitchTicketRooms(
+        room_service=room_service,
+        protocol=protocol,
+        session_factory=session_factory,  # type: ignore[arg-type]
+        agent_store=agent_store,
+        config=config,
+    )
     jira_service = JiraBridgeService(
         session_factory=session_factory,  # type: ignore[arg-type]
         trigger_store=JiraTriggerStore(),
@@ -153,14 +160,8 @@ def create_agent_bridge_app(
         room_store=room_store,
         protocol=protocol,
         config=config,
-        ticket_rooms=SwitchTicketRooms(
-            room_service=room_service,
-            protocol=protocol,
-            session_factory=session_factory,  # type: ignore[arg-type]
-            agent_store=agent_store,
-            config=config,
-        ),
-        card_updater=SwitchCardUpdater(room_service=room_service),
+        ticket_rooms=ticket_rooms,
+        card_updater=SwitchCardUpdater(ticket_rooms=ticket_rooms),
     )
     init_jira_routes(
         service=jira_service,

@@ -13,9 +13,8 @@ still gets a room for the record with no owner, which only admins can see.
 When an admin later maps the reporter, the pending invite follow-up transfers
 room ownership to them.
 
-Card refresh (option C): the creation card message stays fixed as the
-thread root, and the live ticket state is rewritten in place into the room
-description (``SwitchCardUpdater``). Admin cards use message edit instead.
+Card refresh preserves the thread root and updates both its message and the
+room description. Attaching a channel replaces the internal-only root once.
 """
 
 from __future__ import annotations
@@ -24,15 +23,17 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
+from switch_core.bridges.collaboration.models import ChannelCreationUnsupported
 from switch_core.bridges.jira.activity import (
     admit_room,
     capacity_lock,
     ticket_turn_lock,
 )
+from switch_core.bridges.jira.admin import enqueue_admin_card_follow_up
 from switch_core.bridges.jira.worker import (
     SYNC_TICKET_ROOM_COMMAND,
     is_terminal_ticket_status,
@@ -45,10 +46,12 @@ from switch_core.db.models import (
     JiraWorkerIdentity,
     JiraWorkerOutbox,
     JiraWorkerTicket,
+    Message,
     Room,
     User,
 )
 from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
 from switch_core.room_service import RoomCreateConfig, RoomService
 
 TICKET_ROOM_INSTANCE_KEY = "jira_instance"
@@ -58,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 INVITE_REPORTER_COMMAND = "invite_ticket_reporter"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
+RESTORE_HISTORY_COMMAND = "restore_ticket_history"
+REPORTER_ACCESS_REASON = "reporter_access"
 
 
 class TicketRooms(Protocol):
@@ -73,10 +78,16 @@ class TicketRooms(Protocol):
         instance: str,
         issue_key: str,
     ) -> str:
-        """Create a private internal room marked for this ticket. Returns the room id."""
+        """Create a private room on the default bridge, marked for this ticket."""
         ...
 
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None: ...
+
+    async def is_bridged(self, room_id: str) -> bool: ...
+
+    async def ensure_reporter_access(
+        self, room_id: str, user_id: str | None
+    ) -> None: ...
 
     async def post_card(self, room_id: str, *, body: str) -> str:
         """Post the ticket card. Returns the transport event id."""
@@ -124,11 +135,7 @@ class TicketRooms(Protocol):
 
 
 class CardUpdater(Protocol):
-    """In-place ticket-card refresh via the room description.
-
-    The creation card message stays fixed as the thread root. Admin cards
-    use message edit and do not use this path.
-    """
+    """Refresh the card and room description without changing the thread root."""
 
     async def update_card(self, room_id: str, *, event_id: str, body: str) -> None: ...
 
@@ -277,6 +284,106 @@ async def _apply_description_and_archive(
     want_archived = is_terminal_ticket_status(ticket.status)
     if bool(await rooms.is_archived(room_id)) != want_archived:
         await rooms.set_archived(room_id, archived=want_archived)
+
+
+async def _find_history_message(
+    session: AsyncSession,
+    rooms: TicketRooms,
+    room_id: str,
+    after_seq: int,
+    body: str,
+    thread_id: str | None,
+) -> str | None:
+    messages = await session.scalars(
+        select(Message)
+        .where(
+            Message.room_id == room_id,
+            Message.seq > after_seq,
+            Message.body == body,
+            Message.thread_root_event_id == thread_id,
+        )
+        .order_by(Message.seq)
+    )
+    for message in messages:
+        if await rooms.is_worker_sender(message.sender_id):
+            return message.transport_event_id
+    return None
+
+
+async def _restore_ticket_history(
+    session: AsyncSession,
+    rooms: TicketRooms,
+    ticket: JiraWorkerTicket,
+    row: JiraWorkerOutbox,
+) -> None:
+    assert ticket.room_id is not None
+    payload = dict(row.payload or {})
+    if not payload.get("card_event_id"):
+        ticket.card_event_id = await _find_history_message(
+            session, rooms, ticket.room_id, payload["after_seq"], payload["body"], None
+        ) or await rooms.post_card(ticket.room_id, body=payload["body"])
+        payload["card_event_id"] = ticket.card_event_id
+        row.payload = payload
+        await session.commit()
+        if (
+            await _relock_ticket(
+                session, instance=ticket.instance, issue_key=ticket.issue_key
+            )
+            is None
+        ):
+            raise ValueError("Ticket disappeared during history restoration")
+    else:
+        ticket.card_event_id = payload["card_event_id"]
+    questions = list(
+        await session.scalars(
+            select(JiraWorkerOutbox)
+            .where(
+                JiraWorkerOutbox.instance == ticket.instance,
+                JiraWorkerOutbox.issue_key == ticket.issue_key,
+                JiraWorkerOutbox.channel == "switch",
+                JiraWorkerOutbox.command == "intake_question",
+                JiraWorkerOutbox.payload["room_id"].astext == ticket.room_id,
+            )
+            .order_by(JiraWorkerOutbox.created_at.desc(), JiraWorkerOutbox.id.desc())
+        )
+    )
+    if ticket.wait_channel == "switch":
+        for question in questions:
+            if question.status in ("pending", "claimed"):
+                question.payload = {
+                    **(question.payload or {}),
+                    "thread_id": ticket.card_event_id,
+                }
+    latest = questions[0] if questions else None
+    if (
+        ticket.wait_channel == "switch"
+        and (ticket.intake_state or {}).get("phase") == "question"
+        and latest is not None
+        and latest.status == "done"
+        and (latest.payload or {}).get("intake_generation", ticket.agent_generation)
+        == ticket.agent_generation
+        and not any(
+            question.status in ("pending", "claimed", "sending")
+            for question in questions
+        )
+    ):
+        question_body = (latest.payload or {})["data"]
+        if question_body:
+            assert ticket.card_event_id is not None
+            existing = await _find_history_message(
+                session,
+                rooms,
+                ticket.room_id,
+                payload["after_seq"],
+                question_body,
+                ticket.card_event_id,
+            )
+            if existing is None:
+                await rooms.post_question(
+                    ticket.room_id, thread_id=ticket.card_event_id, body=question_body
+                )
+    row.status = "done"
+    await session.flush()
 
 
 async def reconcile_ticket_room(
@@ -441,6 +548,75 @@ async def _reconcile_ticket_room(
                 continue
             body = await _render_card(session, rooms, ticket, owner_id)
         await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        if not is_terminal_ticket_status(ticket.status):
+            history_key = (
+                f"ticket-channel-history:{ticket.id}:{room_id}:{ticket.card_event_id}"
+            )
+            history = await session.scalar(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.instance == ticket.instance,
+                    JiraWorkerOutbox.command == RESTORE_HISTORY_COMMAND,
+                    JiraWorkerOutbox.status == "pending",
+                    JiraWorkerOutbox.payload["ticket_id"].astext == ticket.id,
+                    JiraWorkerOutbox.payload["room_id"].astext == room_id,
+                )
+            )
+            if history is None and not await rooms.is_bridged(room_id):
+                history = JiraWorkerOutbox(
+                    instance=ticket.instance,
+                    issue_key=ticket.issue_key,
+                    channel="switch",
+                    command=RESTORE_HISTORY_COMMAND,
+                    command_key=history_key,
+                    payload={
+                        "ticket_id": ticket.id,
+                        "room_id": room_id,
+                        "body": body,
+                        "after_seq": await session.scalar(
+                            select(func.coalesce(func.max(Message.seq), 0)).where(
+                                Message.room_id == room_id
+                            )
+                        ),
+                    },
+                )
+                session.add(history)
+                await session.commit()
+                ticket = await _relock_ticket(
+                    session, instance=instance, issue_key=issue_key
+                )
+                if ticket is None:
+                    return room_id
+                owner_id = await _mapped_reporter_user_id(session, ticket)
+                if not await _ensure_owner(session, rooms, ticket, room_id, owner_id):
+                    continue
+                body = await _render_card(session, rooms, ticket, owner_id)
+            reasons = dict(ticket.admin_reasons or {})
+            try:
+                await rooms.ensure_reporter_access(room_id, owner_id)
+            except Exception as exc:
+                logger.warning(
+                    "Jira reporter access failed for %s: %s",
+                    ticket.issue_key,
+                    exc,
+                    exc_info=True,
+                )
+                reasons[REPORTER_ACCESS_REASON] = str(exc)
+            else:
+                reasons.pop(REPORTER_ACCESS_REASON, None)
+            if reasons != (ticket.admin_reasons or {}):
+                ticket.admin_reasons = reasons or None
+                await enqueue_admin_card_follow_up(session, ticket)
+            if (
+                history is not None
+                and history.status == "pending"
+                and await rooms.is_bridged(room_id)
+            ):
+                await _restore_ticket_history(session, rooms, ticket, history)
+                if cards is not None and (history.payload or {})["body"] != body:
+                    assert ticket.card_event_id is not None
+                    await cards.update_card(
+                        room_id, event_id=ticket.card_event_id, body=body
+                    )
         if is_terminal_ticket_status(ticket.status):
             ticket.room_claimed = False
             ticket.queue_reason = None
@@ -508,8 +684,8 @@ class SwitchTicketRooms:
 
     Room create/archive go through ``RoomService`` and card posts through
     ``ProtocolService.send_message`` as the Jira system agent (never the
-    public HTTP API). Rooms are private internal rooms owned by the mapped
-    reporter, or ownerless (admins only) for unmapped reporters."""
+    public HTTP API). Rooms use private channels on the default bridge and
+    belong to the mapped reporter, or only admins when the reporter is unmapped."""
 
     def __init__(
         self,
@@ -546,19 +722,34 @@ class SwitchTicketRooms:
         instance: str,
         issue_key: str,
     ) -> str:
-        result = await self._rooms.create_room(
-            RoomCreateConfig(
-                name=name,
-                description=description,
-                agent_names=[self._config.jira_agent_name],
-                internal_only=True,
-                created_by=owner_id,
-                owner_id=owner_id,
-                read_visibility="private",
-                write_visibility="private",
-                metadata=ticket_room_marker(instance, issue_key),
-            )
+        config = RoomCreateConfig(
+            name=name,
+            description=description,
+            agent_names=[self._config.jira_agent_name],
+            channel_type="channel_private",
+            invite_default_member=False,
+            allow_unbridged_on_channel_failure=True,
+            created_by=owner_id,
+            owner_id=owner_id,
+            read_visibility="private",
+            write_visibility="private",
+            metadata=ticket_room_marker(instance, issue_key),
         )
+        try:
+            bridge_id = await self._rooms._resolve_bridge_id(config)
+            if bridge_id is not None:
+                await self._rooms._require_channel_creation(bridge_id)
+        except (ValueError, ChannelCreationUnsupported):
+            logger.warning(
+                "Jira ticket room %s will remain internal-only", name, exc_info=True
+            )
+            config.internal_only = True
+        result = await self._rooms.create_room(config)
+        if not result.room.bridge_id:
+            logger.warning(
+                "Jira ticket room %s is internal-only; reporter access requires a bridge",
+                result.room.id,
+            )
         logger.info("Jira ticket room created for %s: %s", name, result.room.id)
         return result.room.id
 
@@ -592,6 +783,31 @@ class SwitchTicketRooms:
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         await self._rooms.add_agents_to_room(room_id, agent_names=[agent_name])
         await self._rooms.invite_missing_member_clients(room_id)
+
+    async def is_bridged(self, room_id: str) -> bool:
+        async with self._sessions() as session:
+            room = await session.get(Room, room_id)
+            return room is not None and room.external_channel_id is not None
+
+    async def ensure_reporter_access(self, room_id: str, user_id: str | None) -> None:
+        async with self._sessions() as session:
+            room = await session.get(Room, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            if room.archived_at is not None:
+                return
+            bridge_id = room.bridge_id
+            if bridge_id is None:
+                default = await CollaborationBridgeStore().get_default(session)
+                bridge_id = default.id if default is not None else None
+        if bridge_id is None:
+            raise ValueError("No default bridge configured")
+        if room.external_channel_id is None:
+            await self._rooms.link_bridge_to_room(
+                room_id, bridge_id, "channel_private", invite_default_member=False
+            )
+        if user_id is not None:
+            await self._rooms.add_claimed_user_to_room(room_id, user_id)
 
     async def read_context(self, room_id: str, *, after_seq: int) -> dict[str, Any]:
         return await self._protocol.read_context(
@@ -690,14 +906,13 @@ class SwitchTicketRooms:
 
 
 class SwitchCardUpdater:
-    """Production ``CardUpdater``: the live card state is the room description.
+    """Refresh the card message and room description while preserving its id."""
 
-    The creation card message stays fixed (it is the design's thread root),
-    and each refresh rewrites the room description in place through the
-    existing ``RoomService.update_room`` path."""
-
-    def __init__(self, *, room_service: RoomService) -> None:
-        self._rooms = room_service
+    def __init__(self, *, ticket_rooms: SwitchTicketRooms) -> None:
+        self._rooms = ticket_rooms
 
     async def update_card(self, room_id: str, *, event_id: str, body: str) -> None:
-        await self._rooms.update_room(room_id, description=body)
+        await self._rooms._protocol.edit_message(
+            await self._rooms._jira_agent_id(), room_id, event_id, body
+        )
+        await self._rooms._rooms.update_room(room_id, description=body)

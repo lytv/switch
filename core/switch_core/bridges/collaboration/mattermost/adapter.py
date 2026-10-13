@@ -768,6 +768,7 @@ class MattermostAdapter(CollaborationAdapter):
         topic: str,
         *,
         channel_type: ChannelType = "channel_public",
+        invite_default_member: bool = True,
     ) -> str:
         if not self._admin_driver or not self._main_loop:
             raise RuntimeError("Cannot create channel: Mattermost client not connected")
@@ -816,7 +817,8 @@ class MattermostAdapter(CollaborationAdapter):
             )
             channel_id = channel["id"]
 
-        await self._add_default_member(channel_id)
+        if invite_default_member:
+            await self._add_default_member(channel_id)
         return channel_id
 
     async def _add_default_member(self, channel_id: str) -> None:
@@ -938,22 +940,24 @@ class MattermostAdapter(CollaborationAdapter):
 
         loop = self._main_loop
         failed: list[str] = []
-        # Mattermost resolves people by username and ignores the ids, and one
-        # internal caller (the default-member add) has only a name to give — so
-        # walk the names and reach for a paired id only if one was supplied.
+        # Claimed accounts use stable ids; names can change or be reassigned.
         for index, username in enumerate(user_names):
             external_id = (
                 user_external_ids[index] if index < len(user_external_ids) else username
             )
             try:
-                user = await loop.run_in_executor(
-                    None, self._admin_driver.users.get_user_by_username, username
-                )
+                if index < len(user_external_ids):
+                    user_id = user_external_ids[index]
+                else:
+                    user = await loop.run_in_executor(
+                        None, self._admin_driver.users.get_user_by_username, username
+                    )
+                    user_id = user["id"]
                 await loop.run_in_executor(
                     None,
                     self._admin_driver.channels.add_user,
                     channel_id,
-                    {"user_id": user["id"]},
+                    {"user_id": user_id},
                 )
             except Exception:
                 logger.exception(

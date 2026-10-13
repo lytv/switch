@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from alembic.config import Config
@@ -88,6 +90,12 @@ class FakeRooms:
 
     async def ensure_agent_member(self, room_id: str, *, agent_name: str) -> None:
         self.rooms[room_id]["agents"].append(agent_name)
+
+    async def is_bridged(self, room_id: str) -> bool:
+        return True
+
+    async def ensure_reporter_access(self, room_id: str, user_id: str | None) -> None:
+        return None
 
     async def post_card(self, room_id: str, *, body: str) -> str:
         if self.fail_post_once:
@@ -684,9 +692,18 @@ class StubRoomService:
 @pytest.mark.asyncio
 async def test_production_card_updater_rewrites_room_description() -> None:
     service = StubRoomService()
-    updater = SwitchCardUpdater(room_service=service)  # type: ignore[arg-type]
+    protocol = SimpleNamespace(edit_message=AsyncMock())
+    rooms = SimpleNamespace(
+        _rooms=service,
+        _protocol=protocol,
+        _jira_agent_id=AsyncMock(return_value="jira-agent"),
+    )
+    updater = SwitchCardUpdater(ticket_rooms=rooms)  # type: ignore[arg-type]
     await updater.update_card("room-1", event_id="card-room-1", body="Status: Done")
     assert service.descriptions == {"room-1": "Status: Done"}
+    protocol.edit_message.assert_awaited_once_with(
+        "jira-agent", "room-1", "card-room-1", "Status: Done"
+    )
 
 
 @pytest.mark.asyncio
@@ -1126,12 +1143,16 @@ async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
     captured: dict[str, Any] = {}
 
     class _Recording:
+        async def _resolve_bridge_id(self, config: Any) -> None:
+            return None
+
         async def create_room(self, config: Any) -> Any:
             captured["metadata"] = config.metadata
             captured["name"] = config.name
+            captured["config"] = config
 
             class _Result:
-                room = type("Room", (), {"id": "room-9"})()
+                room = type("Room", (), {"id": "room-9", "bridge_id": None})()
 
             return _Result()
 
@@ -1153,6 +1174,10 @@ async def test_create_ticket_room_writes_marker_into_room_metadata() -> None:
         == "room-9"
     )
     assert captured["name"] == "KAN-1"
+    assert captured["config"].internal_only is False
+    assert captured["config"].channel_type == "channel_private"
+    assert captured["config"].read_visibility == "private"
+    assert captured["config"].write_visibility == "private"
     assert captured["metadata"] == {
         "jira_instance": INSTANCE,
         "jira_issue_key": "KAN-1",

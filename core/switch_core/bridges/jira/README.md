@@ -18,6 +18,27 @@ Tickets that exceed room or session capacity remain in the worker's To Do queue.
 Admission selects the oldest unclaimed ticket in an enabled project first, including one that has no queue reason yet. The queue does not overwrite
 Jira status or a human decision.
 
+## Ticket rooms
+
+Each ticket room uses a private channel on the instance's default collaboration
+bridge. Switch read and write visibility also stays private. The mapped reporter
+owns the room; admins retain access through Switch authorization. The worker
+invites every account that the reporter claims on that bridge, and no other
+people. It does not invite Mattermost's configured default member. Mapping and
+claim changes do not revoke previous channel memberships; an operator must
+remove obsolete members on the collaboration platform.
+
+Room sync attaches a private channel to an existing unbridged ticket room.
+Repeated sync and worker restarts reuse that channel. The worker reposts the
+ticket card and current open intake question once after attachment. The new
+card becomes the thread root for later questions and card edits.
+Archived rooms receive no bridge or invitation until the existing reopen path
+reopens them. Missing, stopped, channel-disabled, or unreachable default bridges
+leave new ticket rooms internal-only. Access failures log a warning and add a reason to the
+admin card without blocking ticket sync. Mapping changes, claim changes, and
+ordinary ticket sync retry access and clear the reason after success.
+A mapped reporter needs a claimed account on the bridge to answer there.
+
 ## Input and waits
 
 The worker reads every human message in the ticket room through `read_context`:
@@ -70,8 +91,8 @@ existing outbox version check, retry, and uncertain-write rules.
 
 One admin room holds every alert. The worker finds it by the
 `jira_worker_admin_room` marker, not by name. The configured admin user owns
-the room. The room uses the default bridge channel, the same way a ticket
-room does. The Jira system agent posts there.
+the room. The room uses the default bridge channel. The Jira system agent
+posts there.
 
 One card per ticket is posted once, then edited in place. The message keeps
 its id and position. The card shows the current reasons, ticket key, summary,
