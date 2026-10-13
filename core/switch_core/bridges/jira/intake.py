@@ -451,6 +451,11 @@ class IntakeOrchestrator:
                     "room_id": ticket.room_id,
                     "thread_id": ticket.card_event_id,
                     "based_updated": ticket.jira_read_updated,
+                    "based_status": ticket.status,
+                    "based_context": {
+                        "summary": ticket.summary,
+                        "description": ticket.description,
+                    },
                     "based_changelog_id": ticket.jira_read_changelog_id,
                     "based_comment_ids": ticket.jira_seen_comment_ids,
                     "reporter_account_id": ticket.reporter_account_id,

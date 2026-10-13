@@ -78,6 +78,8 @@ async def enqueue_jira_command(
     payload = {
         "data": data,
         "based_updated": based_updated,
+        "based_status": ticket.status,
+        "based_context": {"summary": ticket.summary, "description": ticket.description},
         "based_changelog_id": based_changelog_id,
         "based_comment_ids": based_comment_ids,
         "reporter_account_id": ticket.reporter_account_id,
@@ -140,9 +142,14 @@ async def _pages(client: JiraPollClient, path: str, key: str) -> list[dict[str, 
 async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str, Any]:
     """Read all history and comments, not the truncated issue expand."""
     path = f"/rest/api/3/issue/{quote(issue_key, safe='')}"
-    before = (await client.request("GET", path, params={"fields": "updated"})).json()[
-        "fields"
-    ]["updated"]
+    fields = (
+        await client.request(
+            "GET",
+            path,
+            params={"fields": "updated,status,summary,description,project,reporter"},
+        )
+    ).json()["fields"]
+    before = fields["updated"]
     histories = await _pages(client, path + "/changelog", "values")
     comments = await _pages(client, path + "/comment", "comments")
     updated = (await client.request("GET", path, params={"fields": "updated"})).json()[
@@ -153,6 +160,7 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
     histories.sort(key=lambda item: (_stamp(item["created"]), int(item["id"])))
     return {
         "updated": updated,
+        "fields": fields,
         "changelog_id": str(histories[-1]["id"]) if histories else "",
         "histories": histories,
         "comments": comments,

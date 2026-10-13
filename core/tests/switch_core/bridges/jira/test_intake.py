@@ -72,6 +72,10 @@ class IntakeJira(JiraMock):
                     },
                 )
             self.writes.append(request)
+            if self.write_started:
+                self.write_started.set()
+            if self.write_release:
+                await self.write_release.wait()
             self.transition(
                 json.loads(request.content)["transition"]["id"], "worker-account"
             )

@@ -117,6 +117,33 @@ An admin accepts a stored `ignored_input` event with
 `POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new
 `explicit_input` event. The old event is not rewritten.
 
+An admin releases a parked ticket with
+`POST /jira-triggers/worker/tickets/{issue_key}/release?instance={instance}`.
+The JSON body requires `request_id`, a UUID generated for this release request.
+Repeat the same UUID after a connection failure or a retryable conflict.
+A repeated request returns its stored release receipt without another release.
+The receipt records the admin, time, previous reason, and retried command IDs.
+
+Release reads a fresh Jira status, summary, description, comment IDs, changelog ID,
+and updated stamp. It clears the park reason and updates the existing admin card.
+Other alert reasons remain. A known unsent command resumes only when its source
+status, summary, description, and visible Jira evidence still match.
+Commands without these baselines, stale commands, field updates, and failed
+commands are cancelled. The worker then plans from the accepted Jira state.
+Release cancels obsolete wait commands and starts a fresh wait interval when
+Jira still waits for input or approval. The question count and token usage do not reset.
+Release preserves unread reporter input under the ticket's existing channel rules.
+If Jira's project or reporter differs from stored routing, release fails.
+Refresh the ticket metadata before retrying that release.
+
+Release refuses completed, cancelled, and token-limit tickets.
+A current Jira status in the Done category also prevents release.
+Release refuses unknown send outcomes and interrupted or failed turns with unknown token usage.
+Those cases require separate reconciliation, not replay. Active sends, turns,
+or admin card updates return a retryable conflict.
+An issue stamp change during the history read also returns a conflict.
+That exact consistency check remains unchanged.
+
 No UI is part of this boundary.
 
 ## One-turn integration
