@@ -141,8 +141,11 @@ status, summary, description, and visible Jira evidence still match.
 Other stale commands, field updates, and obsolete wait commands are cancelled.
 For the current intake chain, release plans only the remaining steps against the
 fresh baseline. It includes successors cancelled when the ticket parked.
-A completed summary stays completed. Release preserves the intake phase, cycle,
-question count, history, and pending replies. It never creates an approver rejection.
+A completed summary stays completed. A completed approval transition never replays.
+Release preserves the intake phase, cycle, question count, history, and pending replies.
+If history proves an approver rejection after completed approval, release calls the
+normal rejection path. It refuses unclear phase/status combinations.
+Failed commands replan with new IDs and retain their attempt counts.
 A question with no remaining delivery resumes the normal intake turn when replies exist.
 Release cancels obsolete wait commands and starts a fresh wait interval when
 Jira still waits for input or approval. The question count and token usage do not reset.

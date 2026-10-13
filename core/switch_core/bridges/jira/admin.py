@@ -22,9 +22,10 @@ from switch_core.bridges.jira.activity import (
     is_terminal_ticket_status,
     record_event,
     request_wake,
+    resume_rejection,
     ticket_turn_lock,
 )
-from switch_core.bridges.jira.observe import _stamp, comment_actor
+from switch_core.bridges.jira.observe import _stamp, comment_actor, observe_jira
 from switch_core.bridges.jira.outbox import (
     INTERRUPTED_TURN,
     STAMP_MISMATCH,
@@ -702,11 +703,20 @@ async def release_parked_ticket(
                                             )
                                         ),
                                         JiraWorkerOutbox.command_key.in_(intake_keys),
+                                        *(
+                                            JiraWorkerOutbox.command_key.like(
+                                                f"{command_key}:release:%"
+                                            )
+                                            for command_key in intake_keys
+                                        ),
                                     ),
                                     or_(
                                         JiraWorkerOutbox.channel == "jira",
                                         JiraWorkerOutbox.command == "intake_question",
                                     ),
+                                )
+                                .order_by(
+                                    JiraWorkerOutbox.created_at, JiraWorkerOutbox.id
                                 )
                                 .with_for_update()
                             )
@@ -743,6 +753,26 @@ async def release_parked_ticket(
                     ).json()["accountId"]
                     if not isinstance(worker_account, str) or not worker_account:
                         raise ValueError("Jira worker accountId is required")
+                    by_key = {
+                        (row.command_key or "").split(":release:", 1)[0]: row
+                        for row in rows
+                    }
+                    approval = by_key.get(prefix + "approval")
+                    phase = state.get("phase", "intake")
+                    statuses = config.jira_worker_statuses
+                    if state and (
+                        phase not in ("intake", "question", "limit", "approval")
+                        or (
+                            status not in (statuses.to_do, statuses.waiting_for_input)
+                            and not (
+                                phase == "approval"
+                                and status == statuses.waiting_for_approval
+                            )
+                        )
+                    ):
+                        raise ValueError(
+                            "Unknown intake phase/status combination; reconcile before release"
+                        )
                     planned = [
                         row
                         for row in rows
@@ -804,19 +834,47 @@ async def release_parked_ticket(
                                     ),
                                 },
                             )
+                    ticket.jira_worker_account_id = worker_account
+                    ticket.jira_read_updated = version["updated"]
+                    ticket.jira_seen_comment_ids = sorted(
+                        str(c["id"]) for c in version["comments"]
+                    )
+                    if (
+                        phase == "approval"
+                        and approval is not None
+                        and approval.status == "done"
+                    ):
+                        if status != statuses.waiting_for_approval:
+                            if status != statuses.waiting_for_input:
+                                raise ValueError(
+                                    "Unknown intake phase/status combination; reconcile before release"
+                                )
+                            ticket.worker_parked_reason = None
+                            ticket.jira_read_changelog_id = (
+                                approval.payload or {}
+                            ).get("based_changelog_id")
+                            observation = observe_jira(
+                                version,
+                                seen_ids=set(ticket.jira_seen_comment_ids),
+                                changelog_id=ticket.jira_read_changelog_id,
+                                base_stamp=_stamp(version["updated"]),
+                                worker_account=worker_account,
+                                reporter_account=ticket.reporter_account_id,
+                            )
+                            resume_rejection(ticket, version, observation, config)
+                            if (ticket.intake_state or {}).get("phase") != "intake":
+                                raise ValueError(
+                                    "Unknown intake phase/status combination; no verified approver rejection"
+                                )
+                        intake_keys = []
+                        retry = False
                     ticket.agent_generation += 1
                     ticket.status = status
                     ticket.summary = version["fields"]["summary"]
                     ticket.description = version["fields"].get("description")
-                    ticket.jira_worker_account_id = worker_account
-                    ticket.jira_read_updated = version["updated"]
                     ticket.jira_read_changelog_id = version["changelog_id"]
-                    ticket.jira_seen_comment_ids = sorted(
-                        str(c["id"]) for c in version["comments"]
-                    )
                     remaining = planned if retry else []
                     if not retry:
-                        by_key = {row.command_key: row for row in rows}
                         predecessor = None
                         question = by_key.get(
                             prefix + f"question:{state.get('questions', 0)}"
@@ -829,26 +887,19 @@ async def release_parked_ticket(
                             intake_keys = []
                         for command_key in intake_keys:
                             row = by_key.get(command_key)
-                            if row is not None and row.status == "done":
-                                if (
+                            if (
+                                row is not None
+                                and row.status == "done"
+                                and (
                                     row.command != "transition"
                                     or (row.payload or {}).get("data") == status
-                                ):
-                                    continue
-                                row = JiraWorkerOutbox(
-                                    channel=row.channel,
-                                    instance=ticket.instance,
-                                    issue_key=ticket.issue_key,
-                                    command_key=f"{command_key}:release:{request_id}",
-                                    command=row.command,
-                                    payload={"data": (row.payload or {})["data"]},
+                                    or command_key == intake_keys[-1]
                                 )
-                                session.add(row)
-                                await session.flush()
+                            ):
+                                continue
                             if (
-                                state.get("phase") == "approval"
-                                and status
-                                == config.jira_worker_statuses.waiting_for_approval
+                                command_key == prefix + "approval"
+                                and status == statuses.waiting_for_approval
                             ):
                                 continue
                             if row is None:
@@ -863,6 +914,25 @@ async def release_parked_ticket(
                                 and predecessor is None
                             ):
                                 continue
+                            if row.status not in (
+                                "parked",
+                                "pending",
+                                "claimed",
+                                "cancelled",
+                            ):
+                                row = JiraWorkerOutbox(
+                                    channel=row.channel,
+                                    instance=ticket.instance,
+                                    issue_key=ticket.issue_key,
+                                    command_key=f"{command_key}:release:{request_id}",
+                                    command=row.command,
+                                    payload=dict(row.payload or {}),
+                                    attempts=row.attempts,
+                                    created_at=row.created_at
+                                    + timedelta(microseconds=1),
+                                )
+                                session.add(row)
+                                await session.flush()
                             row.payload = {
                                 **(row.payload or {}),
                                 "intake_generation": ticket.agent_generation,
@@ -871,8 +941,9 @@ async def release_parked_ticket(
                                 else None,
                             }
                             if predecessor is not None:
-                                row.created_at = predecessor.created_at + timedelta(
-                                    microseconds=1
+                                row.created_at = max(
+                                    row.created_at,
+                                    predecessor.created_at + timedelta(microseconds=1),
                                 )
                             predecessor = row
                             remaining.append(row)
