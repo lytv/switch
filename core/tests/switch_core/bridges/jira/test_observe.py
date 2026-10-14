@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -186,12 +185,17 @@ def test_repeated_accepted_read_does_not_repeat_reporter_input():
     assert not repeated.new_ids and not repeated.reporter_edits
 
 
-def test_hidden_change_is_an_explicit_accepted_evidence_limit():
-    drift = comment_version("worker-account", 52)
-    hidden_change = deepcopy(drift)
-    assert drift == hidden_change
-    assert observe(drift, set()).park is None
-    assert observe(hidden_change, set()).park is None
+@pytest.mark.parametrize("gap_ms", [0, 52])
+def test_deleted_known_comment_preserves_same_read_reporter_input(gap_ms):
+    version = comment_version("worker-account", gap_ms)
+    reporter = comment_version("reporter-account", 0)["comments"][0]
+    reporter["id"] = "7"
+    version["comments"].append(reporter)
+    result = observe(version, {"3"})
+    assert result.park == "human"
+    assert result.new_ids == frozenset({"1", "7"})
+    assert result.reporter_new == (reporter,)
+    assert result.seen_ids == ("1", "3", "7")
 
 
 class MillisecondReadChange(JiraMock):

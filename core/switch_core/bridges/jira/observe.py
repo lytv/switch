@@ -127,13 +127,6 @@ def observe_jira(
             seen_ids=tuple(sorted(seen_ids | current_ids)),
             changelog_id=current_changelog,
         )
-    if seen_ids - current_ids:
-        return Observation(
-            first=False,
-            park="human",
-            seen_ids=tuple(sorted(seen_ids | current_ids)),
-            changelog_id=current_changelog,
-        )
     new_ids = current_ids - seen_ids
     reporter_new: list[dict[str, Any]] = []
     for comment_id in sorted(new_ids):
@@ -143,6 +136,15 @@ def observe_jira(
         if actor and actor == reporter_account:
             reporter_new.append(by_id[comment_id])
             continue
+        return Observation(
+            first=False,
+            new_ids=frozenset(new_ids),
+            reporter_new=tuple(reporter_new),
+            park="human",
+            seen_ids=tuple(sorted(seen_ids | current_ids)),
+            changelog_id=current_changelog,
+        )
+    if seen_ids - current_ids:
         return Observation(
             first=False,
             new_ids=frozenset(new_ids),
