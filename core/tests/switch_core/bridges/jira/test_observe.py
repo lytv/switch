@@ -198,6 +198,71 @@ def test_deleted_known_comment_preserves_same_read_reporter_input(gap_ms):
     assert result.seen_ids == ("1", "3", "7")
 
 
+@pytest.mark.parametrize("other_id", ["1", "8"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "deleted",
+        "new_comment",
+        "missing_history",
+        "changelog",
+        "seen_edit",
+        "stamp_mismatch",
+        "regressed",
+        "initial_comment",
+        "initial_history",
+    ],
+)
+def test_park_returns_preserve_all_reporter_evidence(case, other_id):
+    version = comment_version("reporter-account", 0)
+    reporter_edit = version["comments"][0]
+    reporter_edit["id"] = "4"
+    reporter_edit["created"] = stamp(0)
+    reporter_new = comment_version("reporter-account", 0)["comments"][0]
+    reporter_new["id"] = "7"
+    version["comments"].append(reporter_new)
+    seen, changelog_id = {"4"}, ""
+    if case == "deleted":
+        seen.add("3")
+    elif case in ("new_comment", "seen_edit", "initial_comment"):
+        other = comment_version("other-account", 0)["comments"][0]
+        other["id"] = other_id
+        if case == "seen_edit":
+            seen.add(other_id)
+            other["created"] = stamp(0)
+        version["comments"].append(other)
+    elif case == "missing_history":
+        changelog_id = "missing"
+    elif case in ("changelog", "initial_history"):
+        version["histories"] = [
+            {"id": "1", "created": stamp(10_000), "author": {"accountId": "other-account"}}
+        ]
+        version["changelog_id"] = "1"
+    elif case == "stamp_mismatch":
+        version["updated"] = stamp(10_052)
+    elif case == "regressed":
+        version["updated"] = stamp(-1)
+    if case.startswith("initial"):
+        seen = None
+    result = observe_jira(
+        version,
+        seen_ids=seen,
+        changelog_id=changelog_id,
+        base_stamp=BASE,
+        worker_account="worker-account",
+        reporter_account="reporter-account",
+    )
+    expected_park = {
+        "missing_history": "changelog_missing",
+        "stamp_mismatch": "stamp_mismatch",
+        "regressed": "regressed",
+    }.get(case, "human")
+    assert result.park == expected_park
+    assert result.reporter_new == (reporter_new,)
+    assert result.reporter_edits == (reporter_edit,)
+    assert "7" in result.new_ids
+
+
 class MillisecondReadChange(JiraMock):
     def __init__(self):
         super().__init__()
