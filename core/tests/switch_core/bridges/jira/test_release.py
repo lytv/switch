@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta
 
@@ -29,7 +30,6 @@ from switch_core.db.models import (
     JiraWorkerTicket,
     User,
 )
-from tests.switch_core.bridges.jira.test_activity import message
 from tests.switch_core.bridges.jira.test_admin import (
     NOW,
     FakeAdminBoard,
@@ -135,13 +135,12 @@ async def setup_release(factory):
         return key, admin.id, member.id, command_id, jira, config
 
 
-async def release(factory, setup, request_id, *, board):
+async def release(factory, setup, request_id):
     key, admin, _, _, jira, config = setup
     return await release_parked_ticket(
         factory,
         config=config,
         client=client_for(jira),
-        board=board,
         ticket_id=key,
         request_id=request_id,
         admin_user_id=admin,
@@ -158,156 +157,11 @@ async def release_intake_ticket(factory, key, jira):
         factory,
         config=intake_config(),
         client=client_for(jira),
-        board=FakeAdminBoard(),
         ticket_id=key,
         request_id=str(uuid.uuid4()),
         admin_user_id=admin.id,
         now=INTAKE_NOW,
     )
-
-
-async def test_release_retries_matching_transition_once_after_restart(session_factory):
-    setup = await setup_release(session_factory)
-    key, admin, _, command_id, jira, config = setup
-    board, request_id = FakeAdminBoard(), str(uuid.uuid4())
-    first = await release(session_factory, setup, request_id, board=board)
-    reads = len(jira.requests)
-    second = await release(session_factory, setup, request_id, board=board)
-    assert first.id == second.id and len(jira.requests) == reads
-    assert first.payload["released_by"] == admin
-    assert first.payload["released_at"] == NOW.isoformat()
-    assert first.payload["retried_command_ids"] == [command_id]
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        command = await session.get(JiraWorkerOutbox, command_id)
-        assert ticket.tokens_used == 123 and ticket.worker_parked_reason is None
-        assert ticket.agent_state == "wake_requested"
-        assert ticket.jira_seen_comment_ids == ["1"]
-        assert ticket.jira_read_updated == jira.updated
-        assert command.payload["based_updated"] == jira.updated
-        assert command.payload["intake_generation"] == ticket.agent_generation
-        assert "parked" not in (ticket.admin_reasons or {})
-        assert "- none" in board.cards[ticket.admin_card_event_id]
-        assert not list(
-            await session.scalars(
-                select(JiraWorkerOutbox).where(
-                    JiraWorkerOutbox.command == "admin_reason_alert"
-                )
-            )
-        )
-        assert not board.alerts
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=config,
-        clients={"acme": client_for(jira)},
-        clock=lambda: NOW,
-    )
-    await asyncio.gather(sender.run_once(), sender.run_once())
-    await JiraOutboxSender(
-        session_factory=session_factory,
-        config=config,
-        clients={"acme": client_for(jira)},
-        clock=lambda: NOW,
-    ).run_once()
-    assert jira.status == "Waiting for approval"
-    assert len(jira.writes) == 1 and len(jira.comments) == 1
-    async with session_factory() as session:
-        assert (await session.get(JiraWorkerOutbox, command_id)).status == "done"
-        receipts = list(
-            await session.scalars(
-                select(JiraWorkerEvent).where(
-                    JiraWorkerEvent.event_kind == "admin_release"
-                )
-            )
-        )
-        assert len(receipts) == 1 and receipts[0].consumed
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        "status",
-        "human_field",
-        "legacy_baseline",
-        "failed",
-        "deleted_comment",
-        "cancelled_predecessor",
-        "context_changed",
-        "legacy_context",
-        "field_command",
-    ],
-)
-async def test_release_replans_stale_or_unprovable_commands(session_factory, change):
-    setup = await setup_release(session_factory)
-    key, _, _, command_id, jira, _ = setup
-    if change == "status":
-        jira.status = "To Do"
-    elif change == "human_field":
-        jira.change("human-account")
-    elif change == "context_changed":
-        jira.fields["summary"] = "Changed Jira summary without a visible history row"
-    async with session_factory() as session:
-        command = await session.get(JiraWorkerOutbox, command_id)
-        if change == "legacy_baseline":
-            payload = dict(command.payload)
-            payload.pop("based_status")
-            command.payload = payload
-        elif change == "failed":
-            command.status = "failed"
-        elif change == "legacy_context":
-            payload = dict(command.payload)
-            payload.pop("based_context")
-            command.payload = payload
-        elif change == "field_command":
-            (await session.get(JiraWorkerTicket, key)).intake_state = None
-            command.command_key = "release-fields"
-            command.command = "fields"
-            command.payload = {
-                **command.payload,
-                "data": {"summary": "Old planned summary"},
-            }
-        elif change == "deleted_comment":
-            command.payload = {**command.payload, "based_comment_ids": ["deleted"]}
-        elif change == "cancelled_predecessor":
-            previous = JiraWorkerOutbox(
-                channel="jira",
-                instance="acme",
-                issue_key="KAN-1",
-                command="comment",
-                status="cancelled",
-            )
-            session.add(previous)
-            await session.flush()
-            command.payload = {**command.payload, "after_command": previous.id}
-        await session.commit()
-    receipt = await release(
-        session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard()
-    )
-    assert receipt.payload["replanned"] and receipt.payload["retried_command_ids"] == []
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert ticket.status == jira.status
-        assert ticket.summary == jira.fields["summary"]
-        assert ticket.intake_state == (
-            None
-            if change == "field_command"
-            else {"phase": "approval", "questions": 3, "cycle": 0}
-        )
-        assert ticket.tokens_used == 123
-        assert (await session.get(JiraWorkerOutbox, command_id)).status == (
-            "cancelled" if change in ("field_command", "failed") else "pending"
-        )
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=setup[5],
-        clients={"acme": client_for(jira)},
-        clock=lambda: NOW,
-    )
-    await sender.run_once()
-    assert jira.status == (
-        "Waiting for input" if change == "field_command" else "Waiting for approval"
-    )
-    assert len(jira.comments) == 1
 
 
 @pytest.mark.parametrize(
@@ -372,7 +226,7 @@ async def test_release_refuses_limits_and_unknown_outcomes(session_factory, reas
         error_type,
         match="limit|Terminal|completed|Unknown|changed while|refresh ticket|older than",
     ):
-        await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
+        await release(session_factory, setup, str(uuid.uuid4()))
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         assert ticket.tokens_used == before_tokens
@@ -390,7 +244,6 @@ async def test_release_requires_admin_and_enabled_project(session_factory):
             session_factory,
             config=config,
             client=client_for(jira),
-            board=FakeAdminBoard(),
             ticket_id=key,
             request_id=str(uuid.uuid4()),
             admin_user_id=member,
@@ -399,9 +252,7 @@ async def test_release_requires_admin_and_enabled_project(session_factory):
     assert not jira.requests
     disabled = (*setup[:-1], _worker_config(jira_worker_enabled_projects={}))
     with pytest.raises(ValueError, match="not enabled"):
-        await release(
-            session_factory, disabled, str(uuid.uuid4()), board=FakeAdminBoard()
-        )
+        await release(session_factory, disabled, str(uuid.uuid4()))
     assert not jira.requests
 
 
@@ -411,43 +262,20 @@ async def test_concurrent_release_returns_retryable_conflict_then_same_receipt(
     setup = await setup_release(session_factory)
     jira = setup[4]
     jira.issue_read_started, jira.issue_read_release = asyncio.Event(), asyncio.Event()
-    board, request_id = FakeAdminBoard(), str(uuid.uuid4())
-    first = asyncio.create_task(
-        release(session_factory, setup, request_id, board=board)
-    )
+    request_id = str(uuid.uuid4())
+    first = asyncio.create_task(release(session_factory, setup, request_id))
     await asyncio.wait_for(jira.issue_read_started.wait(), timeout=10)
     with pytest.raises(BlockingIOError, match="active"):
-        await release(session_factory, setup, request_id, board=board)
+        await release(session_factory, setup, request_id)
     jira.issue_read_release.set()
     receipt = await first
-    repeated = await release(session_factory, setup, request_id, board=board)
+    repeated = await release(session_factory, setup, request_id)
     assert repeated.id == receipt.id
-
-
-async def test_card_failure_does_not_repeat_release_and_retry_clears_alert(
-    session_factory,
-):
-    setup = await setup_release(session_factory)
-    board, request_id = FakeAdminBoard(), str(uuid.uuid4())
-
-    async def unavailable():
-        raise RuntimeError("board unavailable")
-
-    original = board.ensure_room
-    board.ensure_room = unavailable
-    with pytest.raises(RuntimeError, match="board unavailable"):
-        await release(session_factory, setup, request_id, board=board)
-    board.ensure_room = original
-    receipt = await release(session_factory, setup, request_id, board=board)
-    assert receipt.payload["retried_command_ids"] == [setup[3]]
-    assert len(board.cards) == 1
 
 
 @pytest.mark.parametrize("channel", ["jira_comments", "switch"])
 @pytest.mark.parametrize("edited", [False, True])
-async def test_release_preserves_new_reporter_input_and_replans(
-    session_factory, channel, edited
-):
+async def test_release_preserves_new_reporter_input(session_factory, channel, edited):
     setup = await setup_release(session_factory)
     key, _, _, _, jira, _ = setup
     jira.change("reporter-account", comment=True)
@@ -460,10 +288,8 @@ async def test_release_preserves_new_reporter_input_and_replans(
             ticket.jira_seen_comment_ids = [comment["id"]]
             comment["created"] = BASE
         await session.commit()
-    receipt = await release(
-        session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard()
-    )
-    assert receipt.payload["replanned"]
+    receipt = await release(session_factory, setup, str(uuid.uuid4()))
+    assert receipt.payload["previous_reason"] == STAMP_MISMATCH
     async with session_factory() as session:
         events = list(
             await session.scalars(
@@ -484,39 +310,18 @@ async def test_release_preserves_new_reporter_input_and_replans(
 async def test_duplicate_old_release_does_not_clear_a_later_park(session_factory):
     setup = await setup_release(session_factory)
     key = setup[0]
-    request_id, board = str(uuid.uuid4()), FakeAdminBoard()
-    receipt = await release(session_factory, setup, request_id, board=board)
+    request_id = str(uuid.uuid4())
+    receipt = await release(session_factory, setup, request_id)
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         park_ticket(ticket, "Human Jira action")
         await session.commit()
-    repeated = await release(session_factory, setup, request_id, board=board)
+    repeated = await release(session_factory, setup, request_id)
     assert repeated.id == receipt.id
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         assert ticket.worker_parked_reason == "Human Jira action"
         assert ticket.tokens_used == 123
-
-
-async def test_release_refuses_a_sender_with_an_active_http_write(session_factory):
-    setup = await setup_release(session_factory)
-    jira, config = setup[4:]
-    board = FakeAdminBoard()
-    await release(session_factory, setup, str(uuid.uuid4()), board=board)
-    jira.write_started, jira.write_release = asyncio.Event(), asyncio.Event()
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=config,
-        clients={"acme": client_for(jira)},
-        clock=lambda: NOW,
-    )
-    sending = asyncio.create_task(sender.run_once())
-    await asyncio.wait_for(jira.write_started.wait(), timeout=10)
-    with pytest.raises(BlockingIOError, match="send is active"):
-        await release(session_factory, setup, str(uuid.uuid4()), board=board)
-    jira.write_release.set()
-    await sending
-    assert len(jira.writes) == 1
 
 
 async def test_release_waits_for_an_older_admin_alert_delivery(session_factory):
@@ -528,10 +333,10 @@ async def test_release_waits_for_an_older_admin_alert_delivery(session_factory):
     ) as locked:
         assert locked
         with pytest.raises(BlockingIOError, match="admin card update is active"):
-            await release(session_factory, setup, request_id, board=board)
+            await release(session_factory, setup, request_id)
         assert not jira.requests
-    receipt = await release(session_factory, setup, request_id, board=board)
-    assert receipt.payload["retried_command_ids"] == [setup[3]]
+    receipt = await release(session_factory, setup, request_id)
+    assert receipt.payload["previous_reason"] == STAMP_MISMATCH
     assert not board.alerts
 
 
@@ -554,212 +359,12 @@ async def test_release_does_not_trust_a_foreign_event_with_its_request_key(
         )
         await session.commit()
     with pytest.raises(ValueError, match="another event"):
-        await release(session_factory, setup, request_id, board=FakeAdminBoard())
+        await release(session_factory, setup, request_id)
     assert not jira.requests
     async with session_factory() as session:
         assert (
             await session.get(JiraWorkerTicket, key)
         ).worker_parked_reason == STAMP_MISMATCH
-
-
-async def test_release_cancels_an_obsolete_wait_without_reusing_its_key(
-    session_factory,
-):
-    setup = await setup_release(session_factory)
-    key, _, _, command_id, _, config = setup
-    old_anchor = NOW - timedelta(days=1)
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        ticket.wait_anchor = old_anchor
-        ticket.wait_fired = {"blocked": old_anchor.isoformat()}
-        wait_id = await enqueue_jira_command(
-            session,
-            config=config,
-            ticket=ticket,
-            command_key=f"wait-blocked:{key}:{old_anchor.isoformat()}",
-            command="transition",
-            data="BLOCKED",
-            based_updated=BASE,
-            based_changelog_id="",
-            based_comment_ids=[],
-        )
-        (await session.get(JiraWorkerOutbox, wait_id)).status = "parked"
-        await session.commit()
-    receipt = await release(
-        session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard()
-    )
-    assert receipt.payload["retried_command_ids"] == [command_id]
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert ticket.wait_anchor == NOW and ticket.wait_fired == {}
-        assert ticket.tokens_used == 123
-        assert (await session.get(JiraWorkerOutbox, wait_id)).status == "cancelled"
-        assert (await session.get(JiraWorkerOutbox, command_id)).status == "pending"
-
-
-@pytest.mark.parametrize("transition_status", ["parked", "cancelled"])
-async def test_release_legacy_posted_summary_only_sends_approval(
-    session_factory, transition_status
-):
-    setup = await setup_release(session_factory)
-    key, _, _, command_id, jira, config = setup
-    async with session_factory() as session:
-        for row in await session.scalars(
-            select(JiraWorkerOutbox).where(
-                JiraWorkerOutbox.command_key.like(f"intake:{key}:%")
-            )
-        ):
-            payload = dict(row.payload)
-            payload.pop("based_status")
-            payload.pop("based_context")
-            row.payload = payload
-        (await session.get(JiraWorkerOutbox, command_id)).status = transition_status
-        await session.commit()
-    receipt = await release(
-        session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard()
-    )
-    assert receipt.payload["replanned"]
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=config,
-        clients={"acme": client_for(jira)},
-        clock=lambda: NOW,
-    )
-    await sender.run_once()
-    await sender.run_once()
-    assert jira.status == "Waiting for approval"
-    assert len(jira.comments) == 1 and len(jira.writes) == 1
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert ticket.intake_state == {"phase": "approval", "questions": 3, "cycle": 0}
-        assert ticket.wait_anchor == NOW and ticket.wait_fired == {}
-        assert ticket.worker_parked_reason is None
-        assert all(row.status == "done" for row in await commands(session_factory))
-
-
-@pytest.mark.parametrize("action", ["complete", "question"])
-async def test_release_restores_successors_cancelled_by_the_sender(
-    session_factory, monkeypatch, action
-):
-    key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock(action)
-    decide = model.decide
-
-    async def change_before_send(data, budget):
-        decision = await decide(data, budget)
-        jira.updated = (
-            datetime.fromisoformat(jira.updated) + timedelta(seconds=2)
-        ).isoformat()
-        return decision
-
-    monkeypatch.setattr(model, "decide", change_before_send)
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    rows = await commands(session_factory)
-    assert [row.status for row in rows] == ["parked", "cancelled"]
-    async with session_factory() as session:
-        before = dict((await session.get(JiraWorkerTicket, key)).intake_state)
-    receipt = await release_intake_ticket(session_factory, key, jira)
-    assert receipt.payload["replanned"]
-    async with session_factory() as session:
-        assert (await session.get(JiraWorkerTicket, key)).intake_state == before
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=intake_config(),
-        clients={"acme": client_for(jira)},
-        clock=lambda: INTAKE_NOW,
-        rooms=rooms,
-    )
-    await sender.run_once()
-    await sender.run_once()
-    assert all(row.status == "done" for row in await commands(session_factory))
-    assert len(model.calls) == 1
-    if action == "complete":
-        assert jira.status == "Waiting for approval"
-        assert len(jira.comments) == 1 and not rooms.questions
-    else:
-        assert jira.status == "Waiting for input"
-        assert len(rooms.questions) == 1 and not jira.comments
-
-
-async def test_release_question_without_pending_commands_keeps_replies_for_model(
-    session_factory,
-):
-    key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("question", "complete")
-    worker = scheduler(session_factory, jira, rooms, model)
-    await worker.run_once()
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        before = {**ticket.intake_state, "pending_replies": ["Saved reporter reply"]}
-        ticket.intake_state = before
-        park_ticket(ticket, "Human Jira action")
-        await session.commit()
-    rooms.messages.append(message(1))
-    await worker.activity.read_once()
-    await release_intake_ticket(session_factory, key, jira)
-    async with session_factory() as session:
-        assert (await session.get(JiraWorkerTicket, key)).intake_state == before
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    assert len(model.calls) == 2
-    assert model.calls[-1][0]["history"] == before["history"]
-    assert model.calls[-1][0]["replies"] == [
-        "Saved reporter reply",
-        rooms.messages[0]["body"],
-    ]
-    assert len(rooms.questions) == 1
-    assert jira.status == "Waiting for approval" and len(jira.comments) == 1
-    async with session_factory() as session:
-        state = (await session.get(JiraWorkerTicket, key)).intake_state
-        assert state["questions"] == 1 and state["cycle"] == 0
-        assert "pending_replies" not in state
-
-
-@pytest.mark.parametrize("changed_status", [False, True])
-async def test_release_after_done_input_transition_only_sends_remaining_steps(
-    session_factory, monkeypatch, changed_status
-):
-    key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("question")
-    handle = jira.handle
-
-    async def drift_after_transition(request):
-        response = await handle(request)
-        if request.method == "POST" and request.url.path.endswith("/transitions"):
-            jira.updated = (
-                datetime.fromisoformat(jira.updated) + timedelta(milliseconds=1)
-            ).isoformat()
-        return response
-
-    monkeypatch.setattr(jira, "handle", drift_after_transition)
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    rows = await commands(session_factory)
-    assert [row.status for row in rows] == ["done", "parked"]
-    assert jira.status == "Waiting for input" and not rooms.questions
-    monkeypatch.setattr(jira, "handle", handle)
-    if changed_status:
-        jira.transition("To Do", "human-account")
-    await release_intake_ticket(session_factory, key, jira)
-    sender = JiraOutboxSender(
-        session_factory=session_factory,
-        config=intake_config(),
-        clients={"acme": client_for(jira)},
-        clock=lambda: INTAKE_NOW,
-        rooms=rooms,
-    )
-    await sender.run_once()
-    assert (
-        len(jira.writes) == (2 if changed_status else 1) and len(rooms.questions) == 1
-    )
-    assert jira.status == "Waiting for input"
-    assert all(row.status == "done" for row in await commands(session_factory))
-    assert len(model.calls) == 1
-    async with session_factory() as session:
-        state = (await session.get(JiraWorkerTicket, key)).intake_state
-        assert (
-            state["phase"] == "question"
-            and state["questions"] == 1
-            and state["cycle"] == 0
-        )
 
 
 @pytest.mark.parametrize("error", [INTERRUPTED_TURN, TURN_FAILED])
@@ -796,7 +401,7 @@ async def test_release_refuses_unknown_turn_after_park_reason_overwrite(
         park_ticket(await session.get(JiraWorkerTicket, key), "Human Jira action")
         await session.commit()
     with pytest.raises(ValueError, match="Unknown turn outcome"):
-        await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
+        await release(session_factory, setup, str(uuid.uuid4()))
     assert not jira.requests
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
@@ -833,10 +438,8 @@ async def test_release_allows_reconciled_turn_before_last_release(session_factor
             )
         )
         await session.commit()
-    receipt = await release(
-        session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard()
-    )
-    assert receipt.payload["retried_command_ids"] == [setup[3]]
+    receipt = await release(session_factory, setup, str(uuid.uuid4()))
+    assert receipt.payload["previous_reason"] == STAMP_MISMATCH
 
 
 @pytest.mark.parametrize(
@@ -860,9 +463,23 @@ async def test_release_completed_approval_never_undoes_human_status(
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         before = dict(ticket.intake_state)
+        control = {
+            name: getattr(ticket, name)
+            for name in (
+                "status",
+                "agent_state",
+                "agent_generation",
+                "tokens_used",
+                "wake_at",
+                "wait_anchor",
+                "wait_fired",
+                "summary",
+                "description",
+            )
+        }
         assert ticket.worker_parked_reason == "Human Jira action"
     writes = len(jira.writes)
-    if status == "Waiting for approval":
+    if status in ("Waiting for approval", "In Progress"):
         await release_intake_ticket(session_factory, key, jira)
     else:
         with pytest.raises(ValueError, match="Unknown intake phase/status combination"):
@@ -873,7 +490,10 @@ async def test_release_completed_approval_never_undoes_human_status(
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         assert ticket.intake_state == before
-        if status != "Waiting for approval":
+        assert {name: getattr(ticket, name) for name in control} == control
+        if status in ("Waiting for approval", "In Progress"):
+            assert ticket.worker_parked_reason is None
+        else:
             assert ticket.worker_parked_reason == "Human Jira action"
             assert not await session.scalar(
                 select(JiraWorkerEvent.id).where(
@@ -882,260 +502,200 @@ async def test_release_completed_approval_never_undoes_human_status(
             )
 
 
-async def test_release_keeps_unsent_summary_when_human_already_moved_to_approval(
-    session_factory, monkeypatch
-):
-    key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("complete")
-    decide = model.decide
-
-    async def move_before_send(data, budget):
-        decision = await decide(data, budget)
-        jira.transition("Waiting for approval", "human-account")
-        return decision
-
-    monkeypatch.setattr(model, "decide", move_before_send)
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    assert [row.status for row in await commands(session_factory)] == [
-        "parked",
-        "cancelled",
-    ]
-    assert not jira.comments
-    await release_intake_ticket(session_factory, key, jira)
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    assert jira.status == "Waiting for approval"
-    assert len(jira.comments) == 1 and len(jira.writes) == 1
-    assert len(model.calls) == 1 and not rooms.questions
-    async with session_factory() as session:
-        state = (await session.get(JiraWorkerTicket, key)).intake_state
-        assert (
-            state["phase"] == "approval"
-            and state["cycle"] == 0
-            and state["questions"] == 0
-        )
-
-
-async def test_release_reuses_rejection_path_after_rejection_and_comments_during_park(
-    session_factory,
-):
-    key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("complete")
-    worker = scheduler(session_factory, jira, rooms, model)
-    await worker.run_once()
-    assert jira.status == "Waiting for approval"
-    jira.change("approver-account", comment=True)
-    await worker.activity.read_ticket(key, force_jira=True)
-    jira.transition("Waiting for input", "approver-account")
-    jira.change("approver-account", comment=True)
-    await worker.activity.read_ticket(key, force_jira=True)
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert ticket.worker_parked_reason == "Human Jira action"
-        assert ticket.intake_state["phase"] == "approval"
-        tokens = ticket.tokens_used
-    await release_intake_ticket(session_factory, key, jira)
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert ticket.worker_parked_reason is None and ticket.tokens_used == tokens
-        assert ticket.intake_state["phase"] == "intake"
-        assert (
-            ticket.intake_state["cycle"] == 1 and ticket.intake_state["questions"] == 0
-        )
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    assert len(model.calls) == 1 and len(rooms.questions) == 1
-    assert (
-        rooms.questions[0][2]
-        == "Which requirements in the intake summary need correction?"
-    )
-    assert jira.status == "Waiting for input"
-    assert (
-        len([c for c in jira.comments if c["author"]["accountId"] == "worker-account"])
-        == 1
-    )
-    rooms.messages.append(message(1))
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    assert len(model.calls) == 2
-    assert model.calls[-1][0]["replies"] == [rooms.messages[0]["body"]]
-    assert any("jira_rejection" in item for item in model.calls[-1][0]["history"])
-    assert jira.status == "Waiting for approval"
-
-
-@pytest.mark.parametrize(
-    "failure", ["unavailable_transition", "known_4xx", "summary_4xx"]
-)
-async def test_release_replans_failed_commands_with_fresh_failure_keys(
-    session_factory, monkeypatch, failure
-):
+async def test_release_clears_only_park_and_baseline_without_replaying(session_factory):
     setup = await setup_release(session_factory)
-    key, _, _, original_id, jira, config = setup
-    step = "approval"
-    if failure == "summary_4xx":
-        step = "summary"
-        jira.comments = []
-        async with session_factory() as session:
-            summary = await session.scalar(
-                select(JiraWorkerOutbox).where(
-                    JiraWorkerOutbox.command_key == f"intake:{key}:0:summary"
-                )
+    key, admin, _, command_id, jira, config = setup
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        ticket.jira_seen_comment_ids = ["deleted", "1"]
+        ticket.wait_anchor = NOW - timedelta(hours=5)
+        ticket.wait_fired = {"admin": NOW.isoformat()}
+        ticket.admin_reasons = {"parked": STAMP_MISMATCH, "custom": "Keep this reason"}
+        await session.commit()
+        before = {
+            column.name: getattr(ticket, column.name)
+            for column in JiraWorkerTicket.__table__.columns
+            if column.name
+            not in (
+                "worker_parked_reason",
+                "jira_seen_comment_ids",
+                "jira_read_updated",
+                "jira_read_changelog_id",
+                "jira_worker_account_id",
+                "admin_reasons",
             )
-            summary.status = "parked"
-            original_id = summary.id
-            await session.commit()
-    handle = jira.handle
-    failing = True
-
-    async def fail_transition(request):
-        if (
-            failing
-            and request.url.path.endswith("/comment")
-            and request.method == "POST"
-            and failure == "summary_4xx"
-        ):
-            jira.requests.append(request)
-            jira.writes.append(request)
-            return httpx.Response(400, json={"errorMessages": ["Comment rejected"]})
-        if failing and request.url.path.endswith("/transitions"):
-            if failure == "unavailable_transition" and request.method == "GET":
-                return httpx.Response(200, json={"transitions": []})
-            if failure == "known_4xx" and request.method == "POST":
-                jira.requests.append(request)
-                jira.writes.append(request)
-                return httpx.Response(
-                    400, json={"errorMessages": ["Transition rejected"]}
-                )
-        return await handle(request)
-
-    monkeypatch.setattr(jira, "handle", fail_transition)
-    sender = JiraOutboxSender(
+        }
+        command = await session.get(JiraWorkerOutbox, command_id)
+        command_before = {
+            column.name: getattr(command, column.name)
+            for column in JiraWorkerOutbox.__table__.columns
+        }
+    request_id = str(uuid.uuid4())
+    first = await release(session_factory, setup, request_id)
+    reads = len(jira.requests)
+    second = await release(session_factory, setup, request_id)
+    assert first.id == second.id and len(jira.requests) == reads
+    assert first.payload["released_by"] == admin
+    assert first.payload["released_at"] == NOW.isoformat()
+    await JiraOutboxSender(
         session_factory=session_factory,
         config=config,
         clients={"acme": client_for(jira)},
         clock=lambda: NOW,
-    )
-    await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
-    await sender.run_once()
-    async with session_factory() as session:
-        original = await session.get(JiraWorkerOutbox, original_id)
-        assert original.status == "failed" and original.attempts == 1
-        children = list(
-            await session.scalars(
-                select(JiraWorkerOutbox).where(
-                    JiraWorkerOutbox.payload["failure_of"].astext == original_id
-                )
-            )
-        )
-        assert len(children) == 2
-    await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
-    async with session_factory() as session:
-        retry = await session.scalar(
-            select(JiraWorkerOutbox).where(
-                JiraWorkerOutbox.command_key.like(f"intake:{key}:0:{step}:release:%")
-            )
-        )
-        retry_id = retry.id
-        assert (
-            retry_id != original_id
-            and retry.status == "pending"
-            and retry.attempts == 1
-        )
-        assert (await session.get(JiraWorkerOutbox, original_id)).status == "cancelled"
-        for child in children:
-            assert (await session.get(JiraWorkerOutbox, child.id)).status == "cancelled"
-    await sender.run_once()
-    async with session_factory() as session:
-        retry = await session.get(JiraWorkerOutbox, retry_id)
-        ticket = await session.get(JiraWorkerTicket, key)
-        assert retry.status == "failed" and retry.attempts == 2
-        assert ticket.worker_parked_reason == f"Jira command failed: {retry_id}"
-        assert (
-            len(
-                list(
-                    await session.scalars(
-                        select(JiraWorkerOutbox).where(
-                            JiraWorkerOutbox.payload["failure_of"].astext == retry_id
-                        )
-                    )
-                )
-            )
-            == 2
-        )
-    failing = False
-    await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
-    await sender.run_once()
-    assert jira.status == "Waiting for approval" and len(jira.comments) == 1
+    ).run_once()
+    assert not jira.writes
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, key)
         assert ticket.worker_parked_reason is None
-        assert (await session.get(JiraWorkerOutbox, original_id)).attempts == 1
-        assert (await session.get(JiraWorkerOutbox, retry_id)).status == "cancelled"
-        completed = list(
-            await session.scalars(
-                select(JiraWorkerOutbox).where(
-                    JiraWorkerOutbox.command_key.like(
-                        f"intake:{key}:0:{step}:release:%"
-                    ),
-                    JiraWorkerOutbox.status == "done",
-                )
-            )
-        )
-        assert len(completed) == 1 and completed[0].attempts == 3
-
-    jira.transition("Waiting for input", "approver-account")
-    async with session_factory() as session:
-        park_ticket(await session.get(JiraWorkerTicket, key), "Human Jira action")
-        await session.commit()
-    await release(session_factory, setup, str(uuid.uuid4()), board=FakeAdminBoard())
-    async with session_factory() as session:
-        state = (await session.get(JiraWorkerTicket, key)).intake_state
-        assert (
-            state["phase"] == "intake"
-            and state["cycle"] == 1
-            and state["questions"] == 3
-        )
+        assert ticket.jira_seen_comment_ids == ["1"]
+        assert ticket.jira_read_updated == jira.updated
+        assert ticket.admin_reasons == {"custom": "Keep this reason"}
+        assert {name: getattr(ticket, name) for name in before} == before
+        command = await session.get(JiraWorkerOutbox, command_id)
+        assert {
+            name: getattr(command, name) for name in command_before
+        } == command_before
 
 
-async def test_release_failed_switch_question_preserves_delivery_route_and_attempts(
-    session_factory, monkeypatch
-):
+class FailedApprovalJira(IntakeJira):
+    async def handle(self, request):
+        if (
+            request.method == "POST"
+            and request.url.path.endswith("/transitions")
+            and json.loads(request.content)["transition"]["id"]
+            == "Waiting for approval"
+        ):
+            self.requests.append(request)
+            return httpx.Response(400, json={"errorMessages": ["Transition rejected"]})
+        return await super().handle(request)
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "human_block", "missing_command", "wrong_failure"]
+)
+async def test_release_worker_blocked_after_failed_write(session_factory, change):
     key = await start_ticket(session_factory)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("question")
-    handle = jira.handle
-
-    async def fail_question_read(request):
-        response = await handle(request)
-        if request.method == "POST" and request.url.path.endswith("/transitions"):
-            jira.read_failure = True
-        return response
-
-    monkeypatch.setattr(jira, "handle", fail_question_read)
-    await scheduler(session_factory, jira, rooms, model).run_once()
-    now = INTAKE_NOW
-    config = intake_config()
+    jira, rooms, model = FailedApprovalJira(), IntakeRooms(), ModelMock("complete")
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
     sender = JiraOutboxSender(
         session_factory=session_factory,
-        config=config,
+        config=intake_config(),
         clients={"acme": client_for(jira)},
-        clock=lambda: now,
-        rooms=rooms,
+        clock=lambda: datetime.now(NOW.tzinfo) + timedelta(seconds=1),
     )
-    for _ in range(2):
-        now += timedelta(seconds=config.jira_worker_write_backoff_seconds + 1)
+    for _ in range(3):
         await sender.run_once()
-    rows = await commands(session_factory)
-    original = rows[-1]
-    assert original.command == "intake_question" and original.status == "failed"
-    assert original.attempts == 3 and not rooms.questions
-    jira.read_failure = False
-    await release_intake_ticket(session_factory, key, jira)
-    await sender.run_once()
-    rows = await commands(session_factory)
-    assert len(rooms.questions) == 1
-    assert rooms.questions[0] == ("room-1", "card-room-1", original.payload["data"])
-    assert (
-        rows[-1].id != original.id
-        and rows[-1].status == "done"
-        and rows[-1].attempts == 4
-    )
+    assert jira.status == "BLOCKED"
     async with session_factory() as session:
-        assert (await session.get(JiraWorkerOutbox, original.id)).status == "cancelled"
+        ticket = await session.get(JiraWorkerTicket, key)
+        reason = ticket.worker_parked_reason
+        assert reason.startswith("Jira command failed: ")
+        rows = list(await session.scalars(select(JiraWorkerOutbox)))
+        failed = next(row for row in rows if row.status == "failed")
+        assert reason == f"Jira command failed: {failed.id}"
+        blocked = next(
+            row for row in rows if (row.payload or {}).get("data") == "BLOCKED"
+        )
+        assert blocked.status == "done"
+        if change == "human_block":
+            jira.transition("BLOCKED", "human-account")
+        elif change == "missing_command":
+            (await session.get(JiraWorkerOutbox, blocked.id)).status = "cancelled"
+        elif change == "wrong_failure":
+            ticket.worker_parked_reason = "Jira command failed: another-command"
+        await session.commit()
+        before = dict(ticket.intake_state)
+        generation, tokens = ticket.agent_generation, ticket.tokens_used
+    writes = len(jira.writes)
+    if change == "none":
+        await release_intake_ticket(session_factory, key, jira)
+    else:
+        with pytest.raises(ValueError, match="Unknown intake phase/status"):
+            await release_intake_ticket(session_factory, key, jira)
+    await worker._outbox.run_once()
+    assert jira.status == "BLOCKED" and len(jira.writes) == writes
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        assert ticket.intake_state == before
+        assert ticket.agent_generation == generation and ticket.tokens_used == tokens
+        assert (ticket.worker_parked_reason is None) == (change == "none")
+        assert (await session.get(JiraWorkerOutbox, failed.id)).status == "failed"
+
+
+async def test_release_deleted_comment_does_not_park_on_next_read(session_factory):
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("complete")
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    await worker.activity.read_ticket(key, force_jira=True)
+    assert jira.comments
+    deleted_ids = [str(comment["id"]) for comment in jira.comments]
+    jira.comments.clear()
+    jira.change("human-account")
+    await worker.activity.read_ticket(key, force_jira=True)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        assert ticket.worker_parked_reason
+        assert ticket.jira_seen_comment_ids == deleted_ids
+    await release_intake_ticket(session_factory, key, jira)
+    await worker.activity.read_ticket(key, force_jira=True)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        assert ticket.worker_parked_reason is None
+        assert ticket.jira_seen_comment_ids == []
+
+
+@pytest.mark.parametrize("status", ["pending", "claimed"])
+async def test_release_refuses_unfinished_commands(session_factory, status):
+    setup = await setup_release(session_factory)
+    async with session_factory() as session:
+        command = await session.get(JiraWorkerOutbox, setup[3])
+        command.status = status
+        await session.commit()
+    with pytest.raises(ValueError, match="Unfinished commands"):
+        await release(session_factory, setup, str(uuid.uuid4()))
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerTicket, setup[0])).worker_parked_reason
+        assert (await session.get(JiraWorkerOutbox, setup[3])).status == status
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["worker", "missing_actor", "wrong_source", "no_history", "unfinished_approval"],
+)
+async def test_release_refuses_unproven_approval(session_factory, change):
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("complete")
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    jira.transition("In Progress", "approver-account")
+    if change == "worker":
+        jira.histories[-1]["author"] = {"accountId": "worker-account"}
+    elif change == "missing_actor":
+        jira.histories[-1]["author"] = {}
+    elif change == "wrong_source":
+        jira.histories[-1]["items"][0]["fromString"] = "To Do"
+    elif change == "no_history":
+        jira.histories.clear()
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        park_ticket(ticket, "Human Jira action")
+        if change == "unfinished_approval":
+            approval = await session.scalar(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command_key == f"intake:{key}:0:approval"
+                )
+            )
+            approval.status = "parked"
+        await session.commit()
+    with pytest.raises(ValueError, match="Unknown intake phase/status"):
+        await release_intake_ticket(session_factory, key, jira)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, key)
+        assert ticket.worker_parked_reason == "Human Jira action"
+        assert not await session.scalar(
+            select(JiraWorkerEvent.id).where(
+                JiraWorkerEvent.event_kind == "admin_release"
+            )
+        )

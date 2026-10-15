@@ -12,11 +12,9 @@ from switch_core.gateway import jira_triggers
 from switch_core.gateway.auth import get_current_user
 from switch_core.gateway.dependencies import (
     get_config,
-    get_jira_admin_board,
     get_session,
     get_session_factory,
 )
-from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard
 from tests.switch_core.bridges.jira.test_outbox import client_for
 from tests.switch_core.bridges.jira.test_release import setup_release
 
@@ -33,7 +31,6 @@ def app_for(factory, user, config):
     app.dependency_overrides[get_config] = lambda: config
     app.dependency_overrides[get_current_user] = lambda: user
     app.dependency_overrides[get_session_factory] = lambda: factory
-    app.dependency_overrides[get_jira_admin_board] = FakeAdminBoard
     return app
 
 

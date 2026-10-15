@@ -78,8 +78,6 @@ async def enqueue_jira_command(
     payload = {
         "data": data,
         "based_updated": based_updated,
-        "based_status": ticket.status,
-        "based_context": {"summary": ticket.summary, "description": ticket.description},
         "based_changelog_id": based_changelog_id,
         "based_comment_ids": based_comment_ids,
         "reporter_account_id": ticket.reporter_account_id,

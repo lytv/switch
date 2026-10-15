@@ -132,34 +132,32 @@ An admin releases a parked ticket with
 The JSON body requires `request_id`, a UUID generated for this release request.
 Repeat the same UUID after a connection failure or a retryable conflict.
 A repeated request returns its stored release receipt without another release.
-The receipt records the admin, time, previous reason, and retried command IDs.
+The receipt records the admin, time, and previous park reason.
 
-Release reads a fresh Jira status, summary, description, comment IDs, changelog ID,
-and updated stamp. It clears the park reason and updates the existing admin card.
-Other alert reasons remain. A known unsent command resumes only when its source
-status, summary, description, and visible Jira evidence still match.
-Other stale commands, field updates, and obsolete wait commands are cancelled.
-For the current intake chain, release plans only the remaining steps against the
-fresh baseline. It includes successors cancelled when the ticket parked.
-A completed summary stays completed. A completed approval transition never replays.
-Release preserves the intake phase, cycle, question count, history, and pending replies.
-If history proves an approver rejection after completed approval, release calls the
-normal rejection path. It refuses unclear phase/status combinations.
-Failed commands replan with new IDs and retain their attempt counts.
-A question with no remaining delivery resumes the normal intake turn when replies exist.
-Release cancels obsolete wait commands and starts a fresh wait interval when
-Jira still waits for input or approval. The question count and token usage do not reset.
-Release preserves unread reporter input under the ticket's existing channel rules.
-If Jira's project or reporter differs from stored routing, release fails.
-Refresh the ticket metadata before retrying that release.
+Release clears the park reason and accepts a fresh observation baseline.
+It replaces remembered comment IDs with the IDs currently visible in Jira.
+A deleted comment therefore cannot immediately park the ticket again.
+Release queues an update to the existing admin card and keeps other alert reasons.
+It preserves the Jira status, intake state, token usage, generation, and wait timers.
+It does not retry, recreate, cancel, or otherwise change Jira commands.
+Unread reporter input remains subject to the ticket's existing channel rules.
+
+A worker BLOCKED transition after a failed Jira write is eligible when the stored
+failure command and Jira history prove that the worker made that transition.
+An approved In Progress ticket is eligible when the intake approval command
+completed and Jira history proves a human transition from Waiting for approval.
+Release changes only the park reason and observation baseline in these cases.
+Unclear phase/status combinations require separate reconciliation.
 
 Release refuses completed, cancelled, and token-limit tickets.
 A current Jira status in the Done category also prevents release.
-Release refuses unknown send outcomes and interrupted or failed turns with unknown token usage.
-Those cases require separate reconciliation, not replay. Active sends, turns,
-or admin card updates return a retryable conflict.
+Pending or claimed commands require separate reconciliation before release.
+Unknown send outcomes and interrupted or failed turns with unknown token usage
+also require reconciliation, not replay.
+Active sends, turns, or admin card updates return a retryable conflict.
 An issue stamp change during the history read also returns a conflict.
-That exact consistency check remains unchanged.
+If Jira's project or reporter differs from stored routing, release fails.
+Refresh the ticket metadata before retrying that release.
 
 No UI is part of this boundary.
 

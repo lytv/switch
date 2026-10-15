@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from switch_core.bridges.jira import routes as jira_webhook_routes
 from switch_core.bridges.jira.admin import (
-    SwitchAdminBoard,
     accept_ignored_input,
     release_parked_ticket,
 )
@@ -56,7 +55,6 @@ from switch_core.gateway.dependencies import (
     get_agent_store,
     get_card_updater,
     get_config,
-    get_jira_admin_board,
     get_jira_trigger_store,
     get_room_group_store,
     get_room_store,
@@ -684,7 +682,6 @@ async def release_worker_ticket(
     config: Annotated[SwitchConfig, Depends(get_config)],
     admin: Annotated[User, Depends(require_admin)],
     session_factory: Annotated[Any, Depends(get_session_factory)],
-    board: Annotated[SwitchAdminBoard, Depends(get_jira_admin_board)],
 ) -> JiraWorkerReleaseResponse:
     ticket = await session.scalar(
         select(JiraWorkerTicket).where(
@@ -703,7 +700,6 @@ async def release_worker_ticket(
             session_factory,
             config=config,
             client=client,
-            board=board,
             ticket_id=ticket.id,
             request_id=str(req.request_id),
             admin_user_id=admin.id,

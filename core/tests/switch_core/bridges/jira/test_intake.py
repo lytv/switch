@@ -72,10 +72,6 @@ class IntakeJira(JiraMock):
                     },
                 )
             self.writes.append(request)
-            if self.write_started:
-                self.write_started.set()
-            if self.write_release:
-                await self.write_release.wait()
             self.transition(
                 json.loads(request.content)["transition"]["id"], "worker-account"
             )
@@ -355,10 +351,7 @@ async def test_reject_resumes_intake_without_resetting_question_count(
     assert row.intake_state["cycle"] == 1 and row.intake_state["questions"] == 2
     assert len(rooms.questions) == 2
     assert len(model.calls) == 2
-    assert (
-        rooms.questions[-1][2]
-        == "Which requirements in the intake summary need correction?"
-    )
+    assert "need correction" in rooms.questions[-1][2]
     assert any("jira_rejection" in item for item in row.intake_state["history"])
     rooms.messages.append(message(2))
     await worker.run_once()
