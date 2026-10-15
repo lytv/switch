@@ -235,7 +235,11 @@ def test_park_returns_preserve_all_reporter_evidence(case, other_id):
         changelog_id = "missing"
     elif case in ("changelog", "initial_history"):
         version["histories"] = [
-            {"id": "1", "created": stamp(10_000), "author": {"accountId": "other-account"}}
+            {
+                "id": "1",
+                "created": stamp(10_000),
+                "author": {"accountId": "other-account"},
+            }
         ]
         version["changelog_id"] = "1"
     elif case == "stamp_mismatch":

@@ -5,7 +5,9 @@ the same way: comment newness only by ID, worker items ignored, new reporter
 IDs recorded, other authors or non-worker changelog rows park. A stamp move
 with no new ID and no new changelog row is attributed through the comments
 already returned in the same read (updated/updateAuthor, no new state), even alongside new IDs
-or changelog rows; only a still-unexplained move parks.
+or changelog rows; only a still-unexplained move parks. A forward stamp gap up
+to one second is accepted only when the latest attributable item is a worker-owned
+comment creation or edit; all other items keep exact stamp attribution.
 """
 
 from __future__ import annotations
