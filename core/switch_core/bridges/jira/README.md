@@ -149,6 +149,7 @@ completed and Jira history proves a human transition from Waiting for approval.
 Release changes only the park reason and observation baseline in these cases.
 Unclear phase/status combinations require separate reconciliation.
 
+Release refuses a ticket that is not parked.
 Release refuses completed, cancelled, and token-limit tickets.
 A current Jira status in the Done category also prevents release.
 Pending or claimed commands require separate reconciliation before release.
