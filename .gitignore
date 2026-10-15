@@ -1,4 +1,5 @@
 # custom
+/internal/
 runfiles
 connectors/claude-code-plugin/state/
 dump/

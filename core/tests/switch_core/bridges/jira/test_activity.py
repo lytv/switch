@@ -1173,6 +1173,114 @@ async def test_switch_channel_old_comment_is_baseline_across_reads(
     assert row.agent_state == "parked"
 
 
+@pytest.mark.parametrize("mapped", [False, True])
+async def test_deleted_comment_preserves_same_read_reporter_event(
+    session_factory, mapped
+) -> None:
+    key = await seed(session_factory, mapped=mapped)
+    jira = JiraMock()
+    jira.comments.append(_same_stamp_comment("3", "worker-account", BASE))
+    reader = activity(session_factory, jira, ThreadRooms())
+    assert await reader.read_ticket(key, force_jira=True)
+    assert (await ticket(session_factory, key)).jira_seen_comment_ids == ["3"]
+    jira.comments = [_same_stamp_comment("7", "reporter-account", BASE)]
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.agent_state == "parked"
+    assert row.jira_seen_comment_ids == ["3", "7"]
+    recorded = await events(session_factory)
+    assert len(recorded) == 1
+    assert recorded[0].event_kind == ("ignored_input" if mapped else "jira_comment")
+    assert recorded[0].payload["reporter_input"] is (not mapped)
+    assert ":7:" in recorded[0].idempotency_key
+    async with session_factory() as session:
+        notices = list((await session.scalars(select(JiraWorkerOutbox))).all())
+    assert len(notices) == (1 if mapped else 0)
+    assert await reader.read_ticket(key, force_jira=True)
+    assert len(await events(session_factory)) == 1
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "deleted",
+        "new_comment",
+        "missing_history",
+        "changelog",
+        "seen_edit_before",
+        "seen_edit_after",
+        "stamp_mismatch",
+    ],
+)
+async def test_park_preserves_same_read_reporter_edit(
+    session_factory, mapped, case
+) -> None:
+    key = await seed(session_factory, mapped=mapped)
+    jira = JiraMock()
+    jira.comments = [
+        _same_stamp_comment("3", "worker-account", BASE),
+        _same_stamp_comment("4", "reporter-account", BASE),
+    ]
+    other_id = "1" if case == "seen_edit_before" else "8"
+    if case.startswith("seen_edit"):
+        jira.comments.append(_same_stamp_comment(other_id, "worker-account", BASE))
+    if case == "missing_history":
+        jira.histories = [
+            {"id": "1", "created": BASE, "author": {"accountId": "worker-account"}}
+        ]
+    reader = activity(session_factory, jira, ThreadRooms())
+    assert await reader.read_ticket(key, force_jira=True)
+    assert await events(session_factory) == []
+    later = _edited_later_stamp()
+    jira.updated = jira.comments[1]["updated"] = later
+    jira.comments.append(_same_stamp_comment("7", "reporter-account", later))
+    if case == "deleted":
+        jira.comments.pop(0)
+    elif case == "new_comment":
+        jira.comments.append(_same_stamp_comment("1", "human-account", later))
+    elif case == "missing_history":
+        jira.histories = []
+    elif case == "changelog":
+        jira.histories.append(
+            {"id": "1", "created": later, "author": {"accountId": "human-account"}}
+        )
+    elif case.startswith("seen_edit"):
+        jira.comments[2]["updated"] = later
+        jira.comments[2]["updateAuthor"] = {"accountId": "human-account"}
+    else:
+        jira.updated = (
+            datetime.fromisoformat(later) + timedelta(milliseconds=52)
+        ).isoformat()
+    assert await reader.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == (
+        "Jira changelog baseline is missing"
+        if case == "missing_history"
+        else "Human Jira action"
+    )
+    assert row.agent_state == "parked"
+    assert row.jira_read_updated == jira.updated
+    recorded = [
+        event
+        for event in await events(session_factory)
+        if event.payload["untrusted_data"]["id"] in ("4", "7")
+    ]
+    assert len(recorded) == 2
+    assert all(
+        event.event_kind == ("ignored_input" if mapped else "jira_comment")
+        and event.payload["reporter_input"] is (not mapped)
+        for event in recorded
+    )
+    async with session_factory() as session:
+        notices = list((await session.scalars(select(JiraWorkerOutbox))).all())
+    assert len(notices) == (1 if mapped else 0)
+    count = len(await events(session_factory))
+    assert await reader.read_ticket(key, force_jira=True)
+    assert len(await events(session_factory)) == count
+
+
 async def test_same_stamp_reporter_wakes_while_human_parks(session_factory) -> None:
     key = await seed(session_factory, mapped=False)
     jira = JiraMock()
