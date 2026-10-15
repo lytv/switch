@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -1123,6 +1124,16 @@ class JiraRotateSecretResponse(BaseModel):
     secret: str
     webhook_url: str
     note: str
+
+
+class JiraWorkerReleaseRequest(BaseModel):
+    request_id: UUID
+
+
+class JiraWorkerReleaseResponse(BaseModel):
+    id: str
+    issue_key: str
+    payload: dict[str, Any]
 
 
 class JiraWorkerIdentityMappingRequest(BaseModel):

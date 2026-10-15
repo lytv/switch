@@ -127,6 +127,39 @@ An admin accepts a stored `ignored_input` event with
 `POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new
 `explicit_input` event. The old event is not rewritten.
 
+An admin releases a parked ticket with
+`POST /jira-triggers/worker/tickets/{issue_key}/release?instance={instance}`.
+The JSON body requires `request_id`, a UUID generated for this release request.
+Repeat the same UUID after a connection failure or a retryable conflict.
+A repeated request returns its stored release receipt without another release.
+The receipt records the admin, time, and previous park reason.
+
+Release clears the park reason and accepts a fresh observation baseline.
+It replaces remembered comment IDs with the IDs currently visible in Jira.
+A deleted comment therefore cannot immediately park the ticket again.
+Release queues an update to the existing admin card and keeps other alert reasons.
+It preserves the Jira status, intake state, token usage, generation, and wait timers.
+It does not retry, recreate, cancel, or otherwise change Jira commands.
+Unread reporter input remains subject to the ticket's existing channel rules.
+
+A worker BLOCKED transition after a failed Jira write is eligible when the stored
+failure command and Jira history prove that the worker made that transition.
+An approved In Progress ticket is eligible when the intake approval command
+completed and Jira history proves a human transition from Waiting for approval.
+Release changes only the park reason and observation baseline in these cases.
+Unclear phase/status combinations require separate reconciliation.
+
+Release refuses a ticket that is not parked.
+Release refuses completed, cancelled, and token-limit tickets.
+A current Jira status in the Done category also prevents release.
+Pending or claimed commands require separate reconciliation before release.
+Unknown send outcomes and interrupted or failed turns with unknown token usage
+also require reconciliation, not replay.
+Active sends, turns, or admin card updates return a retryable conflict.
+An issue stamp change during the history read also returns a conflict.
+If Jira's project or reporter differs from stored routing, release fails.
+Refresh the ticket metadata before retrying that release.
+
 No UI is part of this boundary.
 
 ## One-turn integration

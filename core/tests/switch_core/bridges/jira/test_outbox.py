@@ -134,7 +134,32 @@ class JiraMock:
                 self.issue_read_started.set()
                 if self.issue_read_release is not None:
                     await self.issue_read_release.wait()
-            return httpx.Response(200, json={"fields": {"updated": self.updated}})
+            return httpx.Response(
+                200,
+                json={
+                    "fields": {
+                        "updated": self.updated,
+                        "status": {
+                            "name": self.status,
+                            "statusCategory": {
+                                "key": self.fields.get(
+                                    "status_category",
+                                    "done"
+                                    if self.status.casefold()
+                                    in ("done", "cancelled", "canceled")
+                                    else "indeterminate",
+                                )
+                            },
+                        },
+                        "summary": self.fields.get("summary", "Current Jira summary"),
+                        "description": self.fields.get("description"),
+                        "project": self.fields.get("project", {"key": "KAN"}),
+                        "reporter": self.fields.get(
+                            "reporter", {"accountId": "reporter-account"}
+                        ),
+                    }
+                },
+            )
         self.writes.append(request)
         if self.write_started:
             self.write_started.set()

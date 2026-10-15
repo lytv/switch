@@ -7,9 +7,10 @@ message. A disabled project is not read or written.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import JSON, and_, delete, func, or_, select, text
@@ -23,14 +24,20 @@ from switch_core.bridges.jira.activity import (
     request_wake,
     ticket_turn_lock,
 )
+from switch_core.bridges.jira.observe import _stamp, comment_actor
 from switch_core.bridges.jira.outbox import (
+    INTERRUPTED_TURN,
+    TOKEN_LIMIT,
+    TURN_FAILED,
     WAIT_COMMAND_PREFIXES,
     enqueue_jira_command,
     needs_person,
+    read_jira_version,
 )
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
+    JiraWorkerJob,
     JiraWorkerOutbox,
     JiraWorkerTicket,
     Message,
@@ -39,6 +46,9 @@ from switch_core.db.models import (
 )
 from switch_core.db.stores.agent_store import AgentStore
 from switch_core.room_service import RoomCreateConfig, RoomService
+
+if TYPE_CHECKING:
+    from switch_core.bridges.jira.worker import JiraPollClient
 
 logger = logging.getLogger(__name__)
 
@@ -510,6 +520,296 @@ async def set_admin_card_reason(
         ticket_id=ticket_id,
         now=now,
     )
+
+
+async def release_parked_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    config: SwitchConfig,
+    client: JiraPollClient,
+    ticket_id: str,
+    request_id: str,
+    admin_user_id: str,
+    now: datetime,
+) -> JiraWorkerEvent:
+    """Clear a park against a fresh baseline without replaying commands."""
+    request_id = str(uuid.UUID(request_id))
+    if now.tzinfo is None:
+        raise ValueError("release time requires a timezone")
+    engine = cast(AsyncEngine, session_factory.kw["bind"])
+    async with ticket_turn_lock(engine, ticket_id) as locked:
+        if not locked:
+            raise BlockingIOError("Ticket turn is active; retry release later")
+        async with session_factory() as session:
+            admin = await session.get(User, admin_user_id)
+            if admin is None or admin.role != "admin":
+                raise PermissionError("Only an admin may release a parked ticket")
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            if ticket is None:
+                raise ValueError("ticket not found")
+            if not _enabled(config, ticket):
+                raise ValueError("project is not enabled")
+            for lock_key, activity in (
+                (f"jira-outbox:{ticket.instance}:{ticket.issue_key}", "send"),
+                (f"jira-turn:admin-card:{ticket_id}", "admin card update"),
+            ):
+                locked = await session.scalar(
+                    text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": lock_key},
+                )
+                if not locked:
+                    raise BlockingIOError(
+                        f"Ticket {activity} is active; retry release later"
+                    )
+            ticket = await session.get(
+                JiraWorkerTicket,
+                ticket_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
+            assert ticket is not None
+            key = f"admin-release:{ticket.id}:{request_id}"
+            receipt = await session.scalar(
+                select(JiraWorkerEvent).where(
+                    JiraWorkerEvent.instance == ticket.instance,
+                    JiraWorkerEvent.idempotency_key == key,
+                )
+            )
+            if receipt is not None:
+                if (
+                    receipt.event_kind != "admin_release"
+                    or receipt.issue_key != ticket.issue_key
+                ):
+                    raise ValueError("release request key belongs to another event")
+                if (receipt.payload or {}).get("released_by") != admin_user_id:
+                    raise ValueError("release request belongs to another admin")
+            else:
+                reason = ticket.worker_parked_reason
+                if reason:
+                    if reason in (TOKEN_LIMIT, "Jira ticket completed or cancelled"):
+                        raise ValueError(
+                            "Terminal or token-limit tickets cannot be released"
+                        )
+                    if (
+                        ticket.tokens_used
+                        >= config.jira_worker_limits.tokens_per_ticket
+                    ):
+                        raise ValueError("Ticket token limit still applies")
+                    last_release = (
+                        select(func.max(JiraWorkerEvent.received_at))
+                        .where(
+                            JiraWorkerEvent.instance == ticket.instance,
+                            JiraWorkerEvent.issue_key == ticket.issue_key,
+                            JiraWorkerEvent.event_kind == "admin_release",
+                        )
+                        .scalar_subquery()
+                    )
+                    unknown_turn = await session.scalar(
+                        select(JiraWorkerJob.id)
+                        .where(
+                            JiraWorkerJob.payload["ticket_id"].astext == ticket.id,
+                            JiraWorkerJob.status == "error",
+                            JiraWorkerJob.error.in_((INTERRUPTED_TURN, TURN_FAILED)),
+                            or_(
+                                last_release.is_(None),
+                                func.coalesce(
+                                    JiraWorkerJob.completed_at,
+                                    JiraWorkerJob.claimed_at,
+                                    JiraWorkerJob.due_at,
+                                )
+                                > last_release,
+                            ),
+                        )
+                        .limit(1)
+                    )
+                    if reason in (INTERRUPTED_TURN, TURN_FAILED) or unknown_turn:
+                        raise ValueError(
+                            "Unknown turn outcome and token usage require reconciliation"
+                        )
+                    rows = list(
+                        (
+                            await session.scalars(
+                                select(JiraWorkerOutbox)
+                                .where(
+                                    JiraWorkerOutbox.instance == ticket.instance,
+                                    JiraWorkerOutbox.issue_key == ticket.issue_key,
+                                    or_(
+                                        JiraWorkerOutbox.channel == "jira",
+                                        JiraWorkerOutbox.command == "intake_question",
+                                    ),
+                                )
+                                .with_for_update()
+                            )
+                        ).all()
+                    )
+                    if any(row.status in ("sending", "uncertain") for row in rows):
+                        raise ValueError(
+                            "Unknown prior send outcome requires reconciliation; no replay"
+                        )
+                    if any(row.status in ("pending", "claimed") for row in rows):
+                        raise ValueError(
+                            "Unfinished commands require reconciliation before release"
+                        )
+                    version = await read_jira_version(client, ticket.issue_key)
+                    if ticket.jira_read_updated and _stamp(version["updated"]) < _stamp(
+                        ticket.jira_read_updated
+                    ):
+                        raise ValueError(
+                            "Jira version is older than the accepted baseline"
+                        )
+                    status = version["fields"]["status"]["name"]
+                    if (
+                        is_terminal_ticket_status(status)
+                        or version["fields"]["status"]["statusCategory"]["key"]
+                        == "done"
+                    ):
+                        raise ValueError("Jira ticket is completed or cancelled")
+                    reporter = version["fields"].get("reporter") or {}
+                    if (
+                        version["fields"]["project"]["key"] != ticket.project_key
+                        or reporter.get("accountId", "") != ticket.reporter_account_id
+                    ):
+                        raise ValueError(
+                            "Jira project or reporter changed; refresh ticket before release"
+                        )
+                    worker_account = (
+                        await client.request("GET", "/rest/api/3/myself")
+                    ).json()["accountId"]
+                    if not isinstance(worker_account, str) or not worker_account:
+                        raise ValueError("Jira worker accountId is required")
+                    state = ticket.intake_state or {}
+                    phase = state.get("phase", "intake")
+                    statuses = config.jira_worker_statuses
+                    transitions = [
+                        (entry.get("author", {}).get("accountId"), item)
+                        for entry in version["histories"]
+                        for item in entry.get("items", [])
+                        if item.get("field") == "status"
+                    ]
+                    actor, transition = transitions[-1] if transitions else (None, {})
+                    approval_done = any(
+                        row.command_key
+                        == f"intake:{ticket.id}:{state.get('cycle', 0)}:approval"
+                        and row.command == "transition"
+                        and row.status == "done"
+                        and (row.payload or {}).get("data")
+                        == statuses.waiting_for_approval
+                        for row in rows
+                    )
+                    worker_blocked = (
+                        status == statuses.blocked
+                        and actor == worker_account
+                        and transition.get("toString") == statuses.blocked
+                        and any(
+                            row.status == "failed"
+                            and reason == f"Jira command failed: {row.id}"
+                            and not (row.payload or {}).get("failure_of")
+                            for row in rows
+                        )
+                        and any(
+                            row.command == "transition"
+                            and row.status == "done"
+                            and (row.payload or {}).get("data") == statuses.blocked
+                            and reason
+                            == "Jira command failed: "
+                            + str((row.payload or {}).get("failure_of", ""))
+                            for row in rows
+                        )
+                    )
+                    approved = (
+                        phase == "approval"
+                        and approval_done
+                        and status == statuses.in_progress
+                        and actor
+                        and actor != worker_account
+                        and transition.get("fromString")
+                        == statuses.waiting_for_approval
+                        and transition.get("toString") == statuses.in_progress
+                    )
+                    if phase not in ("intake", "question", "limit", "approval") or not (
+                        (
+                            status in (statuses.to_do, statuses.waiting_for_input)
+                            and not approval_done
+                        )
+                        or (
+                            phase == "approval"
+                            and status == statuses.waiting_for_approval
+                        )
+                        or worker_blocked
+                        or approved
+                    ):
+                        raise ValueError(
+                            "Unknown intake phase/status combination; reconcile before release"
+                        )
+                    base_stamp = (
+                        _stamp(ticket.jira_read_updated)
+                        if ticket.jira_read_updated
+                        else ticket.last_event_at
+                    )
+                    for comment in version["comments"]:
+                        new = (
+                            str(comment["id"]) not in ticket.jira_seen_comment_ids
+                            if ticket.jira_seen_comment_ids is not None
+                            else _stamp(comment["created"]) > base_stamp
+                        )
+                        if (
+                            ticket.reporter_account_id != worker_account
+                            and comment_actor(comment) == ticket.reporter_account_id
+                            and (new or _stamp(comment["updated"]) > base_stamp)
+                        ):
+                            await record_event(
+                                session,
+                                instance=ticket.instance,
+                                issue_key=ticket.issue_key,
+                                project_key=ticket.project_key,
+                                idempotency_key=f"jira-comment:{ticket.issue_key}:{comment['id']}:{comment['updated']}",
+                                event_kind="jira_comment"
+                                if ticket.wait_channel == "jira_comments"
+                                else "ignored_input",
+                                webhook_event="worker:jira_comment",
+                                payload={
+                                    "untrusted_data": comment,
+                                    "reporter_input": ticket.wait_channel
+                                    == "jira_comments",
+                                    **(
+                                        {"wrong_place_type": "jira_answer"}
+                                        if ticket.wait_channel != "jira_comments"
+                                        else {}
+                                    ),
+                                },
+                            )
+                    ticket.jira_worker_account_id = worker_account
+                    ticket.jira_read_updated = version["updated"]
+                    ticket.jira_seen_comment_ids = sorted(
+                        str(c["id"]) for c in version["comments"]
+                    )
+                    ticket.jira_read_changelog_id = version["changelog_id"]
+                    ticket.worker_parked_reason = None
+                    previous = set(ticket.admin_reasons or {})
+                    reasons = dict(ticket.admin_reasons or {})
+                    reasons.pop("parked", None)
+                    ticket.admin_reasons = reasons or None
+                    await _record_reason_alerts(session, ticket, previous)
+                    await enqueue_admin_card_follow_up(session, ticket)
+                else:
+                    raise ValueError("ticket is not parked")
+                receipt = JiraWorkerEvent(
+                    instance=ticket.instance,
+                    idempotency_key=key,
+                    issue_key=ticket.issue_key,
+                    project_key=ticket.project_key,
+                    event_kind="admin_release",
+                    webhook_event="worker:admin_release",
+                    consumed=True,
+                    payload={
+                        "released_by": admin_user_id,
+                        "released_at": now.isoformat(),
+                        "previous_reason": reason,
+                    },
+                )
+                session.add(receipt)
+                await session.commit()
+    return receipt
 
 
 async def accept_ignored_input(

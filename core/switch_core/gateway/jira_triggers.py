@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import logging
 import secrets
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from urllib.parse import urljoin
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from switch_core.bridges.jira import routes as jira_webhook_routes
-from switch_core.bridges.jira.admin import accept_ignored_input
+from switch_core.bridges.jira.admin import (
+    accept_ignored_input,
+    release_parked_ticket,
+)
 from switch_core.bridges.jira.matching import explain_match
+from switch_core.bridges.jira.outbox import HumanChange
 from switch_core.bridges.jira.parse import (
     JiraPayloadError,
     ParsedJiraEvent,
@@ -25,6 +31,7 @@ from switch_core.bridges.jira.rooms import (
 )
 from switch_core.bridges.jira.template import MESSAGE_TOKENS, render_template
 from switch_core.bridges.jira.worker import (
+    build_poll_clients,
     list_identity_mappings,
     remove_identity_mapping,
     set_identity_mapping,
@@ -71,6 +78,8 @@ from switch_core.gateway.schemas import (
     JiraWorkerAcceptedInputResponse,
     JiraWorkerIdentityMappingRequest,
     JiraWorkerIdentityMappingResponse,
+    JiraWorkerReleaseRequest,
+    JiraWorkerReleaseResponse,
     RevealKeyResponse,
 )
 
@@ -662,6 +671,55 @@ async def delete_worker_identity_mapping(
         config=config,
     )
     return Response(status_code=204)
+
+
+@router.post("/worker/tickets/{issue_key}/release")
+async def release_worker_ticket(
+    issue_key: str,
+    req: JiraWorkerReleaseRequest,
+    instance: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    admin: Annotated[User, Depends(require_admin)],
+    session_factory: Annotated[Any, Depends(get_session_factory)],
+) -> JiraWorkerReleaseResponse:
+    ticket = await session.scalar(
+        select(JiraWorkerTicket).where(
+            JiraWorkerTicket.instance == instance.strip(),
+            JiraWorkerTicket.issue_key == issue_key.strip(),
+        )
+    )
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket not found")
+    clients = build_poll_clients(config)
+    try:
+        client = clients.get(ticket.instance)
+        if client is None:
+            raise HTTPException(status_code=503, detail="Jira read credentials missing")
+        receipt = await release_parked_ticket(
+            session_factory,
+            config=config,
+            client=client,
+            ticket_id=ticket.id,
+            request_id=str(req.request_id),
+            admin_user_id=admin.id,
+            now=datetime.now(UTC),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (BlockingIOError, HumanChange) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Jira release read failed") from exc
+    finally:
+        for client in clients.values():
+            await client.aclose()
+    assert receipt.payload is not None
+    return JiraWorkerReleaseResponse(
+        id=receipt.id, issue_key=receipt.issue_key, payload=receipt.payload
+    )
 
 
 @router.post("/worker/inputs/{event_id}/accept")
