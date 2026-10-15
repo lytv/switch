@@ -791,6 +791,8 @@ async def release_parked_ticket(
                     ticket.admin_reasons = reasons or None
                     await _record_reason_alerts(session, ticket, previous)
                     await enqueue_admin_card_follow_up(session, ticket)
+                else:
+                    raise ValueError("ticket is not parked")
                 receipt = JiraWorkerEvent(
                     instance=ticket.instance,
                     idempotency_key=key,
