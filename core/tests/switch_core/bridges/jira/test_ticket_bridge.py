@@ -173,6 +173,7 @@ async def ticket_bridge(session_factory):
         ensure_channel_subscriptions=AsyncMock(),
         add_agents_to_channel=AsyncMock(),
         add_users_to_channel=AsyncMock(return_value=[]),
+        retain_channel_members=AsyncMock(),
     )
     bridge = SimpleNamespace(
         adapter=adapter,
@@ -773,7 +774,7 @@ async def test_history_restoration_reuses_messages_after_interrupted_send(
         assert history.status == "done"
 
 
-async def test_claim_and_release_retry_access_without_revoking_channel_members(
+async def test_claim_and_release_reconcile_channel_members(
     session_factory, ticket_bridge
 ):
     rooms, service, adapter, _ = ticket_bridge
@@ -831,6 +832,9 @@ async def test_claim_and_release_retry_access_without_revoking_channel_members(
         )
     assert await scheduler.sweep_ticket_rooms() == 1
     assert adapter.add_users_to_channel.await_args.args[2] == ["ext-second"]
+    adapter.retain_channel_members.assert_awaited_with(
+        "private-channel", {"ext-second"}
+    )
     adapter.create_channel.assert_awaited_once()
     async with session_factory() as session:
         assert (

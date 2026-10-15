@@ -181,13 +181,16 @@ async def enqueue_reporter_access_sync(
     if not scope:
         return
     tickets = await session.scalars(
-        select(JiraWorkerTicket).where(
-            or_(*scope),
-            JiraWorkerTicket.reporter_switch_user_id == switch_user_id,
-            func.lower(func.trim(JiraWorkerTicket.status)).not_in(
-                _TERMINAL_TICKET_STATUSES
+        select(JiraWorkerTicket)
+        .join(
+            JiraWorkerIdentity,
+            and_(
+                JiraWorkerIdentity.instance == JiraWorkerTicket.instance,
+                JiraWorkerIdentity.jira_account_id
+                == JiraWorkerTicket.reporter_account_id,
             ),
         )
+        .where(or_(*scope), JiraWorkerIdentity.switch_user_id == switch_user_id)
     )
     for ticket in tickets:
         await _enqueue_room_sync(session, ticket)

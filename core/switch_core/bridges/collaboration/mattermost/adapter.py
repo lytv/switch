@@ -968,6 +968,54 @@ class MattermostAdapter(CollaborationAdapter):
                 failed.append(external_id)
         return failed
 
+    async def retain_channel_members(
+        self, channel_id: str, user_external_ids: set[str]
+    ) -> None:
+        if not self._admin_driver or not self._main_loop:
+            raise RuntimeError(
+                "Cannot revoke channel members: Mattermost not connected"
+            )
+        driver = self._admin_driver
+        loop = self._main_loop
+        channel = await loop.run_in_executor(
+            None, driver.channels.get_channel, channel_id
+        )
+        if channel["type"] != "P":
+            raise ValueError("Membership revocation requires a private channel")
+        members = []
+        page = 0
+        while True:
+            batch = await loop.run_in_executor(
+                None,
+                driver.channels.get_channel_members,
+                channel_id,
+                {"page": page, "per_page": 200},
+            )
+            members.extend(batch)
+            if len(batch) < 200:
+                break
+            page += 1
+        for member in members:
+            user_id = member["user_id"]
+            if (
+                user_id in user_external_ids
+                or user_id in self._bridge_bot_ids
+                or user_id == self._admin_user_id
+                or "channel_admin" in member["roles"].split()
+            ):
+                continue
+            user = await loop.run_in_executor(None, driver.users.get_user, user_id)
+            if user.get("is_bot") or "system_admin" in user["roles"].split():
+                continue
+            team_member = await loop.run_in_executor(
+                None, driver.teams.get_team_member, channel["team_id"], user_id
+            )
+            if "team_admin" in team_member["roles"].split():
+                continue
+            await loop.run_in_executor(
+                None, driver.channels.remove_channel_member, channel_id, user_id
+            )
+
     async def get_external_user_id(self, username: str) -> str | None:
         """Resolve a platform username to its current user id, or None if the
         user does not exist. Used by the homeserver cutover to rebind a puppet's

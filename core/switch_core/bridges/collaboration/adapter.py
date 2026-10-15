@@ -785,6 +785,12 @@ class CollaborationAdapter(ABC):
         """
         ...
 
+    async def retain_channel_members(
+        self, channel_id: str, user_external_ids: set[str]
+    ) -> None:
+        """Remove unauthorized people, but retain platform admins and bots."""
+        raise NotImplementedError("This bridge cannot revoke channel membership")
+
     @abstractmethod
     async def create_agent_identity(
         self, agent_name: str, agent_description: str

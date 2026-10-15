@@ -23,7 +23,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -548,6 +548,7 @@ async def _reconcile_ticket_room(
                 continue
             body = await _render_card(session, rooms, ticket, owner_id)
         await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        history = None
         if not is_terminal_ticket_status(ticket.status):
             history_key = (
                 f"ticket-channel-history:{ticket.id}:{room_id}:{ticket.card_event_id}"
@@ -590,33 +591,33 @@ async def _reconcile_ticket_room(
                 if not await _ensure_owner(session, rooms, ticket, room_id, owner_id):
                     continue
                 body = await _render_card(session, rooms, ticket, owner_id)
-            reasons = dict(ticket.admin_reasons or {})
-            try:
-                await rooms.ensure_reporter_access(room_id, owner_id)
-            except Exception as exc:
-                logger.warning(
-                    "Jira reporter access failed for %s: %s",
-                    ticket.issue_key,
-                    exc,
-                    exc_info=True,
+        reasons = dict(ticket.admin_reasons or {})
+        try:
+            await rooms.ensure_reporter_access(room_id, owner_id)
+        except Exception as exc:
+            logger.warning(
+                "Jira reporter access failed for %s: %s",
+                ticket.issue_key,
+                exc,
+                exc_info=True,
+            )
+            reasons[REPORTER_ACCESS_REASON] = str(exc)
+        else:
+            reasons.pop(REPORTER_ACCESS_REASON, None)
+        if reasons != (ticket.admin_reasons or {}):
+            ticket.admin_reasons = reasons or None
+            await enqueue_admin_card_follow_up(session, ticket)
+        if (
+            history is not None
+            and history.status == "pending"
+            and await rooms.is_bridged(room_id)
+        ):
+            await _restore_ticket_history(session, rooms, ticket, history)
+            if cards is not None and (history.payload or {})["body"] != body:
+                assert ticket.card_event_id is not None
+                await cards.update_card(
+                    room_id, event_id=ticket.card_event_id, body=body
                 )
-                reasons[REPORTER_ACCESS_REASON] = str(exc)
-            else:
-                reasons.pop(REPORTER_ACCESS_REASON, None)
-            if reasons != (ticket.admin_reasons or {}):
-                ticket.admin_reasons = reasons or None
-                await enqueue_admin_card_follow_up(session, ticket)
-            if (
-                history is not None
-                and history.status == "pending"
-                and await rooms.is_bridged(room_id)
-            ):
-                await _restore_ticket_history(session, rooms, ticket, history)
-                if cards is not None and (history.payload or {})["body"] != body:
-                    assert ticket.card_event_id is not None
-                    await cards.update_card(
-                        room_id, event_id=ticket.card_event_id, body=body
-                    )
         if is_terminal_ticket_status(ticket.status):
             ticket.room_claimed = False
             ticket.queue_reason = None
@@ -794,7 +795,8 @@ class SwitchTicketRooms:
             room = await session.get(Room, room_id)
             if room is None:
                 raise ValueError(f"Room not found: {room_id}")
-            if room.archived_at is not None:
+            archived = room.archived_at is not None
+            if archived and room.external_channel_id is None:
                 return
             bridge_id = room.bridge_id
             if bridge_id is None:
@@ -806,7 +808,40 @@ class SwitchTicketRooms:
             await self._rooms.link_bridge_to_room(
                 room_id, bridge_id, "channel_private", invite_default_member=False
             )
-        if user_id is not None:
+        async with self._sessions() as session:
+            room = await session.get(Room, room_id)
+            if (
+                room is None
+                or room.channel_type != "channel_private"
+                or room.external_channel_id is None
+            ):
+                raise ValueError("Ticket access requires a private channel")
+            allowed = set(
+                await session.scalars(
+                    select(ExternalUser.external_user_id)
+                    .join(
+                        ExternalUserClaim,
+                        ExternalUserClaim.external_user_id == ExternalUser.id,
+                    )
+                    .join(User, User.id == ExternalUserClaim.user_id)
+                    .where(
+                        ExternalUser.bridge_id == bridge_id,
+                        or_(User.id == user_id, User.role == "admin"),
+                    )
+                )
+            )
+        bridge = self._rooms._collab_lifecycle.get(bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not running: {bridge_id}")
+        try:
+            await bridge.adapter.retain_channel_members(
+                room.external_channel_id, allowed
+            )
+        except NotImplementedError:
+            if user_id is not None and not archived:
+                await self._rooms.add_claimed_user_to_room(room_id, user_id)
+            raise
+        if user_id is not None and not archived:
             await self._rooms.add_claimed_user_to_room(room_id, user_id)
 
     async def read_context(self, room_id: str, *, after_seq: int) -> dict[str, Any]:

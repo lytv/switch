@@ -25,8 +25,11 @@ bridge. Switch read and write visibility also stays private. The mapped reporter
 owns the room; admins retain access through Switch authorization. The worker
 invites every account that the reporter claims on that bridge, and no other
 people. It does not invite Mattermost's configured default member. Mapping and
-claim changes do not revoke previous channel memberships; an operator must
-remove obsolete members on the collaboration platform.
+claim changes automatically remove unauthorized people from private Mattermost
+ticket channels, including archived channels. The current reporter's claimed
+accounts, Switch admins' claimed accounts, platform admins, and bots retain
+membership. Other bridges report unsupported membership revocation on the admin
+card.
 
 Room sync attaches a private channel to an existing unbridged ticket room.
 Repeated sync and worker restarts reuse that channel. The worker reposts the
