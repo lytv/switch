@@ -851,6 +851,20 @@ class MattermostAdapter(CollaborationAdapter):
         )
         return self._to_channel_type(channel.get("type", ""))
 
+    async def close_channel(self, channel_id: str) -> None:
+        if not self._admin_driver or not self._main_loop:
+            raise RuntimeError("Cannot close channel: Mattermost client not connected")
+        await self._main_loop.run_in_executor(
+            None, self._admin_driver.channels.delete_channel, channel_id
+        )
+
+    async def reopen_channel(self, channel_id: str) -> None:
+        if not self._admin_driver or not self._main_loop:
+            raise RuntimeError("Cannot reopen channel: Mattermost client not connected")
+        await self._main_loop.run_in_executor(
+            None, self._admin_driver.channels.restore_channel, channel_id
+        )
+
     async def channel_deeplink(self, external_channel_id: str) -> str | None:
         """`mattermost://<host>/<team>/channels/<name>` — opens the channel in
         the Mattermost desktop app. Mattermost channel URLs key off the channel

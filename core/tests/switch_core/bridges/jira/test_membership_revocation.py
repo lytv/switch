@@ -91,11 +91,15 @@ async def test_mapping_changes_revoke_old_reporter_accounts(
         session_factory=session_factory, config=config, ticket_rooms=rooms
     )
     assert await scheduler.sweep_ticket_rooms() == 1
-    expected = {"ext-second"} if remove_mapping else {"ext-second", "ext-other"}
-    adapter.retain_channel_members.assert_awaited_with("private-channel", expected)
-    channels.remove_channel_member.assert_called_once_with(
-        "private-channel", "ext-first"
-    )
+    if terminal:
+        adapter.retain_channel_members.assert_not_awaited()
+        channels.remove_channel_member.assert_not_called()
+    else:
+        expected = {"ext-second"} if remove_mapping else {"ext-second", "ext-other"}
+        adapter.retain_channel_members.assert_awaited_with("private-channel", expected)
+        channels.remove_channel_member.assert_called_once_with(
+            "private-channel", "ext-first"
+        )
     assert await sync(session_factory, rooms) == room_id
     adapter.create_channel.assert_awaited_once()
 
@@ -135,9 +139,12 @@ async def test_shared_claim_release_keeps_reporter_and_admin_access(
         session_factory=session_factory, config=config, ticket_rooms=rooms
     )
     assert await scheduler.sweep_ticket_rooms() == 1
-    adapter.retain_channel_members.assert_awaited_with(
-        "private-channel", {"ext-first", "ext-second"}
-    )
+    if terminal:
+        adapter.retain_channel_members.assert_not_awaited()
+    else:
+        adapter.retain_channel_members.assert_awaited_with(
+            "private-channel", {"ext-first", "ext-second"}
+        )
 
 
 async def test_unsupported_revocation_keeps_invitations_and_reports_degraded_access(

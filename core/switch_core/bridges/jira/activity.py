@@ -60,6 +60,16 @@ def request_wake(ticket: JiraWorkerTicket) -> None:
             ticket.agent_state = "wake_requested"
 
 
+async def _enqueue_terminal_completion_sync(
+    session: AsyncSession, ticket: JiraWorkerTicket
+) -> None:
+    from switch_core.bridges.jira.admin import enqueue_admin_card_follow_up
+    from switch_core.bridges.jira.worker import _enqueue_room_sync
+
+    await _enqueue_room_sync(session, ticket)
+    await enqueue_admin_card_follow_up(session, ticket)
+
+
 async def record_event(
     session: AsyncSession,
     *,
@@ -411,7 +421,17 @@ class TicketActivity:
                 return False
             if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
                 park_ticket(ticket, TOKEN_LIMIT)
+            status_before = ticket.status
             version, observation = await self._read_jira(ticket, force=force_jira)
+            if ticket.status != status_before:
+                if not is_terminal_ticket_status(
+                    status_before
+                ) and is_terminal_ticket_status(ticket.status):
+                    await _enqueue_terminal_completion_sync(session, ticket)
+                elif not is_terminal_ticket_status(ticket.status):
+                    from switch_core.bridges.jira.worker import _enqueue_room_sync
+
+                    await _enqueue_room_sync(session, ticket)
             fell_back = False
             if (
                 (

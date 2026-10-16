@@ -11,7 +11,7 @@ import pytest
 from alembic.config import Config
 from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
@@ -160,11 +160,14 @@ class FakeRooms:
 
 
 class FakeCards:
-    def __init__(self) -> None:
+    def __init__(self, rooms: FakeRooms | None = None) -> None:
         self.updates: list[dict[str, str]] = []
+        self._rooms = rooms
 
     async def update_card(self, room_id: str, *, event_id: str, body: str) -> None:
         self.updates.append({"room_id": room_id, "event_id": event_id, "body": body})
+        if self._rooms is not None and room_id in self._rooms.rooms:
+            self._rooms.rooms[room_id]["description"] = body
 
 
 def _webhook_event(
@@ -634,6 +637,37 @@ async def test_archive_on_done_and_reopen_reuses_room(
     assert await _sync(session_factory, "KAN-1", rooms, updater) == room_id
     assert rooms.rooms[room_id]["archived"] is False
     assert len(rooms.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_change_refreshes_ticket_card_without_duplicate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    rooms = FakeRooms()
+    updater = FakeCards(rooms)
+    assert (
+        await _intake(session_factory, _webhook_event(), webhook_identifier="evt-1")
+        is True
+    )
+    room_id = await _sync(session_factory, "KAN-1", rooms, updater)
+    async with session_factory() as session:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(JiraWorkerTicket.issue_key == "KAN-1")
+        )
+        assert ticket is not None
+        card_id = ticket.card_event_id
+        ticket.status = "Waiting for input"
+        await session.commit()
+    assert await _sync(session_factory, "KAN-1", rooms, updater) == room_id
+    async with session_factory() as session:
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(JiraWorkerTicket.issue_key == "KAN-1")
+        )
+        assert ticket is not None
+        assert ticket.card_event_id == card_id
+    assert len(updater.updates) == 1
+    assert "Waiting for input" in updater.updates[0]["body"]
+    assert len(rooms.cards) == 1
 
 
 @pytest.mark.asyncio
