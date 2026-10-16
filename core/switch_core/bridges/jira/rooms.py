@@ -941,7 +941,15 @@ class SwitchTicketRooms:
             await self._rooms.set_room_archived(room_id, True)
             return
         await self._rooms.set_room_archived(room_id, False)
-        await self._rooms.reopen_bridged_channel(room_id)
+        try:
+            await self._rooms.reopen_bridged_channel(room_id)
+        except Exception as exc:
+            logger.warning(
+                "Jira channel reopen failed for room %s: %s",
+                room_id,
+                exc,
+                exc_info=True,
+            )
 
     async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         async with self._sessions() as session:

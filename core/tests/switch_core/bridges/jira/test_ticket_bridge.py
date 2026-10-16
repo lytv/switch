@@ -903,3 +903,89 @@ async def test_terminal_channel_close_failure_surfaces_and_keeps_sync_pending(
         assert pending
         room = await session.get(Room, room_id)
         assert room.archived_at is None
+
+
+def _pending_room_sync(ticket: JiraWorkerTicket) -> JiraWorkerOutbox:
+    return JiraWorkerOutbox(
+        channel="switch",
+        command="sync_ticket_room",
+        issue_key=ticket.issue_key,
+        payload={
+            "instance": ticket.instance,
+            "project_key": ticket.project_key,
+            "ticket_id": ticket.id,
+            "switch_user_id": ticket.reporter_switch_user_id,
+        },
+        status="pending",
+    )
+
+
+async def test_unsupported_channel_close_still_archives_and_completes_sync(
+    session_factory, ticket_bridge
+):
+    rooms, _, adapter, _ = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    adapter.close_channel.reset_mock()
+    adapter.close_channel.side_effect = NotImplementedError(
+        "slack cannot close bridged channels from Switch"
+    )
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.status = "Done"
+        session.add(_pending_room_sync(ticket))
+        await session.commit()
+        ticket_id = ticket.id
+    assert await sync(session_factory, rooms) == room_id
+    adapter.close_channel.assert_awaited_once_with("private-channel")
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert CHANNEL_CLOSE_REASON not in (ticket.admin_reasons or {})
+        room = await session.get(Room, room_id)
+        assert room.archived_at is not None
+        pending = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == "sync_ticket_room",
+                JiraWorkerOutbox.payload["ticket_id"].astext == ticket_id,
+            )
+        )
+        assert pending.status == "done"
+
+
+@pytest.mark.parametrize("failure", ["stopped", "disconnected"])
+async def test_channel_reopen_failure_completes_room_sync(
+    session_factory, ticket_bridge, failure, caplog
+):
+    rooms, service, adapter, _ = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.status = "Done"
+        await session.commit()
+    assert await sync(session_factory, rooms) == room_id
+    adapter.reopen_channel.reset_mock()
+    if failure == "stopped":
+        service._collab_lifecycle.get = lambda bridge_id: None
+    else:
+        adapter.reopen_channel.side_effect = RuntimeError(
+            "Cannot reopen channel: Mattermost client not connected"
+        )
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.status = "To Do"
+        session.add(_pending_room_sync(ticket))
+        await session.commit()
+        ticket_id = ticket.id
+    assert await sync(session_factory, rooms) == room_id
+    if failure == "disconnected":
+        adapter.reopen_channel.assert_awaited_once_with("private-channel")
+    assert "channel reopen failed" in caplog.text
+    async with session_factory() as session:
+        room = await session.get(Room, room_id)
+        assert room.archived_at is None
+        pending = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command == "sync_ticket_room",
+                JiraWorkerOutbox.payload["ticket_id"].astext == ticket_id,
+            )
+        )
+        assert pending.status == "done"

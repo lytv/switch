@@ -876,7 +876,10 @@ class RoomService:
         bridge_core = self._collab_lifecycle.get(bridge_id)
         if bridge_core is None:
             raise ValueError(f"Bridge not running: {bridge_id}")
-        await bridge_core.adapter.close_channel(external_channel_id)
+        try:
+            await bridge_core.adapter.close_channel(external_channel_id)
+        except NotImplementedError:
+            return
 
     async def reopen_bridged_channel(self, room_id: str) -> None:
         async with self._session_factory() as session:
