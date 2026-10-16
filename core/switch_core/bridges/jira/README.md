@@ -36,7 +36,7 @@ Repeated sync and worker restarts reuse that channel. The worker reposts the
 ticket card and current open intake question once after attachment. The new
 card becomes the thread root for later questions and card edits.
 Done and cancelled tickets archive the Switch room and close the linked private
-channel on the bridge. A channel-close failure stays on the admin card and
+channel when the bridge supports it. A channel-close failure stays on the admin card and
 keeps room sync pending until it succeeds. Reopening the ticket restores the
 channel when the bridge supports it. Archived rooms receive no reporter
 invitation until that reopen path runs. Missing, stopped, channel-disabled, or unreachable default bridges
