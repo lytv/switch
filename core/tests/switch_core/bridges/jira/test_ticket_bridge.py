@@ -12,10 +12,12 @@ from sqlalchemy import select
 
 from switch_core.bridges.jira.admin import reconcile_admin_cards
 from switch_core.bridges.jira.rooms import (
+    CHANNEL_CLOSE_REASON,
     REPORTER_ACCESS_REASON,
     RESTORE_HISTORY_COMMAND,
     SwitchCardUpdater,
     SwitchTicketRooms,
+    TerminalChannelCloseError,
     reconcile_ticket_room,
 )
 from switch_core.bridges.jira.worker import JiraWorkerScheduler, set_identity_mapping
@@ -174,6 +176,8 @@ async def ticket_bridge(session_factory):
         add_agents_to_channel=AsyncMock(),
         add_users_to_channel=AsyncMock(return_value=[]),
         retain_channel_members=AsyncMock(),
+        close_channel=AsyncMock(),
+        reopen_channel=AsyncMock(),
     )
     bridge = SimpleNamespace(
         adapter=adapter,
@@ -840,3 +844,62 @@ async def test_claim_and_release_reconcile_channel_members(
         assert (
             await session.get(Room, room_id)
         ).external_channel_id == "private-channel"
+
+
+async def test_terminal_sync_closes_bridged_channel(session_factory, ticket_bridge):
+    rooms, _, adapter, _ = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    adapter.close_channel.reset_mock()
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.status = "Done"
+        await session.commit()
+    assert await sync(session_factory, rooms) == room_id
+    adapter.close_channel.assert_awaited_once_with("private-channel")
+    async with session_factory() as session:
+        room = await session.get(Room, room_id)
+        assert room.archived_at is not None
+
+
+async def test_terminal_channel_close_failure_surfaces_and_keeps_sync_pending(
+    session_factory, ticket_bridge
+):
+    rooms, _, adapter, _ = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    adapter.close_channel.reset_mock()
+    adapter.close_channel.side_effect = TerminalChannelCloseError(
+        "mattermost unavailable"
+    )
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.status = "Done"
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                command="sync_ticket_room",
+                issue_key=ticket.issue_key,
+                payload={
+                    "instance": ticket.instance,
+                    "project_key": ticket.project_key,
+                    "ticket_id": ticket.id,
+                    "switch_user_id": ticket.reporter_switch_user_id,
+                },
+                status="pending",
+            )
+        )
+        await session.commit()
+    assert await sync(session_factory, rooms) == room_id
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        assert (ticket.admin_reasons or {}).get(CHANNEL_CLOSE_REASON)
+        pending = list(
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command == "sync_ticket_room",
+                    JiraWorkerOutbox.status == "pending",
+                )
+            )
+        )
+        assert pending
+        room = await session.get(Room, room_id)
+        assert room.archived_at is None

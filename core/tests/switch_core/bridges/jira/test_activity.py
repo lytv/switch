@@ -16,9 +16,11 @@ from switch_core.bridges.jira.activity import (
     TurnResult,
     park_ticket,
 )
+from switch_core.bridges.jira.admin import ADMIN_CARD_COMMAND
 from switch_core.bridges.jira.outbox import enqueue_jira_command
 from switch_core.bridges.jira.rooms import reconcile_ticket_room
 from switch_core.bridges.jira.worker import (
+    SYNC_TICKET_ROOM_COMMAND,
     JiraWorkerScheduler,
     record_polled_issue,
     record_webhook_event,
@@ -260,6 +262,99 @@ async def test_done_and_cancel_park_on_intake(session_factory, status) -> None:
     assert row.agent_state == "parked"
     assert row.wake_at is None
     assert row.worker_parked_reason
+
+
+async def test_jira_read_status_change_enqueues_room_sync(session_factory) -> None:
+    key = await seed(session_factory)
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, key)
+        assert stored is not None
+        stored.status = "Backlog"
+        stored.jira_seen_comment_ids = []
+        await session.commit()
+
+    jira = JiraMock()
+    jira.status = "Backlog"
+    jira.change("worker-account")
+    baseline_id = jira.histories[-1]["id"]
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, key)
+        assert stored is not None
+        stored.jira_read_changelog_id = baseline_id
+        stored.jira_read_updated = jira.updated
+        await session.commit()
+
+    jira.status = "Waiting for input"
+    jira.change("worker-account")
+    jira.histories[-1]["items"] = [
+        {
+            "field": "status",
+            "fromString": "Backlog",
+            "toString": "Waiting for input",
+        }
+    ]
+
+    reader = activity(session_factory, jira, ThreadRooms())
+    assert await reader.read_ticket(key, force_jira=True)
+
+    async with session_factory() as session:
+        commands = list(
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.status == "pending",
+                    JiraWorkerOutbox.command == SYNC_TICKET_ROOM_COMMAND,
+                )
+            )
+        )
+    assert len(commands) == 1
+
+
+async def test_jira_read_to_terminal_enqueues_room_and_admin_card_sync(
+    session_factory,
+) -> None:
+    key = await seed(session_factory)
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, key)
+        assert stored is not None
+        stored.status = "In Progress"
+        stored.jira_seen_comment_ids = []
+        stored.admin_card_event_id = "admin-card-1"
+        await session.commit()
+
+    jira = JiraMock()
+    jira.status = "In Progress"
+    jira.change("worker-account")
+    baseline_id = jira.histories[-1]["id"]
+    async with session_factory() as session:
+        stored = await session.get(JiraWorkerTicket, key)
+        assert stored is not None
+        stored.jira_read_changelog_id = baseline_id
+        stored.jira_read_updated = jira.updated
+        await session.commit()
+
+    jira.status = "Done"
+    jira.change("worker-account")
+    jira.histories[-1]["items"] = [
+        {"field": "status", "fromString": "In Progress", "toString": "Done"}
+    ]
+
+    reader = activity(session_factory, jira, ThreadRooms())
+    assert await reader.read_ticket(key, force_jira=True)
+
+    row = await ticket(session_factory, key)
+    assert row.status == "Done"
+    assert row.worker_parked_reason == "Jira ticket completed or cancelled"
+
+    async with session_factory() as session:
+        commands = list(
+            await session.scalars(
+                select(JiraWorkerOutbox).where(JiraWorkerOutbox.status == "pending")
+            )
+        )
+    assert {row.command for row in commands} == {
+        SYNC_TICKET_ROOM_COMMAND,
+        ADMIN_CARD_COMMAND,
+    }
 
 
 async def reconcile(factory, key, rooms, limits, now=NOW, enabled_projects=None):

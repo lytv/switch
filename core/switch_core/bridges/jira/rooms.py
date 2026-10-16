@@ -63,6 +63,11 @@ INVITE_REPORTER_COMMAND = "invite_ticket_reporter"
 ADMIN_CARD_COMMAND = "upsert_ticket_admin_card"
 RESTORE_HISTORY_COMMAND = "restore_ticket_history"
 REPORTER_ACCESS_REASON = "reporter_access"
+CHANNEL_CLOSE_REASON = "channel_close"
+
+
+class TerminalChannelCloseError(RuntimeError):
+    """The linked bridge channel could not be closed for a terminal ticket."""
 
 
 class TicketRooms(Protocol):
@@ -275,12 +280,10 @@ async def _apply_description_and_archive(
     room_id: str,
     body: str,
 ) -> None:
-    if (
-        cards is not None
-        and ticket.card_event_id is not None
-        and body != await rooms.get_room_description(room_id)
-    ):
-        await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
+    if cards is not None and ticket.card_event_id is not None:
+        stored = await rooms.get_room_description(room_id)
+        if body != stored:
+            await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
     want_archived = is_terminal_ticket_status(ticket.status)
     if bool(await rooms.is_archived(room_id)) != want_archived:
         await rooms.set_archived(room_id, archived=want_archived)
@@ -547,7 +550,15 @@ async def _reconcile_ticket_room(
             if not await _ensure_owner(session, rooms, ticket, room_id, owner_id):
                 continue
             body = await _render_card(session, rooms, ticket, owner_id)
-        await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        try:
+            await _apply_description_and_archive(rooms, cards, ticket, room_id, body)
+        except TerminalChannelCloseError as exc:
+            reasons = dict(ticket.admin_reasons or {})
+            reasons[CHANNEL_CLOSE_REASON] = str(exc)
+            ticket.admin_reasons = reasons
+            await enqueue_admin_card_follow_up(session, ticket)
+            await session.flush()
+            return room_id
         history = None
         if not is_terminal_ticket_status(ticket.status):
             history_key = (
@@ -592,18 +603,22 @@ async def _reconcile_ticket_room(
                     continue
                 body = await _render_card(session, rooms, ticket, owner_id)
         reasons = dict(ticket.admin_reasons or {})
-        try:
-            await rooms.ensure_reporter_access(room_id, owner_id)
-        except Exception as exc:
-            logger.warning(
-                "Jira reporter access failed for %s: %s",
-                ticket.issue_key,
-                exc,
-                exc_info=True,
-            )
-            reasons[REPORTER_ACCESS_REASON] = str(exc)
-        else:
+        if is_terminal_ticket_status(ticket.status):
             reasons.pop(REPORTER_ACCESS_REASON, None)
+            reasons.pop(CHANNEL_CLOSE_REASON, None)
+        else:
+            try:
+                await rooms.ensure_reporter_access(room_id, owner_id)
+            except Exception as exc:
+                logger.warning(
+                    "Jira reporter access failed for %s: %s",
+                    ticket.issue_key,
+                    exc,
+                    exc_info=True,
+                )
+                reasons[REPORTER_ACCESS_REASON] = str(exc)
+            else:
+                reasons.pop(REPORTER_ACCESS_REASON, None)
         if reasons != (ticket.admin_reasons or {}):
             ticket.admin_reasons = reasons or None
             await enqueue_admin_card_follow_up(session, ticket)
@@ -918,7 +933,15 @@ class SwitchTicketRooms:
             return None if room is None else room.archived_at is not None
 
     async def set_archived(self, room_id: str, *, archived: bool) -> None:
-        await self._rooms.set_room_archived(room_id, archived)
+        if archived:
+            try:
+                await self._rooms.close_bridged_channel(room_id)
+            except Exception as exc:
+                raise TerminalChannelCloseError(str(exc)) from exc
+            await self._rooms.set_room_archived(room_id, True)
+            return
+        await self._rooms.set_room_archived(room_id, False)
+        await self._rooms.reopen_bridged_channel(room_id)
 
     async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         async with self._sessions() as session:

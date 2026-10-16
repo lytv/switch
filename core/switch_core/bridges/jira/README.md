@@ -35,8 +35,11 @@ Room sync attaches a private channel to an existing unbridged ticket room.
 Repeated sync and worker restarts reuse that channel. The worker reposts the
 ticket card and current open intake question once after attachment. The new
 card becomes the thread root for later questions and card edits.
-Archived rooms receive no bridge or invitation until the existing reopen path
-reopens them. Missing, stopped, channel-disabled, or unreachable default bridges
+Done and cancelled tickets archive the Switch room and close the linked private
+channel on the bridge. A channel-close failure stays on the admin card and
+keeps room sync pending until it succeeds. Reopening the ticket restores the
+channel when the bridge supports it. Archived rooms receive no reporter
+invitation until that reopen path runs. Missing, stopped, channel-disabled, or unreachable default bridges
 leave new ticket rooms internal-only. Access failures log a warning and add a reason to the
 admin card without blocking ticket sync. Mapping changes, claim changes, and
 ordinary ticket sync retry access and clear the reason after success.
@@ -57,7 +60,9 @@ also reads comments on the poll interval when the issue timestamp has not moved.
 Comment event ids keep that repeat read from recording the same comment twice.
 After a completed read, a new comment from anyone except the worker and the reporter parks the ticket even when the issue timestamp has not moved. Comments stored on the first read do not.
 The worker also checks Jira immediately before each orchestrator turn. It uses
-the existing paginated history and comment read path.
+the existing paginated history and comment read path. A Done or cancelled status
+discovered on that read parks the ticket and enqueues the same room and admin-card
+follow-ups as webhook and poll intake.
 
 The shared observer permits an issue updated stamp up to one second after the
 latest attributable worker comment creation or edit. A new comment must belong

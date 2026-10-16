@@ -864,6 +864,37 @@ class RoomService:
             await self._room_store.set_archived(session, room_id, archived)
             await session.commit()
 
+    async def close_bridged_channel(self, room_id: str) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            bridge_id = room.bridge_id
+            external_channel_id = room.external_channel_id
+        if not bridge_id or not external_channel_id:
+            return
+        bridge_core = self._collab_lifecycle.get(bridge_id)
+        if bridge_core is None:
+            raise ValueError(f"Bridge not running: {bridge_id}")
+        await bridge_core.adapter.close_channel(external_channel_id)
+
+    async def reopen_bridged_channel(self, room_id: str) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            bridge_id = room.bridge_id
+            external_channel_id = room.external_channel_id
+        if not bridge_id or not external_channel_id:
+            return
+        bridge_core = self._collab_lifecycle.get(bridge_id)
+        if bridge_core is None:
+            raise ValueError(f"Bridge not running: {bridge_id}")
+        try:
+            await bridge_core.adapter.reopen_channel(external_channel_id)
+        except NotImplementedError:
+            return
+
     async def add_users_to_room(self, room_id: str, user_names: list[str]) -> list[str]:
         """Add users to a bridged room; returns the names that did not make it
         (added users are omitted from the result).

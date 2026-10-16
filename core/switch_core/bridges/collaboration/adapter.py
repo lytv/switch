@@ -791,6 +791,18 @@ class CollaborationAdapter(ABC):
         """Remove unauthorized people, but retain platform admins and bots."""
         raise NotImplementedError("This bridge cannot revoke channel membership")
 
+    async def close_channel(self, channel_id: str) -> None:
+        """Archive or close a bridged channel when its Switch room is retired."""
+        raise NotImplementedError(
+            f"{self.platform_name} cannot close bridged channels from Switch"
+        )
+
+    async def reopen_channel(self, channel_id: str) -> None:
+        """Restore a channel closed by :meth:`close_channel`."""
+        raise NotImplementedError(
+            f"{self.platform_name} cannot reopen bridged channels from Switch"
+        )
+
     @abstractmethod
     async def create_agent_identity(
         self, agent_name: str, agent_description: str
