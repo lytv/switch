@@ -439,18 +439,14 @@ class MattermostAdapter(CollaborationAdapter):
         self, channel_id: str, message_ref: str, new_content: str
     ) -> None:
         if not self._admin_driver or not self._main_loop:
-            logger.error("Cannot update message: Mattermost client not connected")
-            return
+            raise RuntimeError("Cannot update message: Mattermost client not connected")
 
-        try:
-            await self._main_loop.run_in_executor(
-                None,
-                self._admin_driver.posts.patch_post,
-                message_ref,
-                {"message": new_content},
-            )
-        except Exception as e:
-            logger.error("Failed to update Mattermost post %s: %s", message_ref, e)
+        await self._main_loop.run_in_executor(
+            None,
+            self._admin_driver.posts.patch_post,
+            message_ref,
+            {"message": new_content},
+        )
 
     async def delete_message(self, channel_id: str, message_ref: str) -> None:
         if not self._admin_driver or not self._main_loop:

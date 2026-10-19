@@ -1176,6 +1176,7 @@ class ProtocolService:
 
         Room history reads the same row, so the new body is what `read_context`
         and the history endpoint render.
+        Bridged rooms await delivery to the original native post.
         """
         room = await self.require_room_member(agent_id, room_id)
         client = self.client_lifecycle.get_by_agent_id(agent_id)
@@ -1189,6 +1190,13 @@ class ProtocolService:
             raise PermissionError("Only the author may edit this message") from exc
         except TransportError as exc:
             raise ValueError(f"Failed to edit message: {exc}") from exc
+        if room.bridge_id is not None:
+            bridge_core = self.collab_lifecycle.get(room.bridge_id)
+            if bridge_core is None:
+                raise ValueError(
+                    f"Collaboration bridge {room.bridge_id} for room {room_id} is not running"
+                )
+            await bridge_core.handle_message_edit(event_id, content)
 
     async def send_media(
         self,

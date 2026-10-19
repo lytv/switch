@@ -1736,18 +1736,16 @@ class BridgeCore:
         self._indicator_move_targets[key] = thread_root_ref
         await self._run_indicator_move(key)
 
-    # ── Protection sync ──────────────────────────────────────────────────────
+    # ── Mapped message edits ─────────────────────────────────────────────────
 
-    # TODO: use this when protection setup is done
-    async def handle_protection_verdict(
-        self, event_id: str, new_content: str | None
-    ) -> None:
+    async def handle_message_edit(self, event_id: str, new_content: str | None) -> None:
+        """Update or remove the existing native post without replacing its identity."""
         async with self._session_factory() as session:
             mapping = await self._bridge_message_map_store.get_by_transport_event_id(
                 session, self._bridge_id, event_id
             )
         if mapping is None:
-            return
+            raise ValueError(f"No native message mapping for event {event_id}")
 
         channel_id = mapping.external_channel_id
         message_ref = mapping.external_post_id
