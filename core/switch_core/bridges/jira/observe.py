@@ -1,13 +1,9 @@
 """One Jira observer shared by every read path.
 
-Activity reads, the outbox version check, and the webhook intake all classify
-the same way: comment newness only by ID, worker items ignored, new reporter
-IDs recorded, other authors or non-worker changelog rows park. A stamp move
-with no new ID and no new changelog row is attributed through the comments
-already returned in the same read (updated/updateAuthor, no new state), even alongside new IDs
-or changelog rows; only a still-unexplained move parks. A forward stamp gap up
-to one second is accepted only when the latest attributable item is a worker-owned
-comment creation or edit; all other items keep exact stamp attribution.
+Comment IDs identify new input. Meaningful non-worker history and unknown
+changes park intake. Verified Rank-only history does not. A forward stamp gap
+up to one second requires that every latest attributable item is a worker-owned
+comment or Rank-only history; other items require exact stamp attribution.
 """
 
 from __future__ import annotations
@@ -40,6 +36,21 @@ def _author(entry: dict[str, Any]) -> str:
     return account if isinstance(account, str) else ""
 
 
+def _rank_only(entry: dict[str, Any]) -> bool:
+    items = entry.get("items")
+    return (
+        bool(_author(entry))
+        and isinstance(items, list)
+        and bool(items)
+        and all(
+            isinstance(item, dict)
+            and item.get("field") == "Rank"
+            and item.get("fieldtype") == "custom"
+            for item in items
+        )
+    )
+
+
 @dataclass(frozen=True)
 class Observation:
     first: bool
@@ -60,6 +71,7 @@ def observe_jira(
     worker_account: str,
     reporter_account: str,
 ) -> Observation:
+    first = seen_ids is None
     comments = version["comments"]
     histories = version["histories"]
     current_ids = {str(comment.get("id", "")) for comment in comments}
@@ -104,90 +116,39 @@ def observe_jira(
                 seen_ids=tuple(sorted(current_ids)),
                 changelog_id=current_changelog,
             )
-        for entry in histories:
-            if (
-                _stamp(entry["created"]) > base_stamp
-                and _author(entry) != worker_account
-            ):
-                return Observation(
-                    first=True,
-                    new_ids=frozenset(pre_new),
-                    reporter_new=tuple(initial_reporter_new),
-                    reporter_edits=tuple(initial_reporter_edits),
-                    park="human",
-                    seen_ids=tuple(sorted(current_ids)),
-                    changelog_id=current_changelog,
-                )
-        return Observation(
-            first=True,
-            new_ids=frozenset(pre_new),
-            reporter_new=tuple(initial_reporter_new),
-            reporter_edits=tuple(initial_reporter_edits),
-            seen_ids=tuple(sorted(current_ids)),
-            changelog_id=current_changelog,
-        )
-    new_ids = current_ids - seen_ids
-    seen_comments = current_ids & seen_ids
-    reporter_new = [by_id[comment_id] for comment_id in sorted(new_ids & reporter_ids)]
-    edits = [
-        by_id[comment_id]
-        for comment_id in sorted(seen_comments & reporter_ids)
-        if _stamp(by_id[comment_id]["updated"]) > base_stamp
-    ]
-    if current_stamp < base_stamp:
-        return Observation(
-            first=False,
-            new_ids=frozenset(new_ids),
-            reporter_new=tuple(reporter_new),
-            reporter_edits=tuple(edits),
-            park="regressed",
-            seen_ids=tuple(sorted(seen_ids | current_ids)),
-            changelog_id=current_changelog,
-        )
-    for comment_id in sorted(new_ids):
-        actor = comment_actor(by_id[comment_id])
-        if actor == worker_account or comment_id in reporter_ids:
-            continue
-        return Observation(
-            first=False,
-            new_ids=frozenset(new_ids),
-            reporter_new=tuple(reporter_new),
-            reporter_edits=tuple(edits),
-            park="human",
-            seen_ids=tuple(sorted(seen_ids | current_ids)),
-            changelog_id=current_changelog,
-        )
-    if seen_ids - current_ids:
-        return Observation(
-            first=False,
-            new_ids=frozenset(new_ids),
-            reporter_new=tuple(reporter_new),
-            reporter_edits=tuple(edits),
-            park="human",
-            seen_ids=tuple(sorted(seen_ids | current_ids)),
-            changelog_id=current_changelog,
-        )
-    base_id = changelog_id if isinstance(changelog_id, str) else ""
-    if base_id:
-        index = next(
-            (i for i, entry in enumerate(histories) if str(entry["id"]) == base_id),
-            None,
-        )
-        if index is None:
+        new_entries = [
+            entry for entry in histories if _stamp(entry["created"]) > base_stamp
+        ]
+        new_ids = set(pre_new)
+        reporter_new = initial_reporter_new
+        edits = initial_reporter_edits
+        seen_comments = current_ids - new_ids
+        seen_ids = set()
+    else:
+        new_ids = current_ids - seen_ids
+        seen_comments = current_ids & seen_ids
+        reporter_new = [
+            by_id[comment_id] for comment_id in sorted(new_ids & reporter_ids)
+        ]
+        edits = [
+            by_id[comment_id]
+            for comment_id in sorted(seen_comments & reporter_ids)
+            if _stamp(by_id[comment_id]["updated"]) > base_stamp
+        ]
+        if current_stamp < base_stamp:
             return Observation(
                 first=False,
                 new_ids=frozenset(new_ids),
                 reporter_new=tuple(reporter_new),
                 reporter_edits=tuple(edits),
-                park="changelog_missing",
+                park="regressed",
                 seen_ids=tuple(sorted(seen_ids | current_ids)),
                 changelog_id=current_changelog,
             )
-        new_entries = histories[index + 1 :]
-    else:
-        new_entries = list(histories)
-    for entry in new_entries:
-        if _author(entry) != worker_account:
+        for comment_id in sorted(new_ids):
+            actor = comment_actor(by_id[comment_id])
+            if actor == worker_account or comment_id in reporter_ids:
+                continue
             return Observation(
                 first=False,
                 new_ids=frozenset(new_ids),
@@ -197,8 +158,48 @@ def observe_jira(
                 seen_ids=tuple(sorted(seen_ids | current_ids)),
                 changelog_id=current_changelog,
             )
+        if seen_ids - current_ids:
+            return Observation(
+                first=False,
+                new_ids=frozenset(new_ids),
+                reporter_new=tuple(reporter_new),
+                reporter_edits=tuple(edits),
+                park="human",
+                seen_ids=tuple(sorted(seen_ids | current_ids)),
+                changelog_id=current_changelog,
+            )
+        base_id = changelog_id if isinstance(changelog_id, str) else ""
+        if base_id:
+            index = next(
+                (i for i, entry in enumerate(histories) if str(entry["id"]) == base_id),
+                None,
+            )
+            if index is None:
+                return Observation(
+                    first=False,
+                    new_ids=frozenset(new_ids),
+                    reporter_new=tuple(reporter_new),
+                    reporter_edits=tuple(edits),
+                    park="changelog_missing",
+                    seen_ids=tuple(sorted(seen_ids | current_ids)),
+                    changelog_id=current_changelog,
+                )
+            new_entries = histories[index + 1 :]
+        else:
+            new_entries = list(histories)
+    for entry in new_entries:
+        if _author(entry) != worker_account and not _rank_only(entry):
+            return Observation(
+                first=first,
+                new_ids=frozenset(new_ids),
+                reporter_new=tuple(reporter_new),
+                reporter_edits=tuple(edits),
+                park="human",
+                seen_ids=tuple(sorted(seen_ids | current_ids)),
+                changelog_id=current_changelog,
+            )
     attributable: list[tuple[datetime, bool]] = [
-        (_stamp(entry["created"]), False) for entry in new_entries
+        (_stamp(entry["created"]), _rank_only(entry)) for entry in new_entries
     ]
     for comment_id in sorted(new_ids):
         comment = by_id[comment_id]
@@ -219,7 +220,7 @@ def observe_jira(
             attributable.append((_stamp(comment["updated"]), False))
             continue
         return Observation(
-            first=False,
+            first=first,
             new_ids=frozenset(new_ids),
             reporter_new=tuple(reporter_new),
             reporter_edits=tuple(edits),
@@ -229,7 +230,7 @@ def observe_jira(
         )
     if current_stamp > base_stamp and not attributable:
         return Observation(
-            first=False,
+            first=first,
             new_ids=frozenset(new_ids),
             reporter_new=tuple(reporter_new),
             reporter_edits=tuple(edits),
@@ -239,19 +240,17 @@ def observe_jira(
         )
     if current_stamp > base_stamp and attributable:
         latest = max(stamp for stamp, _ in attributable)
-        own_comment_latest = all(
-            own_comment for stamp, own_comment in attributable if stamp == latest
-        )
-        # Accepted risk: a human comment hidden from the bot inside this second is undetectable.
+        gap_allowed = all(allowed for stamp, allowed in attributable if stamp == latest)
+        # Accepted risk: an unseen human change inside this second is undetectable.
         gap = current_stamp - latest
-        comment_gap = (
-            own_comment_latest
+        attributed_gap = (
+            gap_allowed
             and latest > base_stamp
             and timedelta(0) < gap <= timedelta(seconds=1)
         )
-        if latest != current_stamp and not comment_gap:
+        if latest != current_stamp and not attributed_gap:
             return Observation(
-                first=False,
+                first=first,
                 new_ids=frozenset(new_ids),
                 reporter_new=tuple(reporter_new),
                 reporter_edits=tuple(edits),
@@ -260,7 +259,7 @@ def observe_jira(
                 changelog_id=current_changelog,
             )
     return Observation(
-        first=False,
+        first=first,
         new_ids=frozenset(new_ids),
         reporter_new=tuple(reporter_new),
         reporter_edits=tuple(edits),
