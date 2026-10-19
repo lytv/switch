@@ -10,6 +10,7 @@ from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.bridges.jira.outbox import (
     ISSUE_CHANGED_DURING_READ,
     HumanChange,
+    check_jira_version,
     read_jira_version,
 )
 from tests.switch_core.bridges.jira.test_outbox import JiraMock, client_for
@@ -265,6 +266,165 @@ def test_park_returns_preserve_all_reporter_evidence(case, other_id):
     assert result.reporter_new == (reporter_new,)
     assert result.reporter_edits == (reporter_edit,)
     assert "7" in result.new_ids
+
+
+def rank_version(actor, gap_ms):
+    return {
+        "updated": stamp(10_000 + gap_ms),
+        "changelog_id": "1",
+        "histories": [
+            {
+                "id": "1",
+                "created": stamp(10_000),
+                "author": {"accountId": actor},
+                "items": [{"field": "Rank", "fieldtype": "custom"}],
+            }
+        ],
+        "comments": [],
+    }
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+@pytest.mark.parametrize(
+    "actor", ["reporter-account", "other-account", "worker-account"]
+)
+@pytest.mark.parametrize("gap_ms", [0, 168, 1000, 1001, -1])
+def test_rank_only_history_and_bounded_final_updated_gap(seen, actor, gap_ms):
+    result = observe(rank_version(actor, gap_ms), seen)
+    assert result.park == (None if 0 <= gap_ms <= 1000 else "stamp_mismatch")
+    assert result.first is (seen is None)
+    assert result.changelog_id == "1"
+    assert not result.new_ids and not result.reporter_new and not result.reporter_edits
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+@pytest.mark.parametrize("actor", ["reporter-account", "other-account", ""])
+@pytest.mark.parametrize(
+    "items",
+    [
+        None,
+        [],
+        [{"field": "Rank"}],
+        [{"field": "Rank", "fieldtype": "jira"}],
+        [{"field": "Service", "fieldtype": "custom"}],
+        [{"field": "description"}],
+        [{"field": "status"}],
+        [{"field": "Rank", "fieldtype": "custom"}, {"field": "description"}],
+        [{"field": "Rank", "fieldtype": "custom"}, {"field": "status"}],
+        [{"field": "Rank", "fieldtype": "custom"}, {}],
+        [{"field": "Rank", "fieldtype": "custom"}, None],
+    ],
+)
+def test_rank_exemption_requires_known_rank_only_items(seen, actor, items):
+    version = rank_version(actor, 168)
+    if items is None:
+        del version["histories"][0]["items"]
+    else:
+        version["histories"][0]["items"] = items
+    assert observe(version, seen).park == "human"
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+def test_rank_with_unknown_author_still_parks(seen):
+    assert observe(rank_version("", 168), seen).park == "human"
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+@pytest.mark.parametrize(
+    "case", ["tied_status", "later_status", "tied_reporter", "later_reporter"]
+)
+def test_rank_gap_does_not_hide_latest_meaningful_items(seen, case):
+    version = rank_version("reporter-account", 168)
+    latest = 10_001 if case.startswith("later") else 10_000
+    if case.endswith("status"):
+        version["histories"].append(
+            {
+                "id": "2",
+                "created": stamp(latest),
+                "author": {"accountId": "worker-account"},
+                "items": [{"field": "status"}],
+            }
+        )
+        version["changelog_id"] = "2"
+    else:
+        comment = comment_version("reporter-account", 0)["comments"][0]
+        comment["created"] = comment["updated"] = stamp(latest)
+        version["comments"].append(comment)
+    assert observe(version, seen).park == "stamp_mismatch"
+    version["updated"] = stamp(latest)
+    assert observe(version, seen).park is None
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+def test_timestamp_only_change_is_not_rank_evidence(seen):
+    version = rank_version("reporter-account", 168)
+    version["histories"] = []
+    version["changelog_id"] = ""
+    assert observe(version, seen).park == "unattributed"
+
+
+def test_known_rank_does_not_explain_a_later_timestamp_only_change():
+    version = rank_version("reporter-account", 168)
+    result = observe_jira(
+        version,
+        seen_ids=set(),
+        changelog_id="1",
+        base_stamp=_stamp(stamp(10_000)),
+        worker_account="worker-account",
+        reporter_account="reporter-account",
+    )
+    assert result.park == "unattributed"
+
+
+@pytest.mark.parametrize("seen", [None, set()])
+def test_same_timestamp_rank_history_is_safe_without_a_timestamp_exemption(seen):
+    version = rank_version("reporter-account", 0)
+    version["histories"][0]["created"] = version["updated"] = stamp(0)
+    assert observe(version, seen).park is None
+    version["updated"] = stamp(168)
+    assert observe(version, seen).park == (
+        "unattributed" if seen is None else "stamp_mismatch"
+    )
+
+
+def test_rank_read_advances_changelog_baseline_without_repeating_input():
+    version = rank_version("reporter-account", 168)
+    previous = {**version["histories"][0], "id": "0", "created": stamp(0)}
+    version["histories"].insert(0, previous)
+    first = observe_jira(
+        version,
+        seen_ids=set(),
+        changelog_id="0",
+        base_stamp=BASE,
+        worker_account="worker-account",
+        reporter_account="reporter-account",
+    )
+    assert first.park is None and first.changelog_id == "1"
+    repeated = observe_jira(
+        version,
+        seen_ids=set(first.seen_ids),
+        changelog_id=first.changelog_id,
+        base_stamp=_stamp(version["updated"]),
+        worker_account="worker-account",
+        reporter_account="reporter-account",
+    )
+    assert repeated.park is None and not repeated.new_ids
+
+
+async def test_rank_history_from_jira_allows_the_shared_command_version_check():
+    jira = JiraMock()
+    version = rank_version("reporter-account", 168)
+    jira.updated, jira.histories = version["updated"], version["histories"]
+    client = client_for(jira)
+    try:
+        read = await read_jira_version(client, "KAN-1")
+        payload = {"based_updated": stamp(0), "based_changelog_id": ""}
+        check_jira_version(read, payload, "worker-account")
+        read["updated"] = stamp(11_001)
+        with pytest.raises(HumanChange):
+            check_jira_version(read, payload, "worker-account")
+    finally:
+        await client.aclose()
 
 
 class MillisecondReadChange(JiraMock):

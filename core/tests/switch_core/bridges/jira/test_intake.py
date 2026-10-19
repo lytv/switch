@@ -27,6 +27,7 @@ from switch_core.bridges.jira.worker import (
     JiraWorkerScheduler,
     record_polled_issue,
     record_webhook_event,
+    set_identity_mapping,
 )
 from switch_core.config import JiraWorkerLimits
 from switch_core.db.models import JiraWorkerEvent, JiraWorkerOutbox, JiraWorkerTicket
@@ -168,6 +169,139 @@ async def start_ticket(factory, *, mapped=True, status="To Do"):
         row.agent_state = "wake_requested"
         await session.commit()
     return key
+
+
+@pytest.mark.parametrize("ranked", [False, True])
+async def test_ui_creation_reaches_first_question_with_rank_only_history(
+    session_factory, ranked
+) -> None:
+    created = "2026-10-16T16:25:26.796+0700"
+    ranked_at = "2026-10-16T16:25:27.438+0700"
+    final_updated = "2026-10-16T16:25:27.606+0700"
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock()
+    jira.status = "BACKLOG"
+    jira.fields["status_category"] = "new"
+    jira.updated = final_updated if ranked else created
+    if ranked:
+        jira.histories = [
+            {
+                "id": "10701",
+                "created": ranked_at,
+                "author": {"accountId": "reporter-account"},
+                "items": [
+                    {
+                        "field": "Rank",
+                        "fieldtype": "custom",
+                        "fieldId": "customfield_10019",
+                        "fromString": "",
+                        "toString": "Ranked higher",
+                    }
+                ],
+            }
+        ]
+    async with session_factory() as session:
+        await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="reporter-account",
+            switch_user_id="reporter-user",
+            enabled_projects=["KAN"],
+        )
+        deliveries = [
+            ("jira:issue_created", created, "2026-10-16T09:25:27.822124+00:00")
+        ]
+        if ranked:
+            deliveries.append(
+                ("jira:issue_updated", ranked_at, "2026-10-16T09:25:27.849044+00:00")
+            )
+        for index, (kind, updated, received) in enumerate(deliveries):
+            raw = {
+                "webhookEvent": kind,
+                "timestamp": int(datetime.fromisoformat(received).timestamp() * 1000),
+                "issue": {
+                    "id": "10001",
+                    "key": "KAN-137",
+                    "fields": {
+                        "project": {"key": "KAN"},
+                        "issuetype": {"name": "Task"},
+                        "status": {"name": "BACKLOG", "statusCategory": {"key": "new"}},
+                        "summary": "Clarify the empty export",
+                        "description": "Ask about the empty export before implementation.",
+                        "reporter": {"accountId": "reporter-account"},
+                        "created": created,
+                        "updated": updated,
+                    },
+                },
+                **({"changelog": jira.histories[0]} if ranked else {}),
+            }
+            assert await record_webhook_event(
+                session,
+                JiraPayloadParser().parse(raw),
+                instance="acme",
+                enabled_projects=["KAN"],
+                webhook_identifier=f"ui-create-{index}",
+            )
+        await session.commit()
+        row = await session.scalar(select(JiraWorkerTicket))
+        key = row.id
+        assert datetime.fromisoformat(row.jira_read_updated) == datetime.fromisoformat(
+            created
+        )
+        assert row.intake_state is None and row.tokens_used == 0
+    now = datetime.fromisoformat("2026-10-16T09:25:32.505987+00:00")
+    worker = scheduler(session_factory, jira, rooms, model, clock=lambda: now)
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert len(model.calls) == len(rooms.questions) == 1
+    assert rooms.questions[0] == (
+        row.room_id,
+        row.card_event_id,
+        "What outcome do you need?",
+    )
+    assert row.intake_state["questions"] == 1
+    assert jira.status == "Waiting for input"
+    assert all(command.status == "done" for command in await commands(session_factory))
+    await worker.run_once()
+    assert len(model.calls) == len(rooms.questions) == 1
+
+
+async def test_rank_during_intake_preserves_delivery_and_meaningful_edit_protection(
+    session_factory,
+) -> None:
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock()
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    assert len(rooms.questions) == 1
+    jira.change("reporter-account")
+    jira.histories[-1]["items"] = [{"field": "Rank", "fieldtype": "custom"}]
+    jira.updated = (
+        datetime.fromisoformat(jira.updated) + timedelta(milliseconds=168)
+    ).isoformat()
+    restarted = scheduler(session_factory, jira, rooms, model)
+    assert await restarted.activity.read_ticket(key, force_jira=True)
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert row.jira_read_updated == jira.updated
+    assert row.jira_read_changelog_id == jira.histories[-1]["id"]
+    await restarted.run_once()
+    assert len(model.calls) == len(rooms.questions) == 1
+    rooms.messages.append(message(1))
+    await restarted.run_once()
+    assert len(model.calls) == len(rooms.questions) == 2
+    jira.change("reporter-account")
+    jira.histories[-1]["items"] = [
+        {"field": "Rank", "fieldtype": "custom"},
+        {"field": "description"},
+    ]
+    assert await restarted.activity.read_ticket(key, force_jira=True)
+    assert (
+        await ticket(session_factory, key)
+    ).worker_parked_reason == "Human Jira action"
+    rooms.messages.append(message(2))
+    await restarted.run_once()
+    assert len(model.calls) == len(rooms.questions) == 2
 
 
 async def test_one_question_per_turn_restart_and_reporter_reply(

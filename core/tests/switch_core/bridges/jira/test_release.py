@@ -46,6 +46,7 @@ from tests.switch_core.bridges.jira.test_intake import (
     commands,
     scheduler,
     start_ticket,
+    ticket,
 )
 from tests.switch_core.bridges.jira.test_intake import (
     config as intake_config,
@@ -162,6 +163,39 @@ async def release_intake_ticket(factory, key, jira):
         admin_user_id=admin.id,
         now=INTAKE_NOW,
     )
+
+
+@pytest.mark.parametrize("status", ["To Do", "BACKLOG", "In Progress"])
+async def test_never_started_release_keeps_configured_status_guard(
+    session_factory, status
+):
+    key = await start_ticket(session_factory, status=status)
+    jira = IntakeJira()
+    jira.status = status
+    jira.fields["status_category"] = (
+        "new" if status != "In Progress" else "indeterminate"
+    )
+    assert intake_config().jira_worker_statuses.to_do == "To Do"
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerTicket, key)
+        assert row.intake_state is None and row.tokens_used == 0
+        park_ticket(row, "Human Jira action")
+        await session.commit()
+    if status == "To Do":
+        receipt = await release_intake_ticket(session_factory, key, jira)
+        assert receipt.event_kind == "admin_release" and receipt.consumed
+        row = await ticket(session_factory, key)
+        assert row.worker_parked_reason is None
+        assert row.jira_read_updated == jira.updated
+    else:
+        with pytest.raises(ValueError, match="Unknown intake phase/status combination"):
+            await release_intake_ticket(session_factory, key, jira)
+        row = await ticket(session_factory, key)
+        assert row.worker_parked_reason == "Human Jira action"
+        assert row.intake_state is None and row.tokens_used == 0
+        async with session_factory() as session:
+            assert not list(await session.scalars(select(JiraWorkerEvent)))
+    assert not jira.writes
 
 
 @pytest.mark.parametrize(
