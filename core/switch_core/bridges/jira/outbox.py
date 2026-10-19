@@ -166,7 +166,7 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
 
 
 class HumanChange(Exception):
-    """A non-worker or unattributed change must park the ticket."""
+    """A meaningful non-worker or unattributed change must park the ticket."""
 
 
 HUMAN_JIRA_ACTION = "Human Jira action"
