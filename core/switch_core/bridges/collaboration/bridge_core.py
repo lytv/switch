@@ -1745,7 +1745,11 @@ class BridgeCore:
                 session, self._bridge_id, event_id
             )
         if mapping is None:
-            raise ValueError(f"No native message mapping for event {event_id}")
+            logger.warning(
+                "[BRIDGE-OUT] no native message mapping for event %s; skipping native edit",
+                event_id,
+            )
+            return
 
         channel_id = mapping.external_channel_id
         message_ref = mapping.external_post_id

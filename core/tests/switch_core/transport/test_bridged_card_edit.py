@@ -226,3 +226,127 @@ async def test_status_edit_reaches_original_native_card(
             assert calls[-1] == ("close", "channel-test")
     finally:
         receiver._unwatch_all()
+
+
+class _OpenSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _MapStore:
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.lookups = []
+
+    async def get_by_transport_event_id(self, session, bridge_id, event_id):
+        self.lookups.append((bridge_id, event_id))
+        return self.mapping
+
+
+def _bridge_for_edit(mapping):
+    bridge = object.__new__(BridgeCore)
+    bridge._session_factory = _OpenSession
+    bridge._bridge_id = "mm"
+    bridge._bridge_message_map_store = _MapStore(mapping)
+    bridge._adapter = SimpleNamespace(
+        translate_outbound=lambda text: text,
+        update_message=AsyncMock(),
+        delete_message=AsyncMock(),
+    )
+    return bridge
+
+
+async def test_unmapped_edit_skips_and_warns(caplog):
+    bridge = _bridge_for_edit(None)
+    with caplog.at_level(
+        "WARNING", logger="switch_core.bridges.collaboration.bridge_core"
+    ):
+        await bridge.handle_message_edit("evt-missing", "updated card")
+    bridge._adapter.update_message.assert_not_called()
+    bridge._adapter.delete_message.assert_not_called()
+    assert bridge._bridge_message_map_store.lookups == [("mm", "evt-missing")]
+    assert "evt-missing" in caplog.text
+    assert "skipping native edit" in caplog.text
+
+
+async def test_mapped_edit_still_updates_the_native_post():
+    bridge = _bridge_for_edit(
+        SimpleNamespace(external_channel_id="channel-test", external_post_id="post-0")
+    )
+    await bridge.handle_message_edit("evt-card", "Done card")
+    bridge._adapter.update_message.assert_awaited_once_with(
+        "channel-test", "post-0", "Done card"
+    )
+    bridge._adapter.delete_message.assert_not_called()
+
+
+class _BridgeStore:
+    def __init__(self, bridge_type):
+        self.bridge_type = bridge_type
+
+    async def get(self, session, bridge_id):
+        if self.bridge_type is None:
+            return None
+        return SimpleNamespace(type=self.bridge_type)
+
+
+def _protocol(bridge_core, stored_type):
+    client = SimpleNamespace(transport=object(), edit_message=AsyncMock())
+    service = object.__new__(ProtocolService)
+    service.client_lifecycle = SimpleNamespace(get_by_agent_id=lambda _: client)
+    service.collab_lifecycle = SimpleNamespace(get=lambda bridge_id: bridge_core)
+    service.require_room_member = AsyncMock(
+        return_value=SimpleNamespace(matrix_room_id="!room:test", bridge_id="bridge")
+    )
+    service.session_factory = _OpenSession
+    service.bridge_store = _BridgeStore(stored_type)
+    return service, client
+
+
+async def test_mattermost_edit_awaits_the_original_native_post():
+    order = []
+
+    async def edit_message(room_id, event_id, body):
+        order.append("transport")
+
+    async def handle_message_edit(event_id, content):
+        order.append(("native", event_id, content))
+
+    service, client = _protocol(
+        SimpleNamespace(
+            _bridge_type="mattermost", handle_message_edit=handle_message_edit
+        ),
+        stored_type=None,
+    )
+    client.edit_message = edit_message
+    await service.edit_message("agent", "room", "evt-card", "Done card")
+    assert order == ["transport", ("native", "evt-card", "Done card")]
+
+
+@pytest.mark.parametrize("bridge_type", ["slack", "discord", "telegram", "teams"])
+async def test_other_platforms_do_not_await_native_delivery(bridge_type):
+    native = AsyncMock()
+    service, client = _protocol(
+        SimpleNamespace(_bridge_type=bridge_type, handle_message_edit=native),
+        stored_type=bridge_type,
+    )
+    await service.edit_message("agent", "room", "evt-card", "Done card")
+    client.edit_message.assert_awaited_once()
+    native.assert_not_called()
+
+
+async def test_stopped_mattermost_bridge_fails_the_edit():
+    service, client = _protocol(None, stored_type="mattermost")
+    with pytest.raises(ValueError, match="not running"):
+        await service.edit_message("agent", "room", "evt-card", "Done card")
+    client.edit_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize("bridge_type", ["slack", "discord", "telegram", "teams"])
+async def test_stopped_other_bridge_does_not_fail_the_edit(bridge_type):
+    service, client = _protocol(None, stored_type=bridge_type)
+    await service.edit_message("agent", "room", "evt-card", "Done card")
+    client.edit_message.assert_awaited_once()
