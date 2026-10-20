@@ -291,7 +291,9 @@ def rank_version(actor, gap_ms):
 @pytest.mark.parametrize("gap_ms", [0, 168, 1000, 1001, -1])
 def test_rank_only_history_and_bounded_final_updated_gap(seen, actor, gap_ms):
     result = observe(rank_version(actor, gap_ms), seen)
-    assert result.park == (None if 0 <= gap_ms <= 1000 else "stamp_mismatch")
+    assert result.park == (
+        None if seen is None or 0 <= gap_ms <= 1000 else "stamp_mismatch"
+    )
     assert result.first is (seen is None)
     assert result.changelog_id == "1"
     assert not result.new_ids and not result.reporter_new and not result.reporter_edits
@@ -350,7 +352,7 @@ def test_rank_gap_does_not_hide_latest_meaningful_items(seen, case):
         comment = comment_version("reporter-account", 0)["comments"][0]
         comment["created"] = comment["updated"] = stamp(latest)
         version["comments"].append(comment)
-    assert observe(version, seen).park == "stamp_mismatch"
+    assert observe(version, seen).park == (None if seen is None else "stamp_mismatch")
     version["updated"] = stamp(latest)
     assert observe(version, seen).park is None
 
@@ -360,7 +362,7 @@ def test_timestamp_only_change_is_not_rank_evidence(seen):
     version = rank_version("reporter-account", 168)
     version["histories"] = []
     version["changelog_id"] = ""
-    assert observe(version, seen).park == "unattributed"
+    assert observe(version, seen).park == (None if seen is None else "unattributed")
 
 
 def test_known_rank_does_not_explain_a_later_timestamp_only_change():
@@ -382,9 +384,7 @@ def test_same_timestamp_rank_history_is_safe_without_a_timestamp_exemption(seen)
     version["histories"][0]["created"] = version["updated"] = stamp(0)
     assert observe(version, seen).park is None
     version["updated"] = stamp(168)
-    assert observe(version, seen).park == (
-        "unattributed" if seen is None else "stamp_mismatch"
-    )
+    assert observe(version, seen).park == (None if seen is None else "stamp_mismatch")
 
 
 def test_rank_read_advances_changelog_baseline_without_repeating_input():

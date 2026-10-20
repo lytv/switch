@@ -266,6 +266,117 @@ async def test_ui_creation_reaches_first_question_with_rank_only_history(
     assert len(model.calls) == len(rooms.questions) == 1
 
 
+async def _store_created(factory, *, updated: str):
+    created = "2026-10-20T13:24:00.426+0700"
+    async with factory() as session:
+        await set_identity_mapping(
+            session,
+            instance="acme",
+            jira_account_id="reporter-account",
+            switch_user_id="reporter-user",
+            enabled_projects=["KAN"],
+        )
+        raw = {
+            "webhookEvent": "jira:issue_created",
+            "timestamp": int(NOW.timestamp() * 1000),
+            "issue": {
+                "id": "10001",
+                "key": "KAN-141",
+                "fields": {
+                    "project": {"key": "KAN"},
+                    "issuetype": {"name": "Task"},
+                    "status": {"name": "BACKLOG", "statusCategory": {"key": "new"}},
+                    "summary": "Booking confirmation email not sent",
+                    "description": "Weekend bookings get no confirmation email.",
+                    "reporter": {"accountId": "reporter-account"},
+                    "created": created,
+                    "updated": updated,
+                },
+            },
+        }
+        assert await record_webhook_event(
+            session,
+            JiraPayloadParser().parse(raw),
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier="first-read-create",
+        )
+        await session.commit()
+        return (await session.scalar(select(JiraWorkerTicket))).id
+
+
+def _backlog_jira(updated: str) -> IntakeJira:
+    jira = IntakeJira()
+    jira.status = "BACKLOG"
+    jira.fields["status_category"] = "new"
+    jira.updated = updated
+    jira.histories = []
+    jira.comments = []
+    return jira
+
+
+async def test_first_read_ghost_drift_reaches_first_question(
+    session_factory,
+) -> None:
+    """KAN-141: Jira advances `updated` with no history or comments."""
+    ghost = "2026-10-20T13:24:00.947+0700"
+    key = await _store_created(session_factory, updated="2026-10-20T13:24:00.426+0700")
+    rooms, model = IntakeRooms(), ModelMock()
+    worker = scheduler(
+        session_factory, _backlog_jira(ghost), rooms, model, clock=lambda: NOW
+    )
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert len(model.calls) == len(rooms.questions) == 1
+    assert row.jira_read_updated == ghost
+
+
+async def test_delayed_null_baseline_read_advances_without_park(
+    session_factory,
+) -> None:
+    """An older row never successfully read still establishes its baseline."""
+    key = await _store_created(session_factory, updated="2026-10-20T13:24:00.426+0700")
+    old = "2026-10-19T13:24:00.426+0700"
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerTicket, key)
+        assert row is not None
+        row.jira_read_updated = old
+        row.last_event_at = datetime.fromisoformat(old)
+        row.jira_seen_comment_ids = None
+        await session.commit()
+    ghost = "2026-10-19T15:24:00.947+0700"
+    rooms, model = IntakeRooms(), ModelMock()
+    worker = scheduler(
+        session_factory, _backlog_jira(ghost), rooms, model, clock=lambda: NOW
+    )
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason is None
+    assert len(model.calls) == len(rooms.questions) == 1
+    assert row.jira_read_updated == ghost
+
+
+async def test_visible_human_change_after_first_read_stops_delivery(
+    session_factory,
+) -> None:
+    key = await _store_created(session_factory, updated="2026-10-20T13:24:00.426+0700")
+    rooms, model = IntakeRooms(), ModelMock()
+    jira = _backlog_jira("2026-10-20T13:24:00.426+0700")
+    worker = scheduler(session_factory, jira, rooms, model, clock=lambda: NOW)
+    await worker.run_once()
+    assert len(rooms.questions) == 1
+    jira.change("other-account")
+    jira.histories[-1]["items"] = [
+        {"field": "status", "fromString": "BACKLOG", "toString": "In Progress"}
+    ]
+    rooms.messages.append(message(1))
+    await scheduler(session_factory, jira, rooms, model, clock=lambda: NOW).run_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert len(rooms.questions) == 1
+
+
 async def test_rank_during_intake_preserves_delivery_and_meaningful_edit_protection(
     session_factory,
 ) -> None:
