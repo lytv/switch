@@ -1041,7 +1041,6 @@ class JiraWorkerScheduler:
                 board=self._admin_board,
                 config=self._config,
                 now=self._clock(),
-                before_wait_send=self._before_wait_send,
             )
         await self._outbox.run_once()
         for job in jobs:

@@ -30,6 +30,7 @@ from switch_core.bridges.jira.admin import (
     set_admin_card_reason,
     sync_admin_card,
 )
+from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.jira.rooms import (
     ADMIN_CARD_COMMAND as ROOMS_ADMIN_CARD_COMMAND,
 )
@@ -488,7 +489,12 @@ async def test_wait_rules_use_work_hours(
         ticket_id=ticket_id,
         now=monday_reminder,
     )
-    assert board.reminders == [
+    assert board.reminders == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == [
         ("room-1", "Reminder: the worker is still waiting for a reply on KAN-1.")
     ]
     ticket = await _ticket(session_factory, ticket_id)
@@ -614,6 +620,49 @@ async def _sync_at(
     )
 
 
+class ReminderRooms:
+    """Fake Switch endpoint for wait-reminder delivery."""
+
+    def __init__(self) -> None:
+        self.notices: list[tuple[str, str]] = []
+
+    async def post_notice(self, room_id: str, *, body: str) -> str:
+        self.notices.append((room_id, body))
+        return "reminder-event-1"
+
+
+def _reminder_sender(
+    factory: async_sessionmaker[AsyncSession],
+    rooms: ReminderRooms,
+    hook: Any = None,
+    **overrides: object,
+) -> JiraOutboxSender:
+    return JiraOutboxSender(
+        session_factory=factory,
+        config=_worker_config(**overrides),
+        clients={},
+        clock=lambda: datetime.now(UTC),
+        rooms=rooms,  # type: ignore[arg-type]
+        before_wait_send=hook,
+    )
+
+
+async def _switch_reminder_rows(
+    factory: async_sessionmaker[AsyncSession],
+) -> list[JiraWorkerOutbox]:
+    async with factory() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.channel == "switch",
+                        JiraWorkerOutbox.command == "wait_reminder",
+                    )
+                )
+            ).all()
+        )
+
+
 @pytest.mark.asyncio
 async def test_reporter_reply_on_the_wait_channel_resets_the_clock(
     session_factory: async_sessionmaker[AsyncSession],
@@ -641,7 +690,7 @@ async def test_reporter_reply_on_the_wait_channel_resets_the_clock(
         reporter_input=True,
     )
     await _sync_at(session_factory, switch_id, board, NOW + timedelta(hours=2))
-    assert board.reminders
+    assert len(await _switch_reminder_rows(session_factory)) == 1
     await _input_event(
         session_factory,
         kind="thread_message",
@@ -763,9 +812,225 @@ async def test_approval_room_message_does_not_reset_the_wait(
         reporter_input=True,
     )
     await _sync_at(session_factory, ticket_id, board, NOW + timedelta(hours=3))
-    assert board.reminders == [
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == [
         ("room-1", "Reminder: the worker is still waiting for a reply on KAN-1.")
     ]
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_survives_a_restart_between_commit_and_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Repro: the reminder must outlive a crash after the milestone commits."""
+    ticket_id = await _seed(
+        session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=NOW - timedelta(hours=3),
+        wait_fired={},
+    )
+    board = FakeAdminBoard()
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    # Reconciliation commits the milestone but sends nothing itself, so a
+    # crash here loses nothing. The reminder waits in the outbox.
+    assert board.reminders == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "pending"
+    # A fresh worker after restart delivers exactly one logical reminder.
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == [
+        ("room-1", "Reminder: the worker is still waiting for a reply on KAN-1.")
+    ]
+    # A second fresh worker and repeated reconciliation send nothing more.
+    await _reminder_sender(session_factory, rooms).run_once()
+    await _sync_at(session_factory, ticket_id, board, NOW)
+    assert len(rooms.notices) == 1
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+
+
+async def _waiting_switch_ticket(
+    factory: async_sessionmaker[AsyncSession], **overrides: object
+) -> str:
+    values: dict[str, object] = {
+        "status": "Waiting for input",
+        "reporter_switch_user_id": "user-1",
+        "wait_channel": "switch",
+        "room_id": "room-1",
+        "wait_anchor": NOW - timedelta(hours=3),
+        "wait_fired": {},
+    }
+    values.update(overrides)
+    ticket_id = await _seed(factory, **values)
+    await _sync_at(factory, ticket_id, FakeAdminBoard(), NOW)
+    rows = await _switch_reminder_rows(factory)
+    assert len(rows) == 1 and rows[0].status == "pending"
+    return ticket_id
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_reply_cancels_before_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _waiting_switch_ticket(session_factory)
+    await _input_event(
+        session_factory,
+        kind="thread_message",
+        received_at=NOW - timedelta(hours=1),
+        reporter_input=True,
+    )
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_anchor_change_cancels_before_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _waiting_switch_ticket(session_factory)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        assert ticket is not None
+        ticket.wait_anchor = NOW
+        await session.commit()
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_park_cancels_before_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _waiting_switch_ticket(session_factory)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        assert ticket is not None
+        ticket.worker_parked_reason = "Human Jira action"
+        await session.commit()
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_completion_cancels_before_send(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ticket_id = await _waiting_switch_ticket(session_factory)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        assert ticket is not None
+        ticket.status = "Done"
+        await session.commit()
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_disabled_project_is_not_sent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _waiting_switch_ticket(session_factory)
+    rooms = ReminderRooms()
+    await _reminder_sender(
+        session_factory, rooms, jira_worker_enabled_projects={}
+    ).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_restart_after_send_start_is_uncertain_without_replay(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _waiting_switch_ticket(session_factory)
+    async with session_factory() as session:
+        row = (await _switch_reminder_rows(session_factory))[0]
+        stored = await session.get(JiraWorkerOutbox, row.id)
+        assert stored is not None
+        stored.status = "sending"
+        await session.commit()
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "uncertain"
+    assert "unknown outcome" in (rows[0].error or "")
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    assert (await _switch_reminder_rows(session_factory))[0].status == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_switch_reminder_failure_is_uncertain_without_replay(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _waiting_switch_ticket(session_factory)
+
+    class FailingRooms(ReminderRooms):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def post_notice(self, room_id: str, *, body: str) -> str:
+            self.calls += 1
+            raise RuntimeError("room unavailable")
+
+    rooms = FailingRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "uncertain"
+    assert "unknown" in (rows[0].error or "")
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.calls == 1
+    assert (await _switch_reminder_rows(session_factory))[0].status == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_switch_reminder_senders_post_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _waiting_switch_ticket(session_factory)
+
+    class BlockingRooms(ReminderRooms):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def post_notice(self, room_id: str, *, body: str) -> str:
+            self.notices.append((room_id, body))
+            self.entered.set()
+            await self.release.wait()
+            return "reminder-event-1"
+
+    rooms = BlockingRooms()
+    first = asyncio.create_task(_reminder_sender(session_factory, rooms).run_once())
+    await asyncio.wait_for(rooms.entered.wait(), timeout=5)
+    await _reminder_sender(session_factory, rooms).run_once()
+    rooms.release.set()
+    await first
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "done"
 
 
 @pytest.mark.asyncio
@@ -801,6 +1066,7 @@ async def test_parked_ticket_does_not_fire_wait_milestones(
     board = FakeAdminBoard()
     await _sync_at(session_factory, ticket_id, board, NOW)
     assert board.reminders == []
+    assert await _switch_reminder_rows(session_factory) == []
     ticket = await _ticket(session_factory, ticket_id)
     assert ("wait_admin" in (ticket.admin_reasons or {})) == ("admin" in fired)
     assert ("wait_blocked" in (ticket.admin_reasons or {})) == ("blocked" in fired)
@@ -1071,10 +1337,10 @@ async def test_card_failure_does_not_repeat_a_switch_reminder(
             ticket_id=ticket_id,
             now=NOW,
         )
-    assert board.reminders == []
-    assert "reminder" not in (
-        (await _ticket(session_factory, ticket_id)).wait_fired or {}
-    )
+    # The milestone and its outbox row commit with the wait state even though
+    # the card render failed; delivery happens through the sender, once.
+    assert "reminder" in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    assert len(await _switch_reminder_rows(session_factory)) == 1
     await sync_admin_card(
         session_factory,
         engine=await _engine(session_factory),
@@ -1083,8 +1349,11 @@ async def test_card_failure_does_not_repeat_a_switch_reminder(
         ticket_id=ticket_id,
         now=NOW + timedelta(minutes=5),
     )
-    assert len(board.reminders) == 1
     assert "reminder" in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
     await sync_admin_card(
         session_factory,
         engine=await _engine(session_factory),
@@ -1093,7 +1362,9 @@ async def test_card_failure_does_not_repeat_a_switch_reminder(
         ticket_id=ticket_id,
         now=NOW + timedelta(minutes=10),
     )
-    assert len(board.reminders) == 1
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
 
 
 @pytest.mark.asyncio
@@ -1495,8 +1766,11 @@ async def test_alert_failure_still_sends_the_reminder_once(
             ticket_id=ticket_id,
             now=NOW,
         )
-    assert len(board.reminders) == 1
     assert "reminder" in ((await _ticket(session_factory, ticket_id)).wait_fired or {})
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
     board.fail = False
     await sync_admin_card(
         session_factory,
@@ -1506,12 +1780,14 @@ async def test_alert_failure_still_sends_the_reminder_once(
         ticket_id=ticket_id,
         now=NOW + timedelta(minutes=1),
     )
-    assert len(board.reminders) == 1
+    assert len(await _switch_reminder_rows(session_factory)) == 1
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
     assert len(board.alerts) == 1
 
 
 @pytest.mark.asyncio
-async def test_wait_refresh_cancels_the_room_reminder(
+async def test_wait_send_hook_cancels_the_room_reminder(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     ticket_id = await _seed(
@@ -1539,13 +1815,15 @@ async def test_wait_refresh_cancels_the_room_reminder(
         config=_worker_config(),
         ticket_id=ticket_id,
         now=NOW,
-        before_wait_send=refresh,
     )
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "pending"
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms, hook=refresh).run_once()
     assert calls == [ticket_id]
-    assert board.reminders == []
-    assert "reminder" not in (
-        (await _ticket(session_factory, ticket_id)).wait_fired or {}
-    )
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -1582,10 +1860,15 @@ async def test_reply_before_reminder_send_is_not_posted(
         ticket_id=ticket_id,
         now=NOW,
     )
-    assert board.reminders == []
-    assert "reminder" not in (
-        (await _ticket(session_factory, ticket_id)).wait_fired or {}
-    )
+    # The reply landed after the milestone was queued but before any send,
+    # so the sender must cancel the reminder instead of posting it.
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -2025,7 +2308,9 @@ async def test_wait_thresholds_follow_the_configured_work_day(
 
     assert (await sync(2 - 1 / 60)).wait_fired == {}
     assert "reminder" in ((await sync(2)).wait_fired or {})
-    assert len(board.reminders) == 1
+    rooms = ReminderRooms()
+    await _reminder_sender(session_factory, rooms).run_once()
+    assert len(rooms.notices) == 1
     assert "wait_admin" not in ((await sync(4 - 1 / 60)).admin_reasons or {})
     assert "wait_admin" in ((await sync(4)).admin_reasons or {})
     assert "wait_blocked" not in ((await sync(day_hours - 1 / 60)).admin_reasons or {})

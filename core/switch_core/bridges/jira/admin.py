@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import JSON, and_, delete, func, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
@@ -30,6 +30,7 @@ from switch_core.bridges.jira.outbox import (
     TOKEN_LIMIT,
     TURN_FAILED,
     WAIT_COMMAND_PREFIXES,
+    WAIT_REMINDER_COMMAND,
     enqueue_jira_command,
     needs_person,
     read_jira_version,
@@ -51,8 +52,6 @@ if TYPE_CHECKING:
     from switch_core.bridges.jira.worker import JiraPollClient
 
 logger = logging.getLogger(__name__)
-
-WaitRefresh = Callable[[str], Awaitable[bool]]
 
 ADMIN_ROOM_MARKER = "jira_worker_admin_room"
 ADMIN_ROOM_LOCK = "jira-worker-admin-room"
@@ -395,7 +394,6 @@ async def reconcile_admin_cards(
     board: AdminBoard,
     config: SwitchConfig,
     now: datetime | None = None,
-    before_wait_send: WaitRefresh | None = None,
 ) -> int:
     """Post or edit one card per ticket that currently needs one."""
     if not any(config.jira_worker_enabled_projects.values()):
@@ -438,7 +436,6 @@ async def reconcile_admin_cards(
                 config=config,
                 ticket_id=ticket_id,
                 now=moment,
-                before_wait_send=before_wait_send,
             )
         except Exception:
             logger.exception("Jira admin card sync failed for %s", ticket_id)
@@ -456,7 +453,6 @@ async def sync_admin_card(
     config: SwitchConfig,
     ticket_id: str,
     now: datetime | None = None,
-    before_wait_send: WaitRefresh | None = None,
 ) -> bool:
     async with ticket_turn_lock(engine, f"admin-card:{ticket_id}") as locked:
         if not locked:
@@ -467,7 +463,6 @@ async def sync_admin_card(
             config=config,
             ticket_id=ticket_id,
             now=now or datetime.now(UTC),
-            before_wait_send=before_wait_send,
         )
 
 
@@ -953,9 +948,7 @@ async def _sync_admin_card(
     config: SwitchConfig,
     ticket_id: str,
     now: datetime,
-    before_wait_send: WaitRefresh | None,
 ) -> bool:
-    reminders: list[tuple[str, str]] = []
     needs_card = False
     async with session_factory() as session:
         ticket = await session.scalar(
@@ -968,7 +961,7 @@ async def _sync_admin_card(
         previous = set(ticket.admin_reasons or {})
         instance = ticket.instance
         issue_key = ticket.issue_key
-        await _apply_state(session, ticket, config, now, reminders)
+        await _apply_state(session, ticket, config, now)
         await _record_reason_alerts(session, ticket, previous)
         reasons = {
             str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
@@ -976,12 +969,8 @@ async def _sync_admin_card(
         needs_card = bool(reasons) or ticket.admin_card_event_id is not None
         if not needs_card:
             await _consume_follow_ups(session, ticket.id)
-            _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
     if not needs_card:
-        await _send_switch_reminders(
-            session_factory, board, config, ticket_id, reminders, before_wait_send
-        )
         return True
     async with session_factory() as session:
         ticket = await session.scalar(
@@ -1019,16 +1008,8 @@ async def _sync_admin_card(
                 await board.edit_card(room_id, event_id, body=body)
         ticket.admin_card_event_id = event_id
         await _consume_follow_ups(session, ticket.id)
-        _mark_switch_reminder(ticket, now, reminders)
         await session.commit()
-    try:
-        await _deliver_reason_alerts(
-            session_factory, board, instance, issue_key, room_id
-        )
-    finally:
-        await _send_switch_reminders(
-            session_factory, board, config, ticket_id, reminders, before_wait_send
-        )
+    await _deliver_reason_alerts(session_factory, board, instance, issue_key, room_id)
     return True
 
 
@@ -1046,54 +1027,11 @@ async def wait_send_cancelled(
     )
 
 
-async def _clear_reminder_fired(
-    session_factory: async_sessionmaker[AsyncSession], ticket_id: str
-) -> None:
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
-        if ticket is None:
-            return
-        fired = dict(ticket.wait_fired or {})
-        fired.pop("reminder", None)
-        ticket.wait_fired = fired
-        await session.commit()
-
-
-async def _send_switch_reminders(
-    session_factory: async_sessionmaker[AsyncSession],
-    board: AdminBoard,
-    config: SwitchConfig,
-    ticket_id: str,
-    reminders: list[tuple[str, str]],
-    before_wait_send: WaitRefresh | None,
-) -> None:
-    if not reminders:
-        return
-    try:
-        if before_wait_send is not None and await before_wait_send(ticket_id):
-            await _clear_reminder_fired(session_factory, ticket_id)
-            return
-        async with session_factory() as session:
-            ticket = await session.get(JiraWorkerTicket, ticket_id)
-            cancelled = ticket is None or await wait_send_cancelled(
-                session, ticket, config
-            )
-        if cancelled:
-            await _clear_reminder_fired(session_factory, ticket_id)
-            return
-        for room_id, body in reminders:
-            await board.remind_reporter(room_id=room_id, body=body)
-    except Exception:
-        await _clear_reminder_fired(session_factory, ticket_id)
-        raise
-
-
 async def _apply_state(
     session: AsyncSession,
     ticket: JiraWorkerTicket,
     config: SwitchConfig,
     now: datetime,
-    reminders: list[tuple[str, str]],
 ) -> None:
     reasons = {
         str(key): str(value)
@@ -1103,7 +1041,7 @@ async def _apply_state(
     if is_terminal_ticket_status(ticket.status):
         await enqueue_admin_card_follow_up(session, ticket)
         ticket.admin_reasons = None
-        await _apply_wait(session, ticket, config, now, {}, reminders)
+        await _apply_wait(session, ticket, config, now, {})
         return
     if ticket.intake_state is not None:
         if ticket.intake_state.get("phase") == "limit":
@@ -1136,7 +1074,7 @@ async def _apply_state(
         )
     if needs_person(ticket.worker_parked_reason):
         reasons["parked"] = ticket.worker_parked_reason or "parked"
-    await _apply_wait(session, ticket, config, now, reasons, reminders)
+    await _apply_wait(session, ticket, config, now, reasons)
     ticket.admin_reasons = reasons or None
 
 
@@ -1174,16 +1112,6 @@ async def _latest_wait_reply(
     return found
 
 
-def _mark_switch_reminder(
-    ticket: JiraWorkerTicket, now: datetime, reminders: list[tuple[str, str]]
-) -> None:
-    if not reminders:
-        return
-    fired = dict(ticket.wait_fired or {})
-    fired["reminder"] = now.isoformat()
-    ticket.wait_fired = fired
-
-
 async def _cancel_wait_commands(
     session: AsyncSession, ticket: JiraWorkerTicket
 ) -> None:
@@ -1215,7 +1143,6 @@ async def _apply_wait(
     config: SwitchConfig,
     now: datetime,
     reasons: dict[str, str],
-    reminders: list[tuple[str, str]],
 ) -> None:
     waiting_for_input = ticket.status == config.jira_worker_statuses.waiting_for_input
     waiting = waiting_for_input or (
@@ -1254,12 +1181,11 @@ async def _apply_wait(
         anchor, WAIT_REMINDER_HOURS, calendar
     ):
         try:
-            await _send_reminder(session, ticket, config, anchor, reminders)
+            await _send_reminder(session, ticket, config, anchor)
         except _WaitNotReady:
             logger.warning("Jira wait reminder for %s is not ready", ticket.issue_key)
         else:
-            if ticket.wait_channel == "jira_comments":
-                fired["reminder"] = now.isoformat()
+            fired["reminder"] = now.isoformat()
     if "admin" not in fired and now >= add_work_time(
         anchor, WAIT_ADMIN_HOURS, calendar
     ):
@@ -1287,7 +1213,6 @@ async def _send_reminder(
     ticket: JiraWorkerTicket,
     config: SwitchConfig,
     anchor: datetime,
-    reminders: list[tuple[str, str]],
 ) -> None:
     body = f"Reminder: the worker is still waiting for a reply on {ticket.issue_key}."
     if ticket.wait_channel == "jira_comments":
@@ -1306,7 +1231,23 @@ async def _send_reminder(
         return
     if not ticket.room_id:
         raise _WaitNotReady()
-    reminders.append((ticket.room_id, body))
+    await session.execute(
+        insert(JiraWorkerOutbox)
+        .values(
+            id=str(uuid.uuid4()),
+            channel="switch",
+            instance=ticket.instance,
+            issue_key=ticket.issue_key,
+            command_key=f"wait-reminder:{ticket.id}:{anchor.isoformat()}",
+            command=WAIT_REMINDER_COMMAND,
+            payload={
+                "room_id": ticket.room_id,
+                "data": body,
+                "wait_anchor": anchor.isoformat(),
+            },
+        )
+        .on_conflict_do_nothing(index_elements=["instance", "command_key"])
+    )
 
 
 async def _enqueue_blocked(
