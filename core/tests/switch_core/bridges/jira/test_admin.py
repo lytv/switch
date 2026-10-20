@@ -54,7 +54,13 @@ from switch_core.db.models import (
     User,
 )
 from switch_core.room_service import RoomCreateConfig
-from tests.switch_core.bridges.jira.test_outbox import JiraMock, enqueue, sender_for
+from tests.switch_core.bridges.jira.test_activity import ThreadRooms, message
+from tests.switch_core.bridges.jira.test_outbox import (
+    JiraMock,
+    client_for,
+    enqueue,
+    sender_for,
+)
 from tests.switch_core.bridges.jira.test_worker import (
     _config,
     _run_migrations,
@@ -871,6 +877,122 @@ async def _waiting_switch_ticket(
     rows = await _switch_reminder_rows(factory)
     assert len(rows) == 1 and rows[0].status == "pending"
     return ticket_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["send", "reply", "park", "completion"])
+async def test_switch_reminder_refreshes_through_the_scheduler(
+    session_factory: async_sessionmaker[AsyncSession], outcome: str
+) -> None:
+    await _waiting_switch_ticket(
+        session_factory,
+        card_event_id="card-room-1",
+        jira_read_updated=NOW.isoformat(),
+        jira_read_changelog_id="",
+    )
+    jira = JiraMock()
+    jira.updated = NOW.isoformat()
+    jira.status = "Waiting for input"
+    rooms = ThreadRooms()
+    if outcome == "reply":
+        rooms.messages = [message(1, sender="user-1")]
+    elif outcome == "park":
+        jira.change("human-account")
+    elif outcome == "completion":
+        jira.change("worker-account")
+        jira.status = "Done"
+        jira.histories[-1]["items"] = [{"field": "status", "toString": "Done"}]
+
+    def scheduler() -> JiraWorkerScheduler:
+        return JiraWorkerScheduler(
+            session_factory=session_factory,
+            config=_worker_config(),
+            poll_clients={"acme": client_for(jira)},
+            ticket_rooms=rooms,
+            clock=lambda: datetime.now(UTC),
+        )
+
+    if outcome == "send":
+        jira.issue_read_started = asyncio.Event()
+        jira.issue_read_release = asyncio.Event()
+        first = asyncio.create_task(scheduler()._outbox.run_once())
+        try:
+            await asyncio.wait_for(jira.issue_read_started.wait(), timeout=5)
+            await asyncio.wait_for(scheduler()._outbox.run_once(), timeout=5)
+            assert rooms.notices == []
+        finally:
+            jira.issue_read_release.set()
+            await first
+    else:
+        await scheduler()._outbox.run_once()
+    await scheduler()._outbox.run_once()
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1
+    if outcome == "send":
+        assert rooms.notices == [
+            ("room-1", "Reminder: the worker is still waiting for a reply on KAN-1.")
+        ]
+        assert rows[0].status == "done"
+        assert rows[0].attempts == 1
+    else:
+        assert rooms.notices == []
+        assert rows[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["anchor", "reply", "park", "completion", "disable", "cancel"]
+)
+async def test_switch_reminder_rechecks_state_after_refresh(
+    session_factory: async_sessionmaker[AsyncSession], change: str
+) -> None:
+    ticket_id = await _waiting_switch_ticket(session_factory)
+    config = _worker_config()
+
+    async def refresh(refreshed_id: str) -> bool:
+        assert refreshed_id == ticket_id
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
+            assert ticket is not None
+            if change == "anchor":
+                ticket.wait_anchor = NOW
+            elif change == "reply":
+                await _input_event(
+                    session_factory,
+                    kind="thread_message",
+                    received_at=NOW - timedelta(hours=1),
+                    reporter_input=True,
+                )
+            elif change == "park":
+                ticket.worker_parked_reason = "Human Jira action"
+            elif change == "completion":
+                ticket.status = "Done"
+            elif change == "disable":
+                config.jira_worker_enabled_projects = {}
+            else:
+                row = await session.scalar(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.command == "wait_reminder"
+                    )
+                )
+                assert row is not None
+                row.status = "cancelled"
+            await session.commit()
+        return False
+
+    rooms = ReminderRooms()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config,
+        clients={},
+        clock=lambda: datetime.now(UTC),
+        rooms=rooms,  # type: ignore[arg-type]
+        before_wait_send=refresh,
+    )
+    await asyncio.wait_for(sender.run_once(), timeout=5)
+    assert rooms.notices == []
+    rows = await _switch_reminder_rows(session_factory)
+    assert len(rows) == 1 and rows[0].status == "cancelled"
 
 
 @pytest.mark.asyncio

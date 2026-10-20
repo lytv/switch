@@ -648,6 +648,14 @@ class JiraOutboxSender:
             logger.error("Wait reminder %s: %s", row.id, row.error)
             await session.commit()
             return
+        cancelled = False
+        if self._before_wait_send is not None:
+            await session.commit()
+            cancelled = await self._before_wait_send(ticket.id)
+            await session.refresh(row, with_for_update=True)
+            if row.status not in ("pending", "claimed"):
+                return
+            await session.refresh(ticket, with_for_update=True)
         payload = row.payload or {}
         anchor = ticket.wait_anchor
         anchor_text = anchor.isoformat() if anchor is not None else None
@@ -656,28 +664,17 @@ class JiraOutboxSender:
             row.error = "Wait anchor changed before send"
             await session.commit()
             return
-        if ticket.worker_parked_reason or await wait_send_cancelled(
-            session, ticket, self._config
+        if (
+            cancelled
+            or ticket.project_key
+            not in self._config.jira_worker_enabled_projects.get(ticket.instance, [])
+            or ticket.worker_parked_reason
+            or await wait_send_cancelled(session, ticket, self._config)
         ):
             row.status = "cancelled"
             row.error = ticket.worker_parked_reason or "Wait ended before send"
             await session.commit()
             return
-        if self._before_wait_send is not None:
-            cancelled = await self._before_wait_send(ticket.id)
-            await session.refresh(ticket)
-            if cancelled:
-                fresh = await session.get(
-                    JiraWorkerOutbox,
-                    row.id,
-                    with_for_update=True,
-                    populate_existing=True,
-                )
-                if fresh is not None and fresh.status == "pending":
-                    fresh.status = "cancelled"
-                    fresh.error = "Wait ended before send"
-                    await session.commit()
-                return
         row.status = "sending"
         row.attempts += 1
         await session.commit()
