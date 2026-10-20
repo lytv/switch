@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _ACTIVE = ("pending", "claimed", "sending")
 WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
 INTAKE_QUESTION_COMMAND = "intake_question"
+WAIT_REMINDER_COMMAND = "wait_reminder"
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -285,7 +286,11 @@ class JiraOutboxSender:
                                 and_(
                                     JiraWorkerOutbox.channel == "switch",
                                     JiraWorkerOutbox.command.in_(
-                                        ("wrong_place_notice", INTAKE_QUESTION_COMMAND)
+                                        (
+                                            "wrong_place_notice",
+                                            INTAKE_QUESTION_COMMAND,
+                                            WAIT_REMINDER_COMMAND,
+                                        )
                                     ),
                                     literal(self._rooms is not None),
                                 ),
@@ -379,6 +384,8 @@ class JiraOutboxSender:
         if row.channel == "switch":
             if row.command == INTAKE_QUESTION_COMMAND:
                 await self._send_switch_question(session, row, ticket)
+            elif row.command == WAIT_REMINDER_COMMAND:
+                await self._send_switch_wait_reminder(session, row, ticket)
             else:
                 await self._send_switch_notice(session, row)
             return
@@ -623,6 +630,60 @@ class JiraOutboxSender:
             row.status = "uncertain"
             row.error = f"{type(exc).__name__}: Room notice outcome is unknown; automatic replay is unsafe"
             logger.exception("Switch notice %s failed", row.id)
+        else:
+            row.status = "done"
+            row.error = None
+        await session.commit()
+
+    async def _send_switch_wait_reminder(
+        self, session: AsyncSession, row: JiraWorkerOutbox, ticket: JiraWorkerTicket
+    ) -> None:
+        from switch_core.bridges.jira.admin import wait_send_cancelled
+
+        if self._rooms is None:
+            raise ValueError("Wait reminder sender requires ticket rooms")
+        if row.status == "sending":
+            row.status = "uncertain"
+            row.error = "Restart found a wait reminder with an unknown outcome; automatic replay is unsafe"
+            logger.error("Wait reminder %s: %s", row.id, row.error)
+            await session.commit()
+            return
+        cancelled = False
+        if self._before_wait_send is not None:
+            await session.commit()
+            cancelled = await self._before_wait_send(ticket.id)
+            await session.refresh(row, with_for_update=True)
+            if row.status not in ("pending", "claimed"):
+                return
+            await session.refresh(ticket, with_for_update=True)
+        payload = row.payload or {}
+        anchor = ticket.wait_anchor
+        anchor_text = anchor.isoformat() if anchor is not None else None
+        if anchor_text is None or payload.get("wait_anchor") != anchor_text:
+            row.status = "cancelled"
+            row.error = "Wait anchor changed before send"
+            await session.commit()
+            return
+        if (
+            cancelled
+            or ticket.project_key
+            not in self._config.jira_worker_enabled_projects.get(ticket.instance, [])
+            or ticket.worker_parked_reason
+            or await wait_send_cancelled(session, ticket, self._config)
+        ):
+            row.status = "cancelled"
+            row.error = ticket.worker_parked_reason or "Wait ended before send"
+            await session.commit()
+            return
+        row.status = "sending"
+        row.attempts += 1
+        await session.commit()
+        try:
+            await self._rooms.post_notice(payload["room_id"], body=payload["data"])
+        except Exception as exc:
+            row.status = "uncertain"
+            row.error = f"{type(exc).__name__}: Wait reminder outcome is unknown; automatic replay is unsafe"
+            logger.exception("Wait reminder %s failed", row.id)
         else:
             row.status = "done"
             row.error = None

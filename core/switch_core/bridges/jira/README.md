@@ -129,7 +129,10 @@ Wait timers count work hours on `JIRA_WORKER_CALENDAR` (default Monday-Friday
 09:00-17:00 UTC). The reminder is 2 work hours and goes to the reporter on the
 ticket wait channel. The admin alert is 4 work hours. Blocked follows one
 work day, using the calendar's daily window. These thresholds are fixed.
-A disabled project is left unchanged.
+A disabled project is left unchanged. A Switch reminder is a durable outbox
+command: reconciliation queues it atomically with its wait milestone, and the
+sender posts it after rechecking the wait. A reminder with an unknown send
+outcome becomes `uncertain` and is never replayed automatically.
 
 An admin accepts a stored `ignored_input` event with
 `POST /jira-triggers/worker/inputs/{event_id}/accept`. That writes a new
