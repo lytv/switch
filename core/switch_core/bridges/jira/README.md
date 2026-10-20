@@ -69,6 +69,7 @@ latest attributable worker comment creation or edit. A new comment must belong
 to the worker. A seen comment must have the worker as its update author.
 Transitions, field changes, reporter comments, and unrelated changes keep exact
 stamp attribution. A tied non-comment or reporter item also keeps exact attribution.
+The first read establishes its baseline from visible history and comments only, so stamp drift alone never parks it.
 Missing known comments, missing history, visible other-author actions, and
 regressed stamps still stop the worker. History reads require exact before/after stamps.
 Accepted limitation: a human comment hidden from the bot inside that one-second
