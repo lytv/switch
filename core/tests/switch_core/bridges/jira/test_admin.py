@@ -952,7 +952,9 @@ async def test_switch_reminder_rechecks_state_after_refresh(
     async def refresh(refreshed_id: str) -> bool:
         assert refreshed_id == ticket_id
         async with session_factory() as session:
-            ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
+            ticket = await session.get(
+                JiraWorkerTicket, ticket_id, with_for_update=True
+            )
             assert ticket is not None
             if change == "anchor":
                 ticket.wait_anchor = NOW
