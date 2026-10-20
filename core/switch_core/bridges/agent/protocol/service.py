@@ -1194,7 +1194,7 @@ class ProtocolService:
             return
         bridge_core = self.collab_lifecycle.get(room.bridge_id)
         if bridge_core is not None:
-            bridge_type = bridge_core._bridge_type
+            bridge_type: str | None = bridge_core._bridge_type
         else:
             async with self.session_factory() as session:
                 stored = await self.bridge_store.get(session, room.bridge_id)
