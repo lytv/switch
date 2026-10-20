@@ -1,9 +1,12 @@
 """One Jira observer shared by every read path.
 
 Comment IDs identify new input. Meaningful non-worker history and unknown
-changes park intake. Verified Rank-only history does not. A forward stamp gap
-up to one second requires that every latest attributable item is a worker-owned
-comment or Rank-only history; other items require exact stamp attribution.
+changes park intake. Verified Rank-only history does not. The first read
+establishes the baseline: it judges visible history and comments only, so
+stamp drift alone never parks it. Later reads, and every send-time version
+check, keep exact stamp attribution apart from the bounded worker/Rank gap.
+Accepted risk: an edit that moves the stamp with no visible evidence before
+the first read passes unnoticed.
 """
 
 from __future__ import annotations
@@ -234,7 +237,7 @@ def observe_jira(
             new_ids=frozenset(new_ids),
             reporter_new=tuple(reporter_new),
             reporter_edits=tuple(edits),
-            park="unattributed",
+            park=None if first else "unattributed",
             seen_ids=tuple(sorted(seen_ids | current_ids)),
             changelog_id=current_changelog,
         )
@@ -254,7 +257,7 @@ def observe_jira(
                 new_ids=frozenset(new_ids),
                 reporter_new=tuple(reporter_new),
                 reporter_edits=tuple(edits),
-                park="stamp_mismatch",
+                park=None if first else "stamp_mismatch",
                 seen_ids=tuple(sorted(seen_ids | current_ids)),
                 changelog_id=current_changelog,
             )
