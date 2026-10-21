@@ -487,12 +487,80 @@ async def test_five_questions_then_admin_reason_and_clear_on_completion(
     await worker.activity.read_ticket(key, force_jira=True)
     await worker.run_once()
     row = await ticket(session_factory, key)
-    assert row.intake_state["phase"] == "limit"
+    assert row.intake_state["phase"] == "question"
     assert row.intake_state["cycle"] == 1
+    assert row.intake_state["questions"] == 1
+    assert sum("question" in item for item in row.intake_state["history"]) == 6
+    assert len(rooms.questions) == 6 and len(model.calls) == 8
+    assert INTAKE_REASON not in (row.admin_reasons or {})
+
+
+async def test_reject_after_five_questions_starts_new_cycle(session_factory) -> None:
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock()
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    for index in range(1, 6):
+        rooms.messages.append(message(index))
+        await worker.run_once()
+    assert len(rooms.questions) == 5
+    model.actions = ["complete"]
+    rooms.messages.append(message(6))
+    await worker.run_once()
+    assert jira.status == "Waiting for approval"
+    assert (await ticket(session_factory, key)).intake_state["phase"] == "approval"
+    jira.transition("Waiting for input", "approver-account")
+    await worker.activity.read_ticket(key, force_jira=True)
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.intake_state["phase"] == "question"
+    assert row.intake_state["cycle"] == 1
+    assert row.intake_state["questions"] == 1
+    assert len(rooms.questions) == 6
+    assert rooms.questions[5][:2] == ("room-1", "card-room-1")
+    assert INTAKE_REASON not in (row.admin_reasons or {})
+    await scheduler(session_factory, jira, rooms, model).run_once()
+    await worker.activity.read_ticket(key, force_jira=True)
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.intake_state["questions"] == 1
+    assert len(rooms.questions) == 6
+    rooms.messages.append(message(7))
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert jira.status == "Waiting for approval"
+    assert row.intake_state["phase"] == "approval"
+    assert len(rooms.questions) == 6
+
+
+async def test_new_cycle_after_reject_reaches_its_own_limit(session_factory) -> None:
+    key = await start_ticket(session_factory)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock()
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    model.actions = ["complete"]
+    rooms.messages.append(message(1))
+    await worker.run_once()
+    assert jira.status == "Waiting for approval"
+    jira.transition("Waiting for input", "approver-account")
+    await worker.activity.read_ticket(key, force_jira=True)
+    await worker.run_once()
+    assert (await ticket(session_factory, key)).intake_state["questions"] == 1
+    model.actions = ["question"]
+    for index in range(2, 6):
+        rooms.messages.append(message(index))
+        await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.intake_state["questions"] == 5
+    assert row.intake_state["phase"] == "question"
+    assert len(rooms.questions) == 6
+    rooms.messages.append(message(6))
+    await worker.run_once()
+    row = await ticket(session_factory, key)
     assert row.intake_state["questions"] == 6
-    assert sum("question" in item for item in row.intake_state["history"]) == 5
-    assert len(rooms.questions) == 5 and len(model.calls) == 8
-    assert INTAKE_REASON in row.admin_reasons
+    assert row.intake_state["phase"] == "limit"
+    assert len(rooms.questions) == 6
+    assert INTAKE_REASON in (row.admin_reasons or {})
 
 
 class CommentDriftJira(IntakeJira):
@@ -574,7 +642,7 @@ async def test_approve_archives_through_existing_path(session_factory) -> None:
     assert len(model.calls) == 1
 
 
-async def test_reject_resumes_intake_without_resetting_question_count(
+async def test_reject_starts_new_cycle_with_fresh_question_count(
     session_factory,
 ) -> None:
     key = await start_ticket(session_factory)
@@ -593,7 +661,7 @@ async def test_reject_resumes_intake_without_resetting_question_count(
     await scheduler(session_factory, jira, rooms, model).run_once()
     row = await ticket(session_factory, key)
     assert row.worker_parked_reason is None
-    assert row.intake_state["cycle"] == 1 and row.intake_state["questions"] == 2
+    assert row.intake_state["cycle"] == 1 and row.intake_state["questions"] == 1
     assert len(rooms.questions) == 2
     assert len(model.calls) == 2
     assert "need correction" in rooms.questions[-1][2]

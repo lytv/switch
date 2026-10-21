@@ -240,7 +240,8 @@ After five questions, a request for another question raises `intake_questions`
 on the admin card and sends no further question. The transcript does not record
 an unsent over-limit question. Reporter or admin-accepted
 input can resolve the missing requirements. A completed intake clears that
-reason. The question count remains cumulative for the ticket, including Reject.
+reason. The question count resets to zero when a human Reject starts a new
+approval cycle; each cycle has its own budget of five questions.
 
 Completion queues one Jira summary comment per approval cycle, then a dependent
 Waiting for approval transition. Both use the existing compare-read-write
@@ -251,7 +252,8 @@ restriction on Approve and Reject; the worker does not grant approval rights.
 
 A clean Jira status change from Waiting for approval to Waiting for input
 resumes intake with a question about the required corrections, before another
-summary can be queued. That question also counts toward the five-question limit.
+summary can be queued. That question is the first question of the new cycle's
+five-question budget.
 Any accompanying human field change, unrelated comment, or
 existing human park still stops the worker. The worker never clears that park.
 Role agents, code work, routing, attachments, and linked tickets remain out of scope.

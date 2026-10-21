@@ -693,6 +693,7 @@ class TicketActivity:
             **state,
             "phase": "intake",
             "cycle": state.get("cycle", 0) + 1,
+            "questions": 0,
             "history": [
                 *state.get("history", []),
                 {"jira_rejection": "The approver rejected the intake summary."},
