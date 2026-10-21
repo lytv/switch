@@ -31,7 +31,7 @@ from switch_core.transport import TransportHandlers
 
 
 @pytest.mark.parametrize(
-    "target", ["Waiting for input", "Waiting for approval", "Done"]
+    "target", ["Waiting for input", "Waiting for approval", "Done", "To Do"]
 )
 @pytest.mark.parametrize("fail_first", [False, True])
 async def test_status_edit_reaches_original_native_card(
@@ -57,6 +57,11 @@ async def test_status_edit_reaches_original_native_card(
         calls.append(("close", channel_id))
         archived = True
 
+    def reopen(channel_id):
+        nonlocal archived
+        calls.append(("reopen", channel_id))
+        archived = False
+
     adapter = MattermostAdapter(
         config=MattermostConnectionConfig(
             url="https://mattermost.example.invalid",
@@ -68,7 +73,7 @@ async def test_status_edit_reaches_original_native_card(
     adapter._main_loop = asyncio.get_running_loop()
     adapter._admin_driver = SimpleNamespace(
         posts=SimpleNamespace(patch_post=patch),
-        channels=SimpleNamespace(delete_channel=close),
+        channels=SimpleNamespace(delete_channel=close, restore_channel=reopen),
     )
 
     async def send(channel_id, sender_name, content, thread_root_id=None):
@@ -130,7 +135,7 @@ async def test_status_edit_reaches_original_native_card(
         )
 
     try:
-        initial = body("BACKLOG")
+        initial = body("Done" if target == "To Do" else "BACKLOG")
         sent = await sender.send_message(transport_room_id, initial, sender_name="jira")
         reply = await sender.send_message(
             transport_room_id,
@@ -168,6 +173,8 @@ async def test_status_edit_reaches_original_native_card(
         rooms._jira_agent_id = AsyncMock(return_value="jira-agent")
         ticket = SimpleNamespace(status=target, card_event_id=sent.event_id)
         updater = SwitchCardUpdater(ticket_rooms=rooms)
+        if target == "To Do":
+            await rooms.set_archived(room_id, archived=True)
 
         if fail_first:
             with pytest.raises(RuntimeError, match="native edit refused"):
@@ -224,6 +231,10 @@ async def test_status_edit_reaches_original_native_card(
         assert archived == (target == "Done")
         if archived:
             assert calls[-1] == ("close", "channel-test")
+        if target == "To Do":
+            assert calls.index(("reopen", "channel-test")) < calls.index(
+                ("patch", "post-0")
+            )
     finally:
         receiver._unwatch_all()
 
