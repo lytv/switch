@@ -4,7 +4,8 @@ Comment IDs identify new input. Meaningful non-worker history and unknown
 changes park intake. Verified Rank-only history does not. The first read
 establishes the baseline: it judges visible history and comments only, so
 stamp drift alone never parks it. Later reads, and every send-time version
-check, keep exact stamp attribution apart from the bounded worker/Rank gap.
+check, keep exact stamp attribution apart from the bounded worker/Rank gap
+and newly created, unedited comments owned by the ticket's actual reporter.
 Accepted risk: an edit that moves the stamp with no visible evidence before
 the first read passes unnoticed.
 """
@@ -208,9 +209,12 @@ def observe_jira(
         comment = by_id[comment_id]
         actor = comment_actor(comment)
         if actor == worker_account or (actor and actor == reporter_account):
-            own_comment = actor == worker_account and _author(comment) == worker_account
-            attributable.append((_stamp(comment["created"]), own_comment))
-            attributable.append((_stamp(comment["updated"]), own_comment))
+            owned_comment = _author(comment) == actor and (
+                actor == worker_account
+                or _stamp(comment["created"]) == _stamp(comment["updated"])
+            )
+            attributable.append((_stamp(comment["created"]), owned_comment))
+            attributable.append((_stamp(comment["updated"]), owned_comment))
     for comment_id in sorted(seen_comments):
         comment = by_id[comment_id]
         if _stamp(comment["updated"]) <= base_stamp:

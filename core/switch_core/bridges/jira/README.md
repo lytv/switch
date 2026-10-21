@@ -69,15 +69,17 @@ discovered on that read parks the ticket and enqueues the same room and admin-ca
 follow-ups as webhook and poll intake.
 
 The shared observer permits an issue updated stamp up to one second after the
-latest attributable worker comment creation or edit. A new comment must belong
-to the worker. A seen comment must have the worker as its update author.
-Transitions, field changes, reporter comments, and unrelated changes keep exact
-stamp attribution. A tied non-comment or reporter item also keeps exact attribution.
+latest attributable worker-owned comment, Rank-only history, or new unedited
+comment owned by the ticket's actual Jira reporter. Reporter comments still use
+the ticket's selected wait channel: Jira fallback accepts answers; room-based
+intake sends wrong-place guidance. Seen reporter edits, transitions, field changes,
+and unrelated changes keep exact stamp attribution. A tied item that needs exact
+attribution also keeps that requirement.
 The first read establishes its baseline from visible history and comments only, so stamp drift alone never parks it.
 Missing known comments, missing history, visible other-author actions, and
 regressed stamps still stop the worker. History reads require exact before/after stamps.
-Accepted limitation: a human comment hidden from the bot inside that one-second
-window cannot be distinguished from Jira's worker-comment timestamp drift.
+Accepted limitation: an unseen human change inside that one-second window cannot
+be distinguished from Jira's comment or Rank timestamp drift.
 
 Reporter input and due timers request a wake. They do not change Jira wait status.
 A human Jira action, Done, cancel, or an exhausted token budget parks the agent.

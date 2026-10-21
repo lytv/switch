@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -32,7 +32,10 @@ async def commands(factory):
         return list((await session.scalars(select(JiraWorkerOutbox))).all())
 
 
-async def test_waiting_room_ticket_detects_jira_answer_on_refresh(session_factory):
+@pytest.mark.parametrize("gap_ms", [0, 50])
+async def test_waiting_room_ticket_detects_jira_answer_on_refresh(
+    session_factory, gap_ms
+):
     key = await seed(session_factory)
     state = {"phase": "question", "questions": 1, "history": [{"question": "Q1"}]}
     async with session_factory() as session:
@@ -45,6 +48,9 @@ async def test_waiting_room_ticket_detects_jira_answer_on_refresh(session_factor
     await reader.read_once()
     baseline_requests = len(jira.requests)
     jira.change("reporter-account", comment=True)
+    jira.updated = (
+        datetime.fromisoformat(jira.updated) + timedelta(milliseconds=gap_ms)
+    ).isoformat()
     interval = reader._config.jira_worker_poll_interval_seconds
     now[0] += timedelta(seconds=interval - 1)
     await reader.read_once()
