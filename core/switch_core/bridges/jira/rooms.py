@@ -280,13 +280,16 @@ async def _apply_description_and_archive(
     room_id: str,
     body: str,
 ) -> None:
+    want_archived = is_terminal_ticket_status(ticket.status)
+    archived = bool(await rooms.is_archived(room_id))
+    if archived and not want_archived:
+        await rooms.set_archived(room_id, archived=False)
     if cards is not None and ticket.card_event_id is not None:
         stored = await rooms.get_room_description(room_id)
         if body != stored:
             await cards.update_card(room_id, event_id=ticket.card_event_id, body=body)
-    want_archived = is_terminal_ticket_status(ticket.status)
-    if bool(await rooms.is_archived(room_id)) != want_archived:
-        await rooms.set_archived(room_id, archived=want_archived)
+    if want_archived and not archived:
+        await rooms.set_archived(room_id, archived=True)
 
 
 async def _find_history_message(
@@ -940,16 +943,8 @@ class SwitchTicketRooms:
                 raise TerminalChannelCloseError(str(exc)) from exc
             await self._rooms.set_room_archived(room_id, True)
             return
+        await self._rooms.reopen_bridged_channel(room_id)
         await self._rooms.set_room_archived(room_id, False)
-        try:
-            await self._rooms.reopen_bridged_channel(room_id)
-        except Exception as exc:
-            logger.warning(
-                "Jira channel reopen failed for room %s: %s",
-                room_id,
-                exc,
-                exc_info=True,
-            )
 
     async def set_room_owner(self, room_id: str, *, owner_id: str | None) -> bool:
         async with self._sessions() as session:

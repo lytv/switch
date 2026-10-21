@@ -20,7 +20,11 @@ from switch_core.bridges.jira.rooms import (
     TerminalChannelCloseError,
     reconcile_ticket_room,
 )
-from switch_core.bridges.jira.worker import JiraWorkerScheduler, set_identity_mapping
+from switch_core.bridges.jira.worker import (
+    JiraWorkerScheduler,
+    record_polled_issue,
+    set_identity_mapping,
+)
 from switch_core.db.models import (
     Agent,
     ApiKey,
@@ -49,7 +53,7 @@ from switch_core.gateway.schemas import ClaimIdentityRequest
 from switch_core.room_service import RoomService
 from tests.switch_core.bridges.jira.test_activity import activity, message
 from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard, _worker_config
-from tests.switch_core.bridges.jira.test_outbox import JiraMock
+from tests.switch_core.bridges.jira.test_outbox import JiraMock, client_for, enqueue
 from tests.switch_core.bridges.jira.test_rooms import _switch_config
 
 
@@ -861,6 +865,111 @@ async def test_terminal_sync_closes_bridged_channel(session_factory, ticket_brid
         assert room.archived_at is not None
 
 
+async def test_human_reopen_restores_room_and_cards_without_resuming_intake(
+    session_factory, ticket_bridge
+):
+    rooms, _, adapter, matrix = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    rooms._protocol.read_context = AsyncMock(
+        return_value={"next_seq": 0, "truncated": False, "threads": []}
+    )
+    config = _worker_config()
+    board = FakeAdminBoard()
+    board.cards["admin-existing"] = "Existing card"
+    jira = JiraMock()
+    jira.fields["reporter"] = {"accountId": "acct"}
+    client = client_for(jira)
+    history = [
+        {"question": "Which booking?"},
+        {"reply": "Weekend booking"},
+        {"complete": "Existing intake summary"},
+    ]
+    async with session_factory() as session:
+        ticket = await session.scalar(select(JiraWorkerTicket))
+        ticket.last_event_at = datetime.fromisoformat(jira.updated)
+        ticket.jira_read_updated = jira.updated
+        ticket.intake_state = {"phase": "approval", "questions": 1, "history": history}
+        ticket.tokens_used = 1364
+        ticket.admin_card_event_id = "admin-existing"
+        await session.commit()
+        ticket_id, card_id = ticket.id, ticket.card_event_id
+        room = await session.get(Room, room_id)
+        policy = (room.owner_id, room.read_visibility, room.write_visibility)
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config,
+        poll_clients={"acme": client},
+        ticket_rooms=rooms,
+        card_updater=SwitchCardUpdater(ticket_rooms=rooms),
+        admin_board=board,
+    )
+    scheduler._orchestrator = AsyncMock(side_effect=AssertionError("Intake resumed"))
+    assert await scheduler.activity.read_ticket(ticket_id, force_jira=True)
+
+    async def transition(status):
+        previous = jira.status
+        jira.status = status
+        jira.change("human-account")
+        jira.histories[-1]["items"] = [
+            {"field": "status", "fromString": previous, "toString": status}
+        ]
+        fields = (await client.request("GET", "/rest/api/3/issue/KAN-1")).json()[
+            "fields"
+        ]
+        async with session_factory() as session:
+            await record_polled_issue(
+                session, {"key": "KAN-1", "fields": fields}, instance="acme"
+            )
+            await session.commit()
+
+    await transition("Done")
+    await scheduler.run_once()
+    async with session_factory() as session:
+        assert (await session.get(Room, room_id)).archived_at is not None
+    assert "Done" in board.cards["admin-existing"]
+    adapter.close_channel.assert_awaited_once_with("private-channel")
+
+    await transition("To Do")
+    stale_write = await enqueue(session_factory)
+    await scheduler.run_once()
+    await scheduler.run_once()
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        room = await session.get(Room, room_id)
+        assert ticket.status == "To Do"
+        assert ticket.worker_parked_reason == "Human Jira action"
+        assert ticket.agent_state == "parked"
+        assert ticket.room_id == room_id and ticket.card_event_id == card_id
+        assert ticket.tokens_used == 1364
+        assert ticket.intake_state == {
+            "phase": "approval",
+            "questions": 1,
+            "history": history,
+        }
+        assert room.archived_at is None
+        assert room.external_channel_id == "private-channel"
+        assert (room.owner_id, room.read_visibility, room.write_visibility) == policy
+        assert "Status: To Do" in room.description
+        assert len(list(await session.scalars(select(Room)))) == 1
+        assert (await session.get(JiraWorkerOutbox, stale_write)).status == "parked"
+    adapter.reopen_channel.assert_awaited_once_with("private-channel")
+    adapter.retain_channel_members.assert_awaited_with(
+        "private-channel", {"ext-first", "ext-second"}
+    )
+    adapter.create_channel.assert_awaited_once()
+    matrix.create_room.assert_awaited_once()
+    rooms._protocol.send_message.assert_awaited_once()
+    assert rooms._protocol.edit_message.await_args.args[2] == card_id
+    assert "Status: To Do" in rooms._protocol.edit_message.await_args.args[3]
+    assert "To Do" in board.cards["admin-existing"]
+    assert "Human Jira action" in board.cards["admin-existing"]
+    assert len(board.cards) == 1 and not board.posts
+    scheduler._orchestrator.assert_not_awaited()
+    assert not jira.writes
+    await client._client.aclose()
+
+
 async def test_terminal_channel_close_failure_surfaces_and_keeps_sync_pending(
     session_factory, ticket_bridge
 ):
@@ -952,7 +1061,7 @@ async def test_unsupported_channel_close_still_archives_and_completes_sync(
 
 
 @pytest.mark.parametrize("failure", ["stopped", "disconnected"])
-async def test_channel_reopen_failure_completes_room_sync(
+async def test_channel_reopen_failure_stays_pending_until_native_restore(
     session_factory, ticket_bridge, failure, caplog
 ):
     rooms, service, adapter, _ = ticket_bridge
@@ -963,6 +1072,7 @@ async def test_channel_reopen_failure_completes_room_sync(
         await session.commit()
     assert await sync(session_factory, rooms) == room_id
     adapter.reopen_channel.reset_mock()
+    bridge = service._collab_lifecycle.get("mm")
     if failure == "stopped":
         service._collab_lifecycle.get = lambda bridge_id: None
     else:
@@ -975,17 +1085,31 @@ async def test_channel_reopen_failure_completes_room_sync(
         session.add(_pending_room_sync(ticket))
         await session.commit()
         ticket_id = ticket.id
-    assert await sync(session_factory, rooms) == room_id
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_worker_config(),
+        ticket_rooms=rooms,
+    )
+    assert await scheduler.sweep_ticket_rooms() == 0
     if failure == "disconnected":
         adapter.reopen_channel.assert_awaited_once_with("private-channel")
-    assert "channel reopen failed" in caplog.text
+    assert "ticket room sync failed" in caplog.text
     async with session_factory() as session:
         room = await session.get(Room, room_id)
-        assert room.archived_at is None
+        assert room.archived_at is not None
         pending = await session.scalar(
             select(JiraWorkerOutbox).where(
                 JiraWorkerOutbox.command == "sync_ticket_room",
                 JiraWorkerOutbox.payload["ticket_id"].astext == ticket_id,
             )
         )
-        assert pending.status == "done"
+        assert pending.status == "pending"
+    service._collab_lifecycle.get = lambda _: bridge
+    adapter.reopen_channel.side_effect = None
+    assert await scheduler.sweep_ticket_rooms() == 1
+    async with session_factory() as session:
+        room = await session.get(Room, room_id)
+        assert room.archived_at is None
+        assert room.external_channel_id == "private-channel"
+        assert (await session.get(JiraWorkerOutbox, pending.id)).status == "done"
+    adapter.create_channel.assert_awaited_once()

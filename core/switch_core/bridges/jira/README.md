@@ -38,7 +38,9 @@ card becomes the thread root for later questions and card edits.
 Done and cancelled tickets archive the Switch room and close the linked private
 channel when the bridge supports it. A channel-close failure stays on the admin card and
 keeps room sync pending until it succeeds. Reopening the ticket restores the
-channel when the bridge supports it. Archived rooms receive no reporter
+existing channel before editing its card when the bridge supports it. A restore
+failure keeps the room archived and room sync pending for retry. A human reopen
+does not resume intake or permit bot Jira writes. Archived rooms receive no reporter
 invitation until that reopen path runs. Missing, stopped, channel-disabled, or unreachable default bridges
 leave new ticket rooms internal-only. Access failures log a warning and add a reason to the
 admin card without blocking ticket sync. Mapping changes, claim changes, and
