@@ -546,6 +546,7 @@ class TicketActivity:
     def _comment_refresh_due(self, ticket: JiraWorkerTicket) -> bool:
         if (
             ticket.wait_channel != "jira_comments"
+            and ticket.status != self._config.jira_worker_statuses.waiting_for_input
             and (ticket.intake_state or {}).get("phase") != "approval"
         ):
             return False
@@ -555,6 +556,7 @@ class TicketActivity:
     def _schedule_comment_refresh(self, ticket: JiraWorkerTicket) -> None:
         if (
             ticket.wait_channel != "jira_comments"
+            and ticket.status != self._config.jira_worker_statuses.waiting_for_input
             and (ticket.intake_state or {}).get("phase") != "approval"
         ):
             return

@@ -55,9 +55,13 @@ commit together.
 
 An unmapped reporter uses Jira comments. A failed thread read records a fallback
 and selects Jira comments for that ticket. Ordinary Jira reads follow the existing
-webhook and watermark intake. While a ticket waits on Jira comments, the worker
-also reads comments on the poll interval when the issue timestamp has not moved.
+webhook and watermark intake. While a ticket waits on Jira comments or waits
+for input in its room, the worker also reads comments on the poll interval when
+the issue timestamp has not moved. Room-based waiting tickets use this read to
+send wrong-place notices, not to accept Jira comments as answers.
 Comment event ids keep that repeat read from recording the same comment twice.
+The backup search converts its watermark to an unquoted JQL epoch-millisecond
+bound. This preserves its timezone and includes the boundary again for deduplication.
 After a completed read, a new comment from anyone except the worker and the reporter parks the ticket even when the issue timestamp has not moved. Comments stored on the first read do not.
 The worker also checks Jira immediately before each orchestrator turn. It uses
 the existing paginated history and comment read path. A Done or cancelled status

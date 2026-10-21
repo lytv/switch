@@ -35,6 +35,7 @@ from switch_core.bridges.jira.admin import (
     wait_send_cancelled,
 )
 from switch_core.bridges.jira.intake import build_intake_orchestrator
+from switch_core.bridges.jira.observe import _stamp
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
@@ -852,7 +853,11 @@ class JiraPollClient:
     ) -> list[dict[str, Any]]:
         jql = f'project = "{project_key}"'
         if updated_since:
-            jql += f' AND updated >= "{updated_since}"'
+            # Unquoted JQL dates use epoch milliseconds, independent of Jira user timezone.
+            millis = (
+                _stamp(updated_since) - datetime(1970, 1, 1, tzinfo=UTC)
+            ) // timedelta(milliseconds=1)
+            jql += f" AND updated >= {millis}"
         jql += " ORDER BY updated ASC"
         issues: list[dict[str, Any]] = []
         next_page_token: str | None = None
@@ -1243,7 +1248,7 @@ class JiraWorkerScheduler:
                 if isinstance(issue.get("fields"), dict)
             ]
             stamps = [stamp for stamp in stamps if stamp]
-            new_watermark = max(stamps) if stamps else watermark
+            new_watermark = max(stamps, key=_stamp) if stamps else watermark
             logger.info(
                 "Jira worker poll for project %s recorded %d issue(s), watermark %r",
                 job.project_key,

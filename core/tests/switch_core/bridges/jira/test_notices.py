@@ -32,6 +32,54 @@ async def commands(factory):
         return list((await session.scalars(select(JiraWorkerOutbox))).all())
 
 
+async def test_waiting_room_ticket_detects_jira_answer_on_refresh(session_factory):
+    key = await seed(session_factory)
+    state = {"phase": "question", "questions": 1, "history": [{"question": "Q1"}]}
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerTicket, key)
+        row.intake_state = state
+        await session.commit()
+    rooms, jira = ThreadRooms(), JiraMock()
+    now = [NOW]
+    reader = activity(session_factory, jira, rooms, clock=lambda: now[0])
+    await reader.read_once()
+    baseline_requests = len(jira.requests)
+    jira.change("reporter-account", comment=True)
+    interval = reader._config.jira_worker_poll_interval_seconds
+    now[0] += timedelta(seconds=interval - 1)
+    await reader.read_once()
+    assert len(jira.requests) == baseline_requests
+    assert not await commands(session_factory)
+    now[0] += timedelta(seconds=1)
+    await reader.read_once()
+    logged = await events(session_factory)
+    assert [event.event_kind for event in logged] == ["ignored_input"]
+    assert logged[0].payload["reporter_input"] is False
+    queued = await commands(session_factory)
+    assert len(queued) == 1 and queued[0].command == "comment"
+    assert "https://switch.example.invalid/rooms/room-1" in queued[0].payload["data"]
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=reader._config,
+        clients={"acme": client_for(jira)},
+        clock=lambda: now[0],
+    )
+    await sender.run_once()
+    assert len(jira.writes) == 1
+    for _ in range(4):
+        now[0] += timedelta(seconds=interval)
+        await reader.read_once()
+        await sender.run_once()
+    assert len(await commands(session_factory)) == 1
+    assert len(await events(session_factory)) == 1
+    assert len(jira.writes) == 1
+    row = await ticket(session_factory, key)
+    assert row.agent_state == "waiting"
+    assert row.status == "Waiting for input"
+    assert row.intake_state == state
+    assert row.tokens_used == 0
+
+
 async def test_reporter_comment_is_ignored_and_gets_room_link(session_factory):
     key = await seed(session_factory)
     rooms, jira = ThreadRooms(), JiraMock()
