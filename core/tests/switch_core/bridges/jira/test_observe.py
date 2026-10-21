@@ -62,18 +62,53 @@ def test_worker_comment_gap_boundary(edited, gap_ms):
     assert not result.reporter_new and not result.reporter_edits
 
 
+@pytest.mark.parametrize("gap_ms", [-1, 0, 50, 1000, 1001])
+@pytest.mark.parametrize("worker_comment", [False, True])
+def test_new_reporter_owned_comment_gap_boundary(gap_ms, worker_comment):
+    version = comment_version("reporter-account", gap_ms)
+    if worker_comment:
+        other = comment_version("worker-account", gap_ms)["comments"][0]
+        other["id"] = "2"
+        version["comments"].append(other)
+    result = observe(version, set())
+    assert result.park == (None if 0 <= gap_ms <= 1000 else "stamp_mismatch")
+    assert result.reporter_new == (version["comments"][0],)
+    payload = {
+        "based_updated": stamp(0),
+        "based_changelog_id": "",
+        "reporter_account_id": "reporter-account",
+    }
+    if result.park is None:
+        check_jira_version(version, payload, "worker-account")
+    else:
+        with pytest.raises(HumanChange):
+            check_jira_version(version, payload, "worker-account")
+
+
+@pytest.mark.parametrize("case", ["newly_visible_edit", "other_author", "other_editor"])
+def test_reporter_gap_requires_new_unedited_reporter_owned_comment(case):
+    version = comment_version("reporter-account", 50)
+    comment = version["comments"][0]
+    if case == "newly_visible_edit":
+        comment["created"] = stamp(0)
+    elif case == "other_author":
+        comment["author"] = {"accountId": "other-account"}
+    else:
+        comment["updateAuthor"] = {"accountId": "other-account"}
+    assert observe(version, set()).park == (
+        "human" if case == "other_editor" else "stamp_mismatch"
+    )
+
+
 @pytest.mark.parametrize(
     "case",
     [
         "transition",
         "field",
-        "reporter_comment",
         "reporter_edit",
         "unattributed",
         "later_transition",
-        "later_reporter",
         "tied_transition",
-        "tied_reporter",
         "new_reporter_comment_edited_by_worker",
         "old_worker_comment_newly_visible",
     ],
@@ -93,20 +128,12 @@ def test_non_worker_comment_latest_items_stay_exact(case):
         version["changelog_id"] = "1"
         if case in ("transition", "field"):
             version["comments"] = []
-    elif case in ("reporter_comment", "reporter_edit"):
+    elif case == "reporter_edit":
         version = comment_version("reporter-account", 52)
-        if case == "reporter_edit":
-            seen = {"1"}
-            version["comments"][0]["created"] = stamp(0)
+        seen = {"1"}
+        version["comments"][0]["created"] = stamp(0)
     elif case == "unattributed":
         version["comments"] = []
-    elif case in ("later_reporter", "tied_reporter"):
-        other = comment_version("reporter-account", 52)["comments"][0]
-        other["id"] = "2"
-        other["created"] = other["updated"] = stamp(
-            10_001 if case == "later_reporter" else 10_000
-        )
-        version["comments"].append(other)
     elif case == "old_worker_comment_newly_visible":
         version["comments"][0]["created"] = stamp(0)
         version["comments"][0]["updated"] = stamp(0)
@@ -118,10 +145,13 @@ def test_non_worker_comment_latest_items_stay_exact(case):
     )
 
 
+@pytest.mark.parametrize("latest_actor", ["worker-account", "reporter-account"])
 @pytest.mark.parametrize("case", ["comment", "edit", "changelog", "automation"])
 @pytest.mark.parametrize("milliseconds", [9999, 10_000, 10_026, 10_052])
-def test_visible_human_items_still_park_before_or_inside_worker_gap(case, milliseconds):
-    version, seen = comment_version("worker-account", 52), set()
+def test_visible_human_items_still_park_before_or_inside_comment_gap(
+    latest_actor, case, milliseconds
+):
+    version, seen = comment_version(latest_actor, 52), set()
     if case in ("changelog", "automation"):
         version["histories"] = [
             {
@@ -352,7 +382,9 @@ def test_rank_gap_does_not_hide_latest_meaningful_items(seen, case):
         comment = comment_version("reporter-account", 0)["comments"][0]
         comment["created"] = comment["updated"] = stamp(latest)
         version["comments"].append(comment)
-    assert observe(version, seen).park == (None if seen is None else "stamp_mismatch")
+    assert observe(version, seen).park == (
+        None if seen is None or case.endswith("reporter") else "stamp_mismatch"
+    )
     version["updated"] = stamp(latest)
     assert observe(version, seen).park is None
 

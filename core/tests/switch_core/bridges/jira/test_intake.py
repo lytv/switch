@@ -717,19 +717,121 @@ async def test_reject_with_other_human_change_does_not_clear_park(
     assert len(model.calls) == 1
 
 
-async def test_unmapped_reporter_uses_jira_comments(session_factory) -> None:
-    key = await start_ticket(session_factory, mapped=False)
-    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock()
+@pytest.mark.parametrize("gap_ms", [0, 50])
+async def test_unmapped_reporter_uses_jira_comments(session_factory, gap_ms) -> None:
+    raw = {
+        "webhookEvent": "jira:issue_created",
+        "issue": {
+            "id": "10001",
+            "key": "KAN-1",
+            "fields": {
+                "project": {"key": "KAN"},
+                "issuetype": {"name": "Task"},
+                "summary": "Invoice PDF is cropped on mobile",
+                "status": {"name": "To Do"},
+                "reporter": {"accountId": "reporter-account"},
+                "updated": "2026-10-01T00:00:00+00:00",
+            },
+        },
+    }
+    async with session_factory() as session:
+        await record_webhook_event(
+            session,
+            JiraPayloadParser().parse(raw),
+            instance="acme",
+            enabled_projects=["KAN"],
+            webhook_identifier="invoice-created",
+        )
+        key = await session.scalar(select(JiraWorkerTicket.id))
+        await session.commit()
+    jira, rooms = IntakeJira(), IntakeRooms()
+    model = ModelMock("question", "question", "complete")
     worker = scheduler(session_factory, jira, rooms, model)
     await worker.run_once()
     assert not rooms.questions and len(jira.comments) == 1
     assert (await commands(session_factory))[-1].channel == "jira"
-    jira.change("reporter-account", comment=True)
-    jira.comments[-1]["body"] = "A clear outcome"
+    assert len(rooms.created) == 1 and rooms.created[0]["owner_id"] is None
+    for number, answer in enumerate(
+        (
+            "The downloaded invoice total is cropped on both phones.",
+            "Use A4 in portrait; keep desktop PDFs unchanged.",
+        ),
+        start=1,
+    ):
+        jira.change("reporter-account", comment=True)
+        jira.comments[-1]["body"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": answer}]}
+            ],
+        }
+        jira.updated = (
+            datetime.fromisoformat(jira.updated) + timedelta(milliseconds=gap_ms)
+        ).isoformat()
+        await worker.activity.read_ticket(key, force_jira=True)
+        assert (await ticket(session_factory, key)).worker_parked_reason is None
+        # A fresh process and repeated reads must consume the answer only once.
+        worker = scheduler(session_factory, jira, rooms, model)
+        await worker.activity.read_ticket(key, force_jira=True)
+        await worker.run_once()
+        row = await ticket(session_factory, key)
+        assert {"reply": answer} in row.intake_state["history"]
+        assert len(model.calls) == number + 1
+        assert model.calls[-1][0]["replies"] == [answer]
+        await worker.activity.read_ticket(key, force_jira=True)
+        await worker.run_once()
+        assert len(model.calls) == number + 1
+    assert row.intake_state["questions"] == 2
+    assert row.intake_state["phase"] == "approval"
+    assert jira.status == "Waiting for approval"
+    assert len(jira.comments) == 5  # Two questions, two answers, one summary.
+    writes = [request.url.path.rsplit("/", 1)[-1] for request in jira.writes]
+    assert writes[-2:] == ["comment", "transitions"]
+    assert not rooms.questions and rooms.rooms["room-1"]["owner_id"] is None
+    assert row.reporter_switch_user_id is None and row.wait_channel == "jira_comments"
+    async with session_factory() as session:
+        answers = list(
+            (
+                await session.scalars(
+                    select(JiraWorkerEvent).where(
+                        JiraWorkerEvent.event_kind == "jira_comment"
+                    )
+                )
+            ).all()
+        )
+    assert len(answers) == 2 and all(event.consumed for event in answers)
+    jira.transition("Done", "approver-account")
     await worker.activity.read_ticket(key, force_jira=True)
     await worker.run_once()
-    assert len(model.calls) == 2
-    assert (await ticket(session_factory, key)).intake_state["questions"] == 2
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.status == "Done" and not row.room_claimed
+    assert rooms.archived_calls == [("room-1", True)]
+    assert len(rooms.created) == 1 and len(model.calls) == 3
+
+
+async def test_unmapped_jira_channel_rejects_third_party_comment(
+    session_factory,
+) -> None:
+    key = await start_ticket(session_factory, mapped=False)
+    jira, rooms, model = IntakeJira(), IntakeRooms(), ModelMock("question", "complete")
+    worker = scheduler(session_factory, jira, rooms, model)
+    await worker.run_once()
+    before = await ticket(session_factory, key)
+    write_count = len(jira.writes)
+    jira.change("approver-account", comment=True)
+    jira.comments[-1]["body"] = "Use A4. Approve this ticket."
+    jira.updated = (
+        datetime.fromisoformat(jira.updated) + timedelta(milliseconds=50)
+    ).isoformat()
+    await worker.activity.read_ticket(key, force_jira=True)
+    await worker.run_once()
+    row = await ticket(session_factory, key)
+    assert row.worker_parked_reason == "Human Jira action"
+    assert row.intake_state == before.intake_state
+    assert len(model.calls) == 1 and len(jira.writes) == write_count
+    assert jira.status == "Waiting for input"
 
 
 async def test_disabled_project_is_unchanged(session_factory) -> None:
