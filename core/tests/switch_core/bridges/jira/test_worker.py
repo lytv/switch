@@ -978,6 +978,41 @@ class _FakePollClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("watermark", "epoch_millis"),
+    [
+        ("2026-10-08T14:45:47.452+0700", 1791445547452),
+        ("2026-10-08T07:45:47.452Z", 1791445547452),
+        ("2026-10-08T02:15:47.452-05:30", 1791445547452),
+        ("2026-10-08T07:45:47.452999+00:00", 1791445547452),
+        ("2026-10-08T07:46:00.000+00:00", 1791445560000),
+    ],
+)
+async def test_poll_search_uses_timezone_independent_epoch_bound(
+    watermark, epoch_millis
+):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"issues": [], "isLast": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = JiraPollClient(
+            base_url="https://jira.example.invalid",
+            email="worker@example.invalid",
+            api_token="placeholder",
+            client=http_client,
+        )
+        assert (
+            await client.search_updated(project_key="KAN", updated_since=watermark)
+            == []
+        )
+    assert requests[0].url.params["jql"] == (
+        f'project = "KAN" AND updated >= {epoch_millis} ORDER BY updated ASC'
+    )
+
+
 async def test_poll_reads_all_jira_pages_before_recording_watermark(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
