@@ -16,6 +16,10 @@ from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerEvent, JiraWorkerTicket
 
+UNACCEPTED_SERVICE = (
+    "Delivery intake requires a mapped Bug, Feature, Docs or Other Service"
+)
+
 
 def ticket_repository_url(fields: dict[str, Any], field: str) -> str:
     value = fields.get(field)
@@ -44,10 +48,8 @@ def initialize_target(
         return
     service = _text(fields.get(mapping.service_field)).strip()
     if service not in {"Bug", "Feature", "Docs", "Other"}:
-        park_ticket(
-            ticket,
-            "Delivery intake requires a mapped Bug, Feature, Docs or Other Service",
-        )
+        if ticket.worker_parked_reason != UNACCEPTED_SERVICE:
+            park_ticket(ticket, UNACCEPTED_SERVICE)
         return
     supplied_url = ticket_repository_url(fields, mapping.repository_url_field)
     repository = (

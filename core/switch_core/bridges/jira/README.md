@@ -58,6 +58,10 @@ It affects new tickets only. It does not enable execution. For example:
 The Service field must contain `Bug`, `Feature`, `Docs`, or `Other` as its
 single-select value. An absent or unknown value parks that ticket with an admin
 card reason. Other tickets in the poll batch still commit.
+Admin release of that ticket reads Service and the repository link again. If
+Service is still not accepted, the ticket stays set aside. An accepted Service
+stores the delivery target, and intake runs the repository check before any
+scope-approval request.
 Projects without a mapping retain legacy behavior. Existing legacy tickets never
 upgrade because an operator adds a mapping.
 
@@ -92,6 +96,8 @@ cannot form a checkout job. A changed Service or Bug repository URL parks the ti
 preserves its original target. Target edits do not clear a park automatically.
 Feature, Docs, and Other finish with a summary and an explicit manual handoff.
 They never queue code work or an approval transition.
+Step 2 does not release tickets parked in triage, scope-ready, or manual-handoff
+phases. Those release paths belong to step 7, phase-aware admin resume.
 
 ## Firstmate task lifecycle
 
