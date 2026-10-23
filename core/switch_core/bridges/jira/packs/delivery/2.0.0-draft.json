@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "fixture_only": true,
+  "id": "delivery",
+  "version": "2.0.0-draft",
+  "firstmate_commit": "6eb8b7f8277dc37637e3ba58c2fc461d88dc4ff3",
+  "harness": "pi",
+  "harness_version": "1.4.0",
+  "provider": "openai-codex",
+  "model": "gpt-6.1-sol",
+  "bug_path": ["intake", "approve_scope", "reproduce", "fix", "review", "qa", "accept", "merge", "smoke", "close"],
+  "non_bug_path": ["intake", "manual_handoff"],
+  "human_merge": true,
+  "deploy": false,
+  "overrun_action": "alert_and_continue_within_budget",
+  "budget": {
+    "ticket_tokens": 200000,
+    "ticket_estimated_usd": "5",
+    "day_estimated_usd": "25"
+  }
+}

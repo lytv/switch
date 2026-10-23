@@ -719,6 +719,7 @@ async def claim_due_jobs(
     limit: int = 10,
     owner: str = "scheduler",
     interval_seconds: int,
+    kinds: Sequence[str],
     scopes: Sequence[tuple[str, str]] | None = None,
 ) -> Sequence[JiraWorkerJob]:
     """Claim due rows transactionally: pending → claimed in one statement.
@@ -747,6 +748,7 @@ async def claim_due_jobs(
         select(JiraWorkerJob.id)
         .where(
             JiraWorkerJob.status == "pending",
+            JiraWorkerJob.kind.in_(kinds),
             JiraWorkerJob.due_at <= clock,
             scope_filter,
         )
@@ -1028,6 +1030,7 @@ class JiraWorkerScheduler:
                 now=now,
                 limit=10,
                 owner=self._owner,
+                kinds=(POLL_JOB_KIND,),
                 interval_seconds=self._config.jira_worker_poll_interval_seconds,
                 scopes=scopes,
             )
@@ -1197,9 +1200,6 @@ class JiraWorkerScheduler:
     async def _handle_job(self, job: JiraWorkerJob) -> None:
         if job.kind != POLL_JOB_KIND:
             logger.warning("Jira worker ignoring unknown job kind %r", job.kind)
-            async with self._session_factory() as session:
-                await complete_job(session, job.id, status="done", now=self._clock())
-                await session.commit()
             return
         await self._handle_poll_job(job)
 

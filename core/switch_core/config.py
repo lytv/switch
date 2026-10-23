@@ -1,5 +1,6 @@
 import re
 import ssl
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -193,6 +194,11 @@ class SwitchConfig(BaseSettings):
     jira_worker_credentials: dict[str, JiraWorkerCredentials] = {}
     jira_worker_statuses: JiraWorkerStatuses = JiraWorkerStatuses()
     jira_worker_limits: JiraWorkerLimits = JiraWorkerLimits()
+    jira_worker_delivery_ticket_tokens: int = Field(default=200_000, gt=0)
+    jira_worker_delivery_ticket_estimated_usd: Decimal = Field(
+        default=Decimal("5"), ge=0
+    )
+    jira_worker_delivery_day_estimated_usd: Decimal = Field(default=Decimal("25"), ge=0)
     jira_worker_write_backoff_seconds: float = Field(default=5.0, gt=0)
     jira_worker_notice_window_seconds: int = Field(default=86_400, ge=1)
     jira_worker_calendar: JiraWorkerCalendar = JiraWorkerCalendar()

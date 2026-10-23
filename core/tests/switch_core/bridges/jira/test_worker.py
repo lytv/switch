@@ -13,10 +13,11 @@ import pytest
 from alembic.config import Config
 from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import text
+from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import switch_core.db.models  # noqa: F401 — registers every table on Base.metadata
+from switch_core.bridges.jira.state import LegacyWorkflowState
 from switch_core.bridges.jira.worker import (
     JiraPollClient,
     JiraWorkerScheduler,
@@ -36,7 +37,12 @@ from switch_core.bridges.jira.worker import (
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.base import Base
-from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+    Room,
+)
 
 _CORE = Path(__file__).resolve().parents[4]
 _MIG_DB = "jira_worker_mig"
@@ -105,6 +111,200 @@ async def mig_url(postgres_url: str) -> Any:
         await admin.dispose()
 
 
+async def test_upgrade_preserves_active_v1_records(mig_url: str) -> None:
+    engine = create_async_engine(mig_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda c: _run_migrations(c, "head"))
+            await connection.run_sync(lambda c: _run_migrations(c, "6a904d38e217"))
+            await connection.execute(
+                insert(Room).values(
+                    id="archived-room",
+                    matrix_room_id="!archive:example.invalid",
+                    name="Archived",
+                    description="Synthetic room",
+                    archived_at=datetime.now(UTC),
+                )
+            )
+            for number, status in enumerate(
+                ("Waiting for input", "Waiting for approval", "Done", "In Progress")
+            ):
+                await connection.execute(
+                    insert(JiraWorkerTicket).values(
+                        id=f"ticket-{number}",
+                        instance="fixture",
+                        project_key="TEST",
+                        issue_key=f"TEST-{number}",
+                        status=status,
+                        agent_generation=7,
+                        tokens_used=12345,
+                        wait_anchor=datetime.now(UTC),
+                        wait_fired={"reminder": True},
+                        room_id="archived-room" if number == 2 else None,
+                        agent_state="running" if number == 3 else "waiting",
+                        intake_state={"cycle": 2, "transcript": ["preserved"]},
+                    )
+                )
+            jobs = [
+                (
+                    "turn",
+                    "orchestrator_turn",
+                    "claimed",
+                    {"ticket_id": "ticket-3"},
+                    "fixture",
+                    "TEST",
+                ),
+                (
+                    "room",
+                    "ticket_room_create",
+                    "done",
+                    {"ticket_id": "ticket-2"},
+                    "fixture",
+                    "TEST",
+                ),
+                (
+                    "orphan",
+                    "orchestrator_turn",
+                    "claimed",
+                    {"ticket_id": "missing"},
+                    "fixture",
+                    "TEST",
+                ),
+                (
+                    "other-instance",
+                    "orchestrator_turn",
+                    "claimed",
+                    {"ticket_id": "ticket-3"},
+                    "other",
+                    "TEST",
+                ),
+                (
+                    "other-project",
+                    "orchestrator_turn",
+                    "claimed",
+                    {"ticket_id": "ticket-3"},
+                    "fixture",
+                    "OTHER",
+                ),
+                (
+                    "poll",
+                    "watermark_poll",
+                    "pending",
+                    {"ticket_id": "ticket-3"},
+                    "fixture",
+                    "TEST",
+                ),
+            ]
+            for job_id, kind, status, payload, instance, project in jobs:
+                await connection.execute(
+                    insert(JiraWorkerJob).values(
+                        id=job_id,
+                        kind=kind,
+                        status=status,
+                        instance=instance,
+                        project_key=project,
+                        payload=payload,
+                        due_at=datetime.now(UTC),
+                    )
+                )
+            await connection.execute(
+                insert(JiraWorkerOutbox).values(
+                    id="command",
+                    channel="jira",
+                    command="transition",
+                    instance="fixture",
+                    issue_key="TEST-1",
+                    command_key="legacy-transition",
+                    payload={"target": "Waiting for approval", "generation": 7},
+                )
+            )
+            tables = (
+                "jira_worker_ticket_map",
+                "jira_worker_job_record",
+                "jira_worker_outbox",
+                "rooms",
+            )
+            before = {}
+            for table in tables:
+                before[table] = (
+                    (
+                        await connection.execute(
+                            text(
+                                f"SELECT to_jsonb(row) FROM {table} AS row ORDER BY id"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            await connection.run_sync(lambda c: _run_migrations(c, "head"))
+            for table in tables:
+                after = (
+                    (
+                        await connection.execute(
+                            text(
+                                f"SELECT to_jsonb(row) FROM {table} AS row ORDER BY id"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for old, new in zip(before[table], after, strict=True):
+                    assert {key: new[key] for key in old} == old
+                    if table == "jira_worker_ticket_map":
+                        assert new[
+                            "workflow_state"
+                        ] == LegacyWorkflowState().model_dump(mode="json")
+                        assert new["service_value"] is None
+                    elif table == "jira_worker_job_record":
+                        expected = {"turn": "ticket-3", "room": "ticket-2"}.get(
+                            old["id"]
+                        )
+                        assert new["ticket_id"] == expected
+                        assert new["execution_key"] is None
+                        assert new["generation"] is None
+                        assert new["result"] is None
+            await connection.run_sync(lambda c: _run_migrations(c, "6a904d38e217"))
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("status", ["running", "done"])
+async def test_downgrade_refuses_v2_execution_records(
+    mig_url: str, status: str
+) -> None:
+    engine = create_async_engine(mig_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda c: _run_migrations(c, "head"))
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            session.add(
+                JiraWorkerTicket(id="ticket", instance="fixture", issue_key="TEST-1")
+            )
+            await session.flush()
+            session.add(
+                JiraWorkerJob(
+                    kind="role_job",
+                    ticket_id="ticket",
+                    generation=1,
+                    execution_key="ticket/1/fix/1",
+                    due_at=datetime.now(UTC),
+                    status=status,
+                )
+            )
+            await session.commit()
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda c: _run_migrations(c, "6a904d38e217"))
+        async with factory() as session:
+            assert (await session.scalars(select(JiraWorkerJob))).one().status == status
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_worker_migration_creates_five_tables(mig_url: str) -> None:
     engine = create_async_engine(mig_url)
     try:
@@ -886,7 +1086,11 @@ async def test_two_claimers_one_wins(
     async def claim(owner: str) -> int:
         async with session_factory() as session:
             jobs = await claim_due_jobs(
-                session, now=now, owner=owner, interval_seconds=300
+                session,
+                now=now,
+                owner=owner,
+                interval_seconds=300,
+                kinds=("watermark_poll",),
             )
             await session.commit()
             return len(jobs)
@@ -895,6 +1099,51 @@ async def test_two_claimers_one_wins(
 
     first, second = await asyncio.gather(claim("a"), claim("b"))
     assert sorted((first, second)) == [0, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["role_job", "future_job", "ticket_room_create"])
+async def test_scheduler_leaves_unrecognized_due_jobs_untouched(
+    session_factory: async_sessionmaker[AsyncSession], kind: str
+) -> None:
+    async with session_factory() as session:
+        ticket = JiraWorkerTicket(
+            instance="acme",
+            issue_key="KAN-1",
+            project_key="KAN",
+            status="Done",
+            worker_parked_reason="completed",
+            agent_state="parked",
+        )
+        session.add(ticket)
+        await session.flush()
+        job = JiraWorkerJob(
+            ticket_id=ticket.id,
+            generation=1,
+            execution_key=f"{ticket.id}/1/reproduce/1" if kind == "role_job" else None,
+            kind=kind,
+            instance="acme",
+            project_key="KAN",
+            due_at=datetime.now(UTC) - timedelta(hours=1),
+            payload={"preserve": "input"},
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        poll_clients={"acme": _FakePollClient([])},  # type: ignore[dict-item]
+    )
+    await scheduler.run_once()
+    async with session_factory() as session:
+        persisted = await session.get(JiraWorkerJob, job_id)
+        assert persisted is not None
+        assert persisted.status == "pending"
+        assert persisted.attempts == 0
+        assert persisted.claimed_at is None
+        assert persisted.completed_at is None
+        assert persisted.payload == {"preserve": "input"}
 
 
 @pytest.mark.asyncio
@@ -932,7 +1181,11 @@ async def test_claim_commits_successor_before_poll_runs(
     async with session_factory() as session:
         await _insert_due_job(session, due=now - timedelta(seconds=1))
         jobs = await claim_due_jobs(
-            session, now=now, owner="first", interval_seconds=300
+            session,
+            now=now,
+            owner="first",
+            interval_seconds=300,
+            kinds=("watermark_poll",),
         )
         assert len(jobs) == 1
         await session.commit()
@@ -1177,7 +1430,9 @@ async def test_complete_job_marks_error(
         job_id = await _insert_due_job(session, due=datetime.now(UTC))
         await session.commit()
     async with session_factory() as session:
-        jobs = await claim_due_jobs(session, owner="t", interval_seconds=300)
+        jobs = await claim_due_jobs(
+            session, owner="t", interval_seconds=300, kinds=("watermark_poll",)
+        )
         assert len(jobs) == 1
         await complete_job(session, jobs[0].id, status="error", error="boom")
         await session.commit()
