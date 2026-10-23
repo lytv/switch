@@ -434,7 +434,8 @@ class FirstmateJobs:
             )
             day = self._clock().astimezone(UTC).date().isoformat()
             daily = dict(execution.cost_by_day)
-            daily[day] = daily.get(day, Decimal("0")) + known_usd - execution.known_usd
+            if known_usd != execution.known_usd:
+                daily[day] = daily.get(day, Decimal("0")) + known_usd - execution.known_usd
             ticket.tokens_used += known_tokens - execution.known_tokens
             state = _replace(
                 state,

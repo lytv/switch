@@ -386,6 +386,56 @@ async def test_key_input_and_estimates_are_immutable(session_factory, lab):
         await service.start(job, reservation=RESERVATION, estimate_seconds=61)
 
 
+@pytest.mark.parametrize("state", ["done", "running"])
+async def test_zero_spend_reads_do_not_add_daily_entries(
+    session_factory, lab, state
+):
+    job = await _job(session_factory, lab)
+    service = _service(session_factory, lab)
+    await _start(service, job)
+    if state == "done":
+        _result(lab, job)
+    accepted = await service.get(job.run.execution_key)
+    async with session_factory() as session:
+        stored = (
+            await session.scalar(
+                select(JiraWorkerJob).where(
+                    JiraWorkerJob.execution_key == job.run.execution_key
+                )
+            )
+        ).payload
+    next_day = _service(session_factory, lab, clock=lambda: NOW + timedelta(days=1))
+    for _ in range(2):
+        assert await next_day.get(job.run.execution_key) == accepted
+        assert await _start(next_day, job) == accepted
+    if state == "done":
+        assert await next_day.cancel(job.run.execution_key) == accepted
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(JiraWorkerJob).where(
+                JiraWorkerJob.execution_key == job.run.execution_key
+            )
+        )
+        ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+        assert row.payload == stored
+        assert row.result == (
+            accepted.result.model_dump(mode="json")
+            if accepted.result is not None
+            else None
+        )
+        assert ticket.tokens_used == (125 if state == "done" else 0)
+        assert ticket.workflow_state["reserved_tokens"] == (
+            0 if state == "done" else 1000
+        )
+        assert Decimal(ticket.workflow_state["known_estimated_usd"]) == Decimal(
+            "0.1" if state == "done" else "0"
+        )
+        assert Decimal(ticket.workflow_state["reserved_estimated_usd"]) == Decimal(
+            "0" if state == "done" else "1"
+        )
+    assert (lab.copy.location(job) / "starts").read_text() == "1"
+
+
 @pytest.mark.parametrize("outcome", ["completed", "needs_input", "cancelled"])
 @pytest.mark.parametrize("change", ["cancel", "generation", "park", "day_budget"])
 async def test_terminal_receipt_survives_later_ticket_and_budget_changes(
