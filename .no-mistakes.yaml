@@ -1,0 +1,8 @@
+# The local-ci gate replaces remote checks that never register on this fork.
+# Registered remote checks still apply; zero reported checks do not block CI.
+no_ci: true
+
+gates:
+  - name: local-ci
+    after: lint
+    command: bash scripts/local-ci.sh

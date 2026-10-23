@@ -86,6 +86,20 @@ with `just test -k test_name`.
 Before opening a pull request, run `just check`, `just typecheck` and
 `just test`.
 
+For the complete local PR checks, commit your changes, then run
+`bash scripts/local-ci.sh`. The script fetches `origin/main` and selects jobs
+from the committed changes since the merge base, using the PR CI path filters.
+Shared files select every tree. Secret scanning always runs through Docker.
+The script prints each job's result and duration. Missing tools or failed
+checks return a nonzero exit code. Use Node 24, pnpm 11.5.3, uv, just, and a
+running Docker engine. Console checks install Playwright Chromium.
+Run `bash scripts/local-ci.sh --self-test` to check the path selection.
+
+After `.no-mistakes.yaml` reaches the default branch, new no-mistakes runs
+execute this script after Lint, before Push. Test stays targeted.
+The trusted `no_ci: true` setting accepts zero remote checks; it does not
+ignore registered checks. Existing runs keep their original gates.
+
 ## Contributor License Agreement (required)
 
 Every contributor must agree to a Contributor License Agreement before their
