@@ -435,7 +435,9 @@ class FirstmateJobs:
             day = self._clock().astimezone(UTC).date().isoformat()
             daily = dict(execution.cost_by_day)
             if known_usd != execution.known_usd:
-                daily[day] = daily.get(day, Decimal("0")) + known_usd - execution.known_usd
+                daily[day] = (
+                    daily.get(day, Decimal("0")) + known_usd - execution.known_usd
+                )
             ticket.tokens_used += known_tokens - execution.known_tokens
             state = _replace(
                 state,
@@ -515,7 +517,8 @@ class FirstmateJobs:
                         row.status = "uncertain"
                         if complete:
                             ticket.worker_parked_reason = (
-                                ticket.worker_parked_reason or "delivery_outcome_uncertain"
+                                ticket.worker_parked_reason
+                                or "delivery_outcome_uncertain"
                             )
                             _reason(
                                 ticket,
