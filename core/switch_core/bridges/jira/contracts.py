@@ -28,6 +28,12 @@ class Budget(Contract):
     day_estimated_usd: USD
 
 
+class Reservation(Contract):
+    tokens: Positive
+    estimated_usd: Annotated[Decimal, Field(gt=0)]
+    price_source: Text
+
+
 class Pack(Contract):
     schema_version: Literal[1]
     fixture_only: Literal[True]
