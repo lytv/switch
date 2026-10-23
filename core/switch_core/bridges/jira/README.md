@@ -37,14 +37,79 @@ Typed state and result contracts validate JSON at the workflow boundary.
 | `JIRA_WORKER_DELIVERY_DAY_ESTIMATED_USD` | 25 |
 
 Costs are USD estimates, not subscription invoices. These settings do not change
-the existing intake limit of 50000 tokens. Budget enforcement belongs to delivery
-execution, which is not enabled here.
+the existing intake limit of 50000 tokens. The delivery lifecycle reserves these budgets before a task starts. Delivery
+execution remains disconnected from the live approval path.
 
 The scheduler claims only explicit job kinds. The intake scheduler claims
 watermark polls, not role jobs or unknown kinds. Execution keys remain unique
 after completion. Only one active role execution may hold a ticket generation.
 Downgrade refuses delivery workflow or execution records, including completed
 executions, to preserve their snapshots and audit history.
+
+## Firstmate task lifecycle
+
+`firstmate_jobs.py` exposes `FirstmateJobs.start`, `get`, and `cancel`.
+No live Approve handler or scheduler calls this service. It uses the existing
+role-job records and the ticket's `agent_generation`. It adds no daemon, queue,
+or schema migration.
+
+Start commits the frozen input and usage reservation before it calls Firstmate.
+A repeated execution key returns the same execution. Different input, reservation,
+or duration estimates for that key fail. One database lock serializes each
+execution's process operations. A separate transaction lock serializes budget
+admission and usage accounting across tickets.
+
+`firstmate_copy.py` calls the delivery checkout's `fm-spawn.sh --scout` and
+`fm-control.sh <task-id> exit`. It uses the native task metadata, brief, status,
+and steering inbox paths. Each execution receives its own Firstmate home,
+operating-system HOME directory, and private tmux server. The operator must
+prepare a separate delivery checkout and a separate worker-homes root. Both
+paths must be absolute and contain no symlinks. To opt these roots in, the
+operator creates these regular marker files with exactly
+`switch-firstmate-delivery-v1` followed by a newline:
+
+- `<delivery-checkout>/.switch-delivery-copy`
+- `<worker-homes>/.switch-delivery-workers`
+
+The caller supplies a prepared project checkout and an explicit executable PATH.
+The adapter checks the frozen Firstmate and repository commits. It does not
+clone a ticket URL, discover a standing home, or configure provider credentials.
+Its subprocess environment contains only explicit operational values. Inject
+all configured credential values into `SecretGuard.forbidden_values`; never
+forward them into task data or the process environment. The guard also rejects
+credential-bearing URLs and common credential forms. Pattern checks cannot
+identify every possible secret supplied as arbitrary prose.
+
+The task writes `result.json` and then its hex SHA-256 digest in `result.sha256`
+inside its artifact directory. Results use the frozen `Result` contract.
+Optional `usage.json` contains cumulative `Usage` observations. Reads reject
+oversized files, path traversal, symlinks, hardlinks, non-regular files, digest
+mismatches, mismatched inputs, and forbidden credential values. A result does
+not prove process exit. The service confirms native cancellation before it
+accepts the result or releases unused reservations. Cancellation and generation
+changes reject late results, but still account for their known usage.
+
+A durable dispatch marker precedes native spawn. If a crash leaves that marker
+without native task metadata, the execution becomes `uncertain`. It retains its
+reservation and never repeats the ambiguous spawn. Recovery needs evidence from
+the operator; this adapter deliberately provides no automatic marker reset.
+A crash before that handoff can reuse the durable database reservation.
+
+Reservations include cached tokens and estimated USD. Partial or unknown usage
+retains the unaccounted reservation, including across UTC day boundaries.
+Known usage never resets on retry. Budget admission includes previous intake
+usage. Reported spend at the reserved limit triggers cancellation and an admin
+alert. At twice the duration estimate, the service queues an admin alert but
+continues within the existing budget. Polls and reminders run independently of
+these short lifecycle calls.
+
+These primitives do not prove an OS sandbox, trusted live metering, or real
+provider process-tree cancellation. A worker can exceed a limit between usage
+observations. Prompts and reservation accounting cannot prevent that spend.
+Before live enablement, deployment must supply isolation, credential-free model
+access, and trusted metering that prevents additional spend at the limit.
+The draft fixture pack is not a production runtime. Tests use real PostgreSQL
+and fake Firstmate processes, never paid agents or standing homes.
 
 ## Ticket rooms
 
