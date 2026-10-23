@@ -1,0 +1,2 @@
+# Synthetic fixture execution_key in workflow-state test (verified false positive, no secret).
+730d42b3a0ea942e607502a450ed213eeefa1b52:core/tests/switch_core/bridges/jira/test_workflow_state.py:generic-api-key:258
