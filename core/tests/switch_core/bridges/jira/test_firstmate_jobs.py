@@ -387,9 +387,7 @@ async def test_key_input_and_estimates_are_immutable(session_factory, lab):
 
 
 @pytest.mark.parametrize("state", ["done", "running"])
-async def test_zero_spend_reads_do_not_add_daily_entries(
-    session_factory, lab, state
-):
+async def test_zero_spend_reads_do_not_add_daily_entries(session_factory, lab, state):
     job = await _job(session_factory, lab)
     service = _service(session_factory, lab)
     await _start(service, job)
@@ -457,11 +455,14 @@ async def test_terminal_receipt_survives_later_ticket_and_budget_changes(
     )
     _result(lab, job, status=outcome, question=question)
     accepted = await service.get(job.run.execution_key)
-    assert accepted.status == {
-        "completed": "done",
-        "needs_input": "waiting_input",
-        "cancelled": "cancelled",
-    }[outcome]
+    assert (
+        accepted.status
+        == {
+            "completed": "done",
+            "needs_input": "waiting_input",
+            "cancelled": "cancelled",
+        }[outcome]
+    )
     assert accepted.result is not None
     if change == "cancel":
         assert await service.cancel(job.run.execution_key) == accepted
@@ -637,9 +638,9 @@ async def test_known_usd_never_regresses_on_unknown_usage(
                 assert Decimal(state["reserved_estimated_usd"]) == Decimal("0.5")
                 assert state["unknown_spend"]
     assert (await _start(restarted, job)).execution.known_usd == Decimal("0.5")
-    assert (await restarted.cancel(job.run.execution_key)).execution.known_usd == Decimal(
-        "0.5"
-    )
+    assert (
+        await restarted.cancel(job.run.execution_key)
+    ).execution.known_usd == Decimal("0.5")
     assert (lab.copy.location(job) / "starts").read_text() == "1"
 
 
@@ -769,7 +770,9 @@ async def test_cancel_during_start_persists_intent_before_launch_returns(
                 await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_cancel_and_get_wait_for_full_native_start(session_factory, lab, tmp_path):
+async def test_cancel_and_get_wait_for_full_native_start(
+    session_factory, lab, tmp_path
+):
     job = await _job(session_factory, lab)
     service = _service(session_factory, lab)
     _script(
