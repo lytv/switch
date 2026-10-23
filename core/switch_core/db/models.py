@@ -1128,6 +1128,15 @@ class JiraWorkerTicket(Base):
     wake_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     tokens_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     intake_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    service_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workflow_state: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            '\'{"schema_version": 1,"policy":"legacy_intake",'
+            '"pack_id":"delivery","pack_version":"1"}\'::jsonb'
+        ),
+    )
     room_claimed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     queue_reason: Mapped[str | None] = mapped_column(Text)
     thread_cursor: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
@@ -1166,14 +1175,55 @@ class JiraWorkerJob(Base):
     across restarts or overlaps. Job rows schedule watermark polling."""
 
     __tablename__ = "jira_worker_job_record"
-    __table_args__ = (Index("ix_jira_worker_job_record_due", "status", "due_at"),)
+    __table_args__ = (
+        Index("ix_jira_worker_job_record_due", "status", "due_at"),
+        Index(
+            "uq_jira_worker_job_execution_key",
+            "execution_key",
+            unique=True,
+            postgresql_where=text("execution_key IS NOT NULL"),
+        ),
+        Index(
+            "ix_jira_worker_job_active_role",
+            "ticket_id",
+            "kind",
+            "status",
+            "due_at",
+            postgresql_where=text("kind = 'role_job'"),
+        ),
+        Index(
+            "uq_jira_worker_job_active_generation",
+            "ticket_id",
+            "generation",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'role_job' AND status IN "
+                "('pending','claimed','running','waiting_input','paused',"
+                "'cancel_requested','uncertain')"
+            ),
+        ),
+        CheckConstraint(
+            "kind <> 'role_job' OR (ticket_id IS NOT NULL "
+            "AND execution_key IS NOT NULL AND generation IS NOT NULL AND generation > 0 "
+            "AND execution_key ~ '^[^/]+/[1-9][0-9]*/(reproduce|fix|review|qa|smoke)/[1-9][0-9]*$' "
+            "AND split_part(execution_key, '/', 1) = ticket_id "
+            "AND split_part(execution_key, '/', 2) = generation::text)",
+            name="ck_jira_worker_role_identity",
+        ),
+        CheckConstraint(
+            "kind <> 'role_job' OR status IN "
+            "('pending','claimed','running','waiting_input','paused','cancel_requested',"
+            "'cancelled','uncertain','done','error')",
+            name="ck_jira_worker_role_status",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     instance: Mapped[str] = mapped_column(Text, nullable=False, default="")
     project_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
     due_at: Mapped[str] = mapped_column(DateTime(timezone=True), nullable=False)
-    # pending | claimed | done | error
+    # Role jobs also retain running, wait, cancellation, and uncertain states.
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     claimed_at: Mapped[str | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -1185,6 +1235,20 @@ class JiraWorkerJob(Base):
     )
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ticket_id: Mapped[str | None] = mapped_column(
+        Text,
+        ForeignKey("jira_worker_ticket_map.id", name="fk_jira_worker_job_ticket"),
+        nullable=True,
+    )
+    execution_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class JiraWorkerEvent(Base):

@@ -18,6 +18,34 @@ Tickets that exceed room or session capacity remain in the worker's To Do queue.
 Admission selects the oldest unclaimed ticket in an enabled project first, including one that has no queue reason yet. The queue does not overwrite
 Jira status or a human decision.
 
+## Frozen workflow state
+
+Existing tickets retain the `delivery@1` legacy intake policy. New intake tickets
+also use that policy. The additive workflow schema does not enable delivery,
+start coding jobs, or change approval behavior.
+
+`packs.py` loads the immutable `delivery@2.0.0-draft` fixture. It checks the
+historical digest before it creates a snapshot with configured budgets.
+A ticket stores its snapshot and digest together. Later configuration or pack
+file changes do not change that stored snapshot. The draft remains fixture-only.
+Typed state and result contracts validate JSON at the workflow boundary.
+
+| Environment variable | Default |
+| --- | ---: |
+| `JIRA_WORKER_DELIVERY_TICKET_TOKENS` | 200000 |
+| `JIRA_WORKER_DELIVERY_TICKET_ESTIMATED_USD` | 5 |
+| `JIRA_WORKER_DELIVERY_DAY_ESTIMATED_USD` | 25 |
+
+Costs are USD estimates, not subscription invoices. These settings do not change
+the existing intake limit of 50000 tokens. Budget enforcement belongs to delivery
+execution, which is not enabled here.
+
+The scheduler claims only explicit job kinds. The intake scheduler claims
+watermark polls, not role jobs or unknown kinds. Execution keys remain unique
+after completion. Only one active role execution may hold a ticket generation.
+Downgrade refuses delivery workflow or execution records, including completed
+executions, to preserve their snapshots and audit history.
+
 ## Ticket rooms
 
 Each ticket room uses a private channel on the instance's default collaboration
