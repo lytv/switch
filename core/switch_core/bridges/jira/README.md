@@ -56,7 +56,8 @@ It affects new tickets only. It does not enable execution. For example:
 ```
 
 The Service field must contain `Bug`, `Feature`, `Docs`, or `Other` as its
-single-select value. An absent or unknown value fails intake visibly.
+single-select value. An absent or unknown value parks that ticket with an admin
+card reason. Other tickets in the poll batch still commit.
 Projects without a mapping retain legacy behavior. Existing legacy tickets never
 upgrade because an operator adds a mapping.
 
@@ -83,8 +84,11 @@ The intake model cannot verify repositories. This change adds no triage runtime,
 checkout, Firstmate launcher, or new outbox command type.
 
 Bug intake without a verified target records its summary and requests trusted
-triage. It does not queue scope approval. Missing or ambiguous URLs cannot form
-a checkout job. A changed Service or Bug repository URL parks the ticket and
+triage. It does not queue scope approval until trusted triage verifies the target.
+Verification resumes completed intake once, without another model decision, and
+queues a summary with the verified repository before requesting scope approval.
+Repeated triage results do not queue another approval. Missing or ambiguous URLs
+cannot form a checkout job. A changed Service or Bug repository URL parks the ticket and
 preserves its original target. Target edits do not clear a park automatically.
 Feature, Docs, and Other finish with a summary and an explicit manual handoff.
 They never queue code work or an approval transition.

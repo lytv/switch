@@ -196,6 +196,7 @@ class IntakeOrchestrator:
             original_state = ticket.intake_state
             state = dict(original_state or {})
             phase = state.get("phase", "intake")
+            resuming_scope = phase == "scope_ready"
             if (
                 phase in ("approval", "triage", "manual_handoff")
                 or ticket.status
@@ -225,7 +226,15 @@ class IntakeOrchestrator:
                 if key in ("reply", "question", "complete", "jira_rejection")
             ]
         failure = None
-        if phase == "intake" and state.get("cycle", 0) > 0:
+        if resuming_scope:
+            decision = IntakeDecision(
+                "complete",
+                next(
+                    item["complete"] for item in reversed(history) if "complete" in item
+                ),
+                0,
+            )
+        elif phase == "intake" and state.get("cycle", 0) > 0:
             decision = IntakeDecision(
                 "question",
                 "Which requirements in the intake summary need correction?",
@@ -358,11 +367,20 @@ class IntakeOrchestrator:
                         phase = "triage"
                         reason = "Repository triage required before scope approval or checkout"
                         content += "\n" + reason
-                history.append({"complete": content})
+                    else:
+                        content += (
+                            f"\nVerified repository: {target.repository.canonical_url}"
+                            f"\nBase branch: {target.repository.base_branch}"
+                            f"\nBase commit: {target.repository.base_sha}"
+                        )
+                if not resuming_scope:
+                    history.append({"complete": decision.content})
                 summary = await self._queue(
                     session,
                     ticket,
-                    f"{cycle}:summary",
+                    f"{cycle}:verified-summary"
+                    if resuming_scope
+                    else f"{cycle}:summary",
                     "jira",
                     "comment",
                     f"Intake summary (not approval):\n{content}",

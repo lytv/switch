@@ -14,7 +14,7 @@ from switch_core.bridges.jira.packs import load_pack
 from switch_core.bridges.jira.parse import _plain_text, _text
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerTicket
+from switch_core.db.models import JiraWorkerEvent, JiraWorkerTicket
 
 
 def ticket_repository_url(fields: dict[str, Any], field: str) -> str:
@@ -44,9 +44,11 @@ def initialize_target(
         return
     service = _text(fields.get(mapping.service_field)).strip()
     if service not in {"Bug", "Feature", "Docs", "Other"}:
-        raise ValueError(
-            "Delivery intake requires a mapped Bug, Feature, Docs or Other Service"
+        park_ticket(
+            ticket,
+            "Delivery intake requires a mapped Bug, Feature, Docs or Other Service",
         )
+        return
     supplied_url = ticket_repository_url(fields, mapping.repository_url_field)
     repository = (
         Repository(
@@ -134,4 +136,20 @@ async def record_repository_triage(
     ticket.workflow_state = DeliveryWorkflowState.model_validate_json(
         json.dumps(data)
     ).model_dump(mode="json")
+    intake = dict(ticket.intake_state or {})
+    if repository.outcome == "verified" and intake.get("phase") == "triage":
+        ticket.intake_state = {**intake, "phase": "scope_ready"}
+        session.add(
+            JiraWorkerEvent(
+                instance=ticket.instance,
+                issue_key=ticket.issue_key,
+                project_key=ticket.project_key,
+                idempotency_key=f"repository-verified:{ticket.id}:{generation}",
+                event_kind="explicit_input",
+                webhook_event="worker:repository_verified",
+                payload={"reporter_input": True},
+            )
+        )
+        if ticket.agent_state != "live":
+            ticket.agent_state = "wake_requested"
     await session.flush()

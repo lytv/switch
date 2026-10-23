@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from switch_core.bridges.jira.activity import TicketTurn
+from switch_core.bridges.jira.activity import TicketActivity, TicketTurn
 from switch_core.bridges.jira.contracts import Job, Repository, repository_identity
 from switch_core.bridges.jira.intake import IntakeOrchestrator
 from switch_core.bridges.jira.outbox import read_jira_version
@@ -32,7 +32,12 @@ from switch_core.bridges.jira.worker import (
     record_polled_issue,
     record_webhook_event,
 )
-from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
+from switch_core.db.models import (
+    JiraWorkerEvent,
+    JiraWorkerJob,
+    JiraWorkerOutbox,
+    JiraWorkerTicket,
+)
 from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard
 from tests.switch_core.bridges.jira.test_intake import (
     ModelMock,
@@ -440,12 +445,84 @@ async def test_partial_webhook_preserves_target(session_factory):
         assert row.workflow_state == stored.workflow_state
 
 
-@pytest.mark.parametrize("service", ["", "Unexpected"])
-async def test_unmapped_service_fails_intake_visibly(session_factory, service):
-    with pytest.raises(ValueError, match="requires a mapped"):
-        await ingest(session_factory, service=service)
+@pytest.mark.parametrize("service", [None, "", "Unexpected"])
+@pytest.mark.parametrize("bad_first", [False, True])
+async def test_invalid_service_parks_only_its_ticket_in_poll_and_webhook(
+    session_factory, service, bad_first
+):
+    settings = config().model_copy(
+        update={"jira_worker_enabled_projects": {"acme": ["TEST"]}}
+    )
+    good, bad = issue("TEST-1"), issue("TEST-2", service=service)
+    if service is None:
+        del bad["fields"][SERVICE_FIELD]
+    poll = AsyncMock(spec=JiraPollClient)
+    poll.search_updated.return_value = [bad, good] if bad_first else [good, bad]
+    worker = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=settings,
+        poll_clients={"acme": poll},
+        clock=lambda: NOW,
+    )
+    await worker.run_once()
     async with session_factory() as session:
-        assert (await session.scalars(select(JiraWorkerTicket))).all() == []
+        jobs = (await session.scalars(select(JiraWorkerJob))).all()
+        assert len([job for job in jobs if job.status == "done"]) == 1
+        next_poll = next(job for job in jobs if job.status == "pending")
+        assert next_poll.payload["watermark"] == NOW.isoformat()
+
+    store = AsyncMock()
+    store.list.return_value = []
+    bridge = JiraBridgeService(
+        session_factory=session_factory,
+        trigger_store=store,
+        agent_store=AsyncMock(),
+        room_store=AsyncMock(),
+        protocol=AsyncMock(),
+        config=settings,
+    )
+    app = FastAPI()
+    init_jira_routes(service=bridge, secrets_by_instance={"acme": "placeholder"})
+    app.include_router(router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as http:
+        for source, key in [(good, "TEST-3"), (bad, "TEST-4")]:
+            for _ in range(2):
+                response = await http.post(
+                    "/integrations/jira/acme",
+                    json={
+                        "webhookEvent": "jira:issue_created",
+                        "issue": {**source, "key": key},
+                    },
+                    headers={"X-Switch-Secret": "placeholder"},
+                )
+                assert response.status_code == 202
+    async with session_factory() as session:
+        rows = {
+            row.issue_key: row
+            for row in await session.scalars(select(JiraWorkerTicket))
+        }
+        assert set(rows) == {"TEST-1", "TEST-2", "TEST-3", "TEST-4"}
+        for key in ("TEST-1", "TEST-3"):
+            assert rows[key].worker_parked_reason is None
+            assert delivery_state(rows[key]).service == "Bug"
+        for key in ("TEST-2", "TEST-4"):
+            row = rows[key]
+            assert "requires a mapped" in row.worker_parked_reason
+            assert row.agent_state == "parked"
+            assert row.agent_generation == 1
+            assert await session.scalar(
+                select(JiraWorkerOutbox.id).where(
+                    JiraWorkerOutbox.issue_key == key,
+                    JiraWorkerOutbox.command == "upsert_ticket_admin_card",
+                )
+            )
+        assert not (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(JiraWorkerOutbox.channel == "jira")
+            )
+        ).all()
 
 
 @pytest.mark.parametrize("key", ["KAN-1", "TEST-1"])
@@ -527,6 +604,170 @@ async def test_intake_completion_cannot_dispatch_development(
         if service != "Bug":
             assert delivery_state(row).step == "manual_handoff"
             assert "Manual handling required" in commands[0].payload["data"]
+
+
+@pytest.mark.parametrize("verified_later", [False, True])
+async def test_verified_repository_requests_scope_approval_once(
+    session_factory, verified_later
+):
+    stored = await ingest(session_factory)
+    settings = config()
+    model = ModelMock("complete")
+    orchestrator = IntakeOrchestrator(
+        session_factory=session_factory,
+        config=settings,
+        model=model,
+        board=FakeAdminBoard(),
+        clock=lambda: NOW,
+    )
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerTicket, stored.id)
+        row.jira_read_changelog_id = ""
+        row.jira_seen_comment_ids = []
+        row.room_claimed = True
+        row.card_event_id = "card"
+        row.agent_state = "wake_requested"
+        if not verified_later:
+            await record_repository_triage(
+                session,
+                ticket_id=row.id,
+                generation=row.agent_generation,
+                repository=verified(),
+            )
+        await session.commit()
+
+    async def handle(request):
+        if request.url.path.endswith("/myself"):
+            return httpx.Response(200, json={"accountId": "worker"})
+        if request.url.path.endswith("/changelog"):
+            return httpx.Response(200, json={"values": [], "total": 0})
+        if request.url.path.endswith("/comment"):
+            return httpx.Response(200, json={"comments": [], "total": 0})
+        return httpx.Response(200, json=issue())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        activity = TicketActivity(
+            session_factory=session_factory,
+            config=settings,
+            clients={
+                "acme": JiraPollClient(
+                    base_url="https://jira.example",
+                    email="bot@example.com",
+                    api_token="placeholder",
+                    client=http,
+                    extra_fields=(SERVICE_FIELD,),
+                )
+            },
+            rooms=None,
+            clock=lambda: NOW,
+        )
+        assert await activity.run_one_turn(orchestrator) == stored.id
+        if verified_later:
+            async with session_factory() as session:
+                row = await session.get(JiraWorkerTicket, stored.id)
+                assert row.intake_state["phase"] == "triage"
+                assert row.agent_state == "waiting"
+                commands = (
+                    await session.scalars(
+                        select(JiraWorkerOutbox).where(
+                            JiraWorkerOutbox.command_key.like("intake:%")
+                        )
+                    )
+                ).all()
+                assert len(commands) == 1
+                assert commands[0].command == "comment"
+                commands[0].status = "done"
+                for outcome in ("unknown", "invalid"):
+                    await record_repository_triage(
+                        session,
+                        ticket_id=row.id,
+                        generation=row.agent_generation,
+                        repository=Repository(
+                            supplied_url=URL,
+                            outcome=outcome,
+                            canonical_url=None,
+                            base_branch=None,
+                            base_sha=None,
+                            evidence="Repository needs human investigation",
+                        ),
+                    )
+                    assert row.intake_state["phase"] == "triage"
+                    assert row.agent_state == "waiting"
+                with pytest.raises(ValueError, match="does not match"):
+                    await record_repository_triage(
+                        session,
+                        ticket_id=row.id,
+                        generation=row.agent_generation,
+                        repository=verified("https://forge.example/wrong/repo"),
+                    )
+                assert row.intake_state["phase"] == "triage"
+                await session.commit()
+            for _ in range(2):
+                async with session_factory() as session:
+                    await record_repository_triage(
+                        session,
+                        ticket_id=stored.id,
+                        generation=stored.agent_generation,
+                        repository=verified(),
+                    )
+                    await session.commit()
+            async with session_factory() as session:
+                row = await session.get(JiraWorkerTicket, stored.id)
+                assert row.intake_state["phase"] == "scope_ready"
+                assert row.agent_state == "wake_requested"
+            assert await activity.run_one_turn(orchestrator) == stored.id
+        async with session_factory() as session:
+            await record_repository_triage(
+                session,
+                ticket_id=stored.id,
+                generation=stored.agent_generation,
+                repository=verified(),
+            )
+            await session.commit()
+        assert await activity.run_one_turn(orchestrator) is None
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerTicket, stored.id)
+        assert row.intake_state["phase"] == "approval"
+        assert delivery_state(row).step == "intake"
+        assert row.status == "To Do"
+        commands = (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command_key.like("intake:%")
+                )
+            )
+        ).all()
+        assert len(commands) == (3 if verified_later else 2)
+        approvals = [command for command in commands if command.command == "transition"]
+        assert len(approvals) == 1
+        assert (
+            approvals[0].payload["data"]
+            == settings.jira_worker_statuses.waiting_for_approval
+        )
+        summary = await session.get(
+            JiraWorkerOutbox, approvals[0].payload["after_command"]
+        )
+        assert summary.command == "comment"
+        assert "The reporter needs a clear outcome." in summary.payload["data"]
+        assert verified().canonical_url in summary.payload["data"]
+        assert verified().base_branch in summary.payload["data"]
+        assert verified().base_sha in summary.payload["data"]
+        assert "triage required" not in summary.payload["data"]
+        events = (
+            await session.scalars(
+                select(JiraWorkerEvent).where(
+                    JiraWorkerEvent.webhook_event == "worker:repository_verified"
+                )
+            )
+        ).all()
+        assert len(events) == int(verified_later)
+        assert all(event.consumed for event in events)
+        assert not (
+            await session.scalars(
+                select(JiraWorkerJob).where(JiraWorkerJob.kind == "role_job")
+            )
+        ).all()
+        assert len(model.calls) == 1
 
 
 @pytest.mark.parametrize(
