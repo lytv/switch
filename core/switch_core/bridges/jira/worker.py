@@ -37,6 +37,7 @@ from switch_core.bridges.jira.admin import (
 from switch_core.bridges.jira.intake import build_intake_orchestrator
 from switch_core.bridges.jira.observe import _stamp
 from switch_core.bridges.jira.outbox import JiraOutboxSender
+from switch_core.bridges.jira.target import check_target_fields, initialize_target
 from switch_core.bridges.trigger_source import NormalizedTriggerEvent
 from switch_core.config import SwitchConfig
 from switch_core.db.models import (
@@ -75,7 +76,7 @@ def is_worker_enabled(config: SwitchConfig, instance: str, project_key: str) -> 
 
 def webhook_idempotency_key(payload: dict[str, Any], issue_key: str) -> str:
     """Key from raw webhookEvent + issue id/key + timestamp + changelog.id."""
-    issue = payload.get("issue")
+    issue = payload.get("issue", payload)
     issue_id = ""
     if isinstance(issue, dict):
         issue_id = str(issue.get("id") or "")
@@ -99,7 +100,7 @@ def poll_idempotency_key(issue_key: str, updated: str) -> str:
 
 def jira_reporter_account_id(payload: dict[str, Any]) -> str:
     """Return only Jira's immutable reporter account identifier."""
-    issue = payload.get("issue")
+    issue = payload.get("issue", payload)
     fields = issue.get("fields") if isinstance(issue, dict) else None
     reporter = fields.get("reporter") if isinstance(fields, dict) else None
     account_id = reporter.get("accountId") if isinstance(reporter, dict) else None
@@ -356,7 +357,7 @@ async def remove_identity_mapping(
 
 
 def jira_updated_at(payload: dict[str, Any]) -> datetime:
-    issue = payload.get("issue")
+    issue = payload.get("issue", payload)
     fields = issue.get("fields") if isinstance(issue, dict) else None
     updated = fields.get("updated") if isinstance(fields, dict) else None
     if isinstance(updated, str):
@@ -388,6 +389,7 @@ async def upsert_ticket(
     wait_channel: str,
     updated_at: datetime,
     fields: dict[str, Any],
+    config: SwitchConfig | None,
     issue_id: str = "",
     project_key: str = "",
     summary: str = "",
@@ -415,6 +417,8 @@ async def upsert_ticket(
     )
     ticket = result.scalar_one_or_none()
     if ticket is not None:
+        if config is not None:
+            initialize_target(ticket, fields, config)
         if is_terminal_ticket_status(ticket.status):
             park_ticket(ticket, "Jira ticket completed or cancelled")
         await session.flush()
@@ -432,6 +436,7 @@ async def upsert_ticket(
     assert ticket is not None
     if ticket.last_event_at > updated_at:
         return ticket, False, False
+    check_target_fields(ticket, fields, complete=False)
 
     if not reporter_account_id and ticket.reporter_account_id:
         reporter_account_id = ticket.reporter_account_id
@@ -516,6 +521,7 @@ async def record_webhook_event(
     instance: str,
     enabled_projects: Sequence[str],
     webhook_identifier: str | None,
+    config: SwitchConfig | None = None,
 ) -> bool:
     """Record one parsed webhook event. Duplicate deliveries are no-ops.
 
@@ -548,9 +554,9 @@ async def record_webhook_event(
         SWITCH_WAIT_CHANNEL if reporter_switch_user_id else JIRA_COMMENTS_WAIT_CHANNEL
     )
     issue_id = ""
-    if isinstance(raw.get("issue"), dict):
-        issue_id = str(raw["issue"].get("id") or "")
-    issue = raw.get("issue")
+    issue = raw.get("issue", raw)
+    if isinstance(issue, dict):
+        issue_id = str(issue.get("id") or "")
     fields = issue.get("fields") if isinstance(issue, dict) else None
     ticket, created, reporter_resolution_changed = await upsert_ticket(
         session,
@@ -560,6 +566,7 @@ async def record_webhook_event(
         project_key=event.project,
         summary=event.summary,
         fields=fields if isinstance(fields, dict) else {},
+        config=config,
         status=event.status,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -581,6 +588,7 @@ async def record_polled_issue(
     issue: dict[str, Any],
     *,
     instance: str,
+    config: SwitchConfig | None = None,
 ) -> bool:
     """Record one Jira search hit through the same event-log path as webhooks."""
     fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
@@ -636,6 +644,7 @@ async def record_polled_issue(
         project_key=project_key,
         summary=str(fields.get("summary") or ""),
         fields=fields,
+        config=config,
         status=status_name,
         reporter_account_id=reporter_account_id,
         reporter_switch_user_id=reporter_switch_user_id,
@@ -837,7 +846,22 @@ class JiraPollClient:
         email: str,
         api_token: str,
         client: httpx.AsyncClient | None = None,
+        extra_fields: Sequence[str] = (),
     ) -> None:
+        self.issue_fields = ",".join(
+            dict.fromkeys(
+                (
+                    "summary",
+                    "description",
+                    "status",
+                    "updated",
+                    "project",
+                    "reporter",
+                    "labels",
+                    *extra_fields,
+                )
+            )
+        )
         self._base_url = base_url.rstrip("/")
         self._auth = (email, api_token)
         self._client = client or httpx.AsyncClient(timeout=30.0)
@@ -866,7 +890,7 @@ class JiraPollClient:
         while True:
             params: dict[str, str | int] = {
                 "jql": jql,
-                "fields": "summary,description,status,updated,project,reporter",
+                "fields": self.issue_fields,
                 "maxResults": 50,
             }
             if next_page_token is not None:
@@ -899,6 +923,20 @@ def build_poll_clients(config: SwitchConfig) -> dict[str, JiraPollClient]:
             base_url=credentials.base_url,
             email=credentials.email,
             api_token=credentials.api_token,
+            extra_fields=tuple(
+                sorted(
+                    {
+                        field
+                        for project in config.jira_worker_delivery_projects.get(
+                            instance, {}
+                        ).values()
+                        for field in (
+                            project.service_field,
+                            project.repository_url_field,
+                        )
+                    }
+                )
+            ),
         )
         for instance, credentials in config.jira_worker_credentials.items()
     }
@@ -1225,7 +1263,9 @@ class JiraWorkerScheduler:
             )
             async with self._session_factory() as session:
                 for issue in issues:
-                    await record_polled_issue(session, issue, instance=job.instance)
+                    await record_polled_issue(
+                        session, issue, instance=job.instance, config=self._config
+                    )
                 await session.commit()
             from switch_core.bridges.jira.rooms import sync_ticket_room
 

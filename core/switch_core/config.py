@@ -18,6 +18,15 @@ class JiraWorkerCredentials(BaseModel):
     api_token: str
 
 
+class JiraWorkerDeliveryProject(BaseModel):
+    """Field mapping for draft delivery intake, not execution enablement."""
+
+    service_field: str = Field(min_length=1, pattern=r"\S")
+    repository_url_field: str = Field(
+        default="description", min_length=1, pattern=r"\S"
+    )
+
+
 class JiraWorkerStatuses(BaseModel):
     to_do: str = Field(default="To Do", min_length=1, pattern=r"\S")
     in_progress: str = Field(default="In Progress", min_length=1, pattern=r"\S")
@@ -188,6 +197,7 @@ class SwitchConfig(BaseSettings):
     # Pilot enables projects by Jira instance, e.g.
     # JIRA_WORKER_ENABLED_PROJECTS='{"acme":["KAN"]}'.
     jira_worker_enabled_projects: dict[str, list[str]] = {}
+    jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
     # Jira REST credentials used only by the worker for polling and outbox writes.
