@@ -519,6 +519,80 @@ async def test_late_result_is_fenced_but_usage_is_reconciled(
         assert "delivery_budget" not in (ticket.admin_reasons or {})
 
 
+@pytest.mark.parametrize("day_offset", [0, 1])
+@pytest.mark.parametrize("artifact", ["usage", "result"])
+@pytest.mark.parametrize("fence", ["active", "cancel", "generation"])
+async def test_known_usd_never_regresses_on_unknown_usage(
+    session_factory, lab, artifact, fence, day_offset
+):
+    job = await _job(session_factory, lab)
+    service = _service(session_factory, lab)
+    await _start(service, job)
+    task = lab.copy.location(job) / "data" / lab.copy.task_id(job)
+    (task / "usage.json").write_text(
+        _usage(usd="0.5", measurement="partial").model_dump_json()
+    )
+    partial = await service.get(job.run.execution_key)
+    assert partial.execution.known_usd == Decimal("0.5")
+    if fence == "cancel":
+        await service.cancel(job.run.execution_key)
+    elif fence == "generation":
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+            ticket.agent_generation += 1
+            await session.commit()
+        await service.get(job.run.execution_key)
+    unknown = Usage(
+        measurement="unknown",
+        provider=None,
+        model=None,
+        input_tokens=None,
+        output_tokens=None,
+        cache_read_tokens=None,
+        cache_write_tokens=None,
+        estimated_usd=Decimal("0.1"),
+        price_source=RESERVATION.price_source,
+        billing="estimate_not_subscription_invoice",
+    )
+    if artifact == "usage":
+        (task / "usage.json").write_text(unknown.model_dump_json())
+    else:
+        _result(lab, job, usage=unknown)
+    first_day = NOW.date().isoformat()
+    for day in (day_offset, day_offset + 1):
+        now = NOW + timedelta(days=day)
+        restarted = _service(session_factory, lab, clock=lambda: now)
+        for _ in range(2):
+            view = await restarted.get(job.run.execution_key)
+            assert view.result is None
+            assert view.execution.known_tokens == 125
+            assert view.execution.known_usd == Decimal("0.5")
+            assert view.execution.held_tokens == 875
+            assert view.execution.held_usd == Decimal("0.5")
+            assert view.execution.usage_unknown
+            assert view.execution.cost_by_day[first_day] == Decimal("0.5")
+            assert sum(view.execution.cost_by_day.values()) == Decimal("0.5")
+            assert all(cost >= 0 for cost in view.execution.cost_by_day.values())
+            async with session_factory() as session:
+                row = await session.scalar(select(JiraWorkerJob))
+                ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+                assert row.result is None
+                assert Decimal(row.payload["known_usd"]) == Decimal("0.5")
+                assert Decimal(row.payload["held_usd"]) == Decimal("0.5")
+                assert row.payload["usage_unknown"]
+                assert ticket.tokens_used == 125
+                state = ticket.workflow_state
+                assert state["reserved_tokens"] == 875
+                assert Decimal(state["known_estimated_usd"]) == Decimal("0.5")
+                assert Decimal(state["reserved_estimated_usd"]) == Decimal("0.5")
+                assert state["unknown_spend"]
+    assert (await _start(restarted, job)).execution.known_usd == Decimal("0.5")
+    assert (await restarted.cancel(job.run.execution_key)).execution.known_usd == Decimal(
+        "0.5"
+    )
+    assert (lab.copy.location(job) / "starts").read_text() == "1"
+
+
 async def test_unknown_usage_retains_reservation_across_midnight(session_factory, lab):
     job = await _job(session_factory, lab, day_estimated_usd="1")
     service = _service(session_factory, lab)

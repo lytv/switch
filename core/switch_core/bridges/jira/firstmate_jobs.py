@@ -418,7 +418,7 @@ class FirstmateJobs:
                         raise ValueError(
                             "Usage price source differs from the reservation"
                         )
-                    known_usd = measured_usd
+                    known_usd = max(known_usd, measured_usd)
                 complete = (
                     stopped
                     and usage.measurement == "complete"
