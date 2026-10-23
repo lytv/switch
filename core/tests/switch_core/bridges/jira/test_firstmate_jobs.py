@@ -386,6 +386,70 @@ async def test_key_input_and_estimates_are_immutable(session_factory, lab):
         await service.start(job, reservation=RESERVATION, estimate_seconds=61)
 
 
+@pytest.mark.parametrize("outcome", ["completed", "needs_input", "cancelled"])
+@pytest.mark.parametrize("change", ["cancel", "generation", "park", "day_budget"])
+async def test_terminal_receipt_survives_later_ticket_and_budget_changes(
+    session_factory, lab, outcome, change
+):
+    job = await _job(session_factory, lab, day_estimated_usd="1")
+    service = _service(session_factory, lab)
+    await _start(service, job)
+    question = (
+        {
+            "run": job.run.model_dump(mode="json"),
+            "input_digest": digest(job),
+            "id": "question-1",
+            "checkpoint_digest": "0" * 64,
+            "text": "Which fixture should I use?",
+        }
+        if outcome == "needs_input"
+        else None
+    )
+    _result(lab, job, status=outcome, question=question)
+    accepted = await service.get(job.run.execution_key)
+    assert accepted.status == {
+        "completed": "done",
+        "needs_input": "waiting_input",
+        "cancelled": "cancelled",
+    }[outcome]
+    assert accepted.result is not None
+    if change == "cancel":
+        assert await service.cancel(job.run.execution_key) == accepted
+    elif change == "day_budget":
+        other = await _job(session_factory, lab, ticket_id="other")
+        await _start(service, other)
+        _result(lab, other, usage=_usage(usd="2"))
+        assert (await service.get(other.run.execution_key)).status == "cancelled"
+    else:
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+            if change == "generation":
+                ticket.agent_generation += 1
+            else:
+                ticket.worker_parked_reason = "human_action"
+            await session.commit()
+    restarted = _service(session_factory, lab)
+    assert await restarted.get(job.run.execution_key) == accepted
+    assert await _start(restarted, job) == accepted
+    assert await restarted.cancel(job.run.execution_key) == accepted
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(JiraWorkerJob).where(
+                JiraWorkerJob.execution_key == job.run.execution_key
+            )
+        )
+        ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+        assert row.result == accepted.result.model_dump(mode="json")
+        assert row.cancel_requested_at is None
+        assert ticket.tokens_used == 125
+        assert ticket.workflow_state["reserved_tokens"] == 0
+        assert Decimal(ticket.workflow_state["reserved_estimated_usd"]) == 0
+        assert Decimal(ticket.workflow_state["known_estimated_usd"]) == Decimal("0.1")
+        assert not ticket.workflow_state["unknown_spend"]
+        assert "delivery_budget" not in (ticket.admin_reasons or {})
+    assert (lab.copy.location(job) / "starts").read_text() == "1"
+
+
 @pytest.mark.parametrize("fence", ["cancel", "generation", "park", "service"])
 async def test_late_result_is_fenced_but_usage_is_reconciled(
     session_factory, lab, fence
@@ -409,16 +473,50 @@ async def test_late_result_is_fenced_but_usage_is_reconciled(
             else:
                 ticket.worker_parked_reason = "human_action"
             await session.commit()
-    _result(lab, job)
+    terminal = await service.get(job.run.execution_key)
+    assert terminal.status == "cancelled" and terminal.result is None
+    assert terminal.execution.held_tokens == 1000
+    assert terminal.execution.held_usd == Decimal("1")
+    assert terminal.execution.usage_unknown
+    task = lab.copy.location(job) / "data" / lab.copy.task_id(job)
+    (task / "usage.json").write_text(_usage(measurement="partial").model_dump_json())
+    partial = await service.get(job.run.execution_key)
+    assert partial.status == "cancelled" and partial.result is None
+    assert partial.execution.rejection == terminal.execution.rejection
+    assert partial.execution.known_tokens == 125
+    assert partial.execution.held_tokens == 875
+    assert partial.execution.held_usd == Decimal("0.9")
+    assert partial.execution.usage_unknown
+    assert await service.get(job.run.execution_key) == partial
+    if fence == "park":
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+            ticket.worker_parked_reason = None
+            await session.commit()
+    _result(lab, job, usage=_usage(tokens=1975, usd="2"))
     late = await service.get(job.run.execution_key)
     assert late.result is None and late.status == "cancelled"
-    assert late.execution.rejection is not None
-    assert late.execution.known_tokens == 125
+    assert late.execution.rejection == terminal.execution.rejection
+    assert late.execution.known_tokens == 2000
+    assert late.execution.known_usd == Decimal("2")
     assert late.execution.held_tokens == 0
+    assert late.execution.held_usd == 0
+    assert not late.execution.usage_unknown
+    assert await _start(service, job) == late
+    assert await service.cancel(job.run.execution_key) == late
+    assert await _service(session_factory, lab).get(job.run.execution_key) == late
     assert (lab.copy.location(job) / "cancel-reached").exists()
+    assert (lab.copy.location(job) / "starts").read_text() == "1"
     async with session_factory() as session:
         row = await session.scalar(select(JiraWorkerJob))
+        ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
         assert row.result is None
+        assert ticket.tokens_used == 2000
+        assert ticket.workflow_state["reserved_tokens"] == 0
+        assert Decimal(ticket.workflow_state["reserved_estimated_usd"]) == 0
+        assert Decimal(ticket.workflow_state["known_estimated_usd"]) == Decimal("2")
+        assert not ticket.workflow_state["unknown_spend"]
+        assert "delivery_budget" not in (ticket.admin_reasons or {})
 
 
 async def test_unknown_usage_retains_reservation_across_midnight(session_factory, lab):
@@ -545,6 +643,74 @@ async def test_cancel_during_start_persists_intent_before_launch_returns(
             if task is not None and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancel_and_get_wait_for_full_native_start(session_factory, lab, tmp_path):
+    job = await _job(session_factory, lab)
+    service = _service(session_factory, lab)
+    _script(
+        tmp_path / "tools/tmux",
+        "import os, pathlib, time\n"
+        "home = pathlib.Path(os.environ['FM_HOME'])\n"
+        "(home / 'tmux-entered').touch()\n"
+        "while (pathlib.Path.cwd() / 'wait-tmux').exists():\n"
+        "    time.sleep(0.01)\n",
+    )
+    tmux_gate, launch_gate = (
+        lab.checkout / name for name in ("wait-tmux", "wait-launch")
+    )
+    tmux_gate.touch()
+    launch_gate.touch()
+    start = asyncio.create_task(_start(service, job))
+    cancel = get = None
+    try:
+        async with asyncio.timeout(160):
+            while not (lab.copy.location(job) / "tmux-entered").exists():
+                await asyncio.sleep(0.01)
+            cancel = asyncio.create_task(
+                _service(session_factory, lab).cancel(job.run.execution_key)
+            )
+            get = asyncio.create_task(
+                _service(session_factory, lab).get(job.run.execution_key)
+            )
+            while True:
+                async with session_factory() as session:
+                    row = await session.scalar(select(JiraWorkerJob))
+                    if row.cancel_requested_at is not None:
+                        break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(70)
+            tmux_gate.unlink()
+            while not (lab.copy.location(job) / "launch-entered").exists():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(65)
+            assert not cancel.done() and not get.done()
+            launch_gate.unlink()
+            views = await asyncio.gather(start, cancel, get)
+        assert all(view.status == "cancelled" for view in views)
+        assert all(view.result is None for view in views)
+        home = lab.copy.location(job)
+        assert (home / "starts").read_text() == "1"
+        assert (home / "cancel-reached").exists()
+        pid = int((home / "child.pid").read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert (await _start(_service(session_factory, lab), job)).status == "cancelled"
+        assert (home / "starts").read_text() == "1"
+        async with session_factory() as session:
+            rows = (await session.scalars(select(JiraWorkerJob))).all()
+            assert len(rows) == 1
+            assert rows[0].cancel_requested_at is not None
+    finally:
+        tmux_gate.unlink(missing_ok=True)
+        launch_gate.unlink(missing_ok=True)
+        for task in (start, cancel, get):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (start, cancel, get) if task is not None),
+            return_exceptions=True,
+        )
 
 
 async def test_corrupt_artifact_cannot_prevent_cancellation(session_factory, lab):

@@ -95,7 +95,7 @@ def _view(row: JiraWorkerJob) -> ExecutionView:
         execution_key=_execution(row).contract.run.execution_key,
         status=row.status,
         result=Result.model_validate_json(json.dumps(row.result))
-        if row.result and _execution(row).rejection is None
+        if row.result is not None
         else None,
         execution=_execution(row),
     )
@@ -122,8 +122,7 @@ class FirstmateJobs:
     @asynccontextmanager
     async def _execution_lock(self, key: str) -> AsyncIterator[None]:
         # Session locks do not hold ticket rows during a process-boundary call.
-        deadline = asyncio.get_running_loop().time() + 130
-        while asyncio.get_running_loop().time() < deadline:
+        while True:
             async with self._sessions() as session:
                 acquired = await session.scalar(
                     text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
@@ -141,7 +140,6 @@ class FirstmateJobs:
                         )
                     return
             await asyncio.sleep(0.05)
-        raise TimeoutError("Another lifecycle operation still owns this execution")
 
     async def _budget_lock(self, session: AsyncSession) -> None:
         await session.execute(text(f"SELECT pg_advisory_xact_lock({_BUDGET_LOCK})"))
@@ -321,9 +319,8 @@ class FirstmateJobs:
         async with self._sessions() as session:
             await self._budget_lock(session)
             row = await self._row(session, execution_key)
-            if row.cancel_requested_at is None:
-                row.cancel_requested_at = self._clock()
-            if row.status not in _TERMINAL:
+            if row.status not in _TERMINAL and row.result is None:
+                row.cancel_requested_at = row.cancel_requested_at or self._clock()
                 row.status = "cancel_requested"
             await session.commit()
         async with self._execution_lock(execution_key):
@@ -378,6 +375,7 @@ class FirstmateJobs:
             ticket = await self._ticket(session, row)
             previous = set(ticket.admin_reasons or {})
             state, execution = _state(ticket), _execution(row)
+            terminal = row.status in _TERMINAL or row.result is not None
             result = observed.result
             if result is not None:
                 self._secrets.check(result.model_dump_json())
@@ -451,12 +449,13 @@ class FirstmateJobs:
                 - execution.known_usd,
             )
             rejection = execution.rejection
-            if row.cancel_requested_at is not None:
-                rejection = "cancelled"
-            elif ticket.agent_generation != row.generation:
-                rejection = "stale_generation"
-            elif ticket.worker_parked_reason is not None:
-                rejection = "parked"
+            if not terminal:
+                if row.cancel_requested_at is not None:
+                    rejection = "cancelled"
+                elif ticket.agent_generation != row.generation:
+                    rejection = "stale_generation"
+                elif ticket.worker_parked_reason is not None:
+                    rejection = "parked"
             execution = _replace(
                 execution,
                 known_tokens=known_tokens,
@@ -470,65 +469,67 @@ class FirstmateJobs:
             )
             row.payload = execution.model_dump(mode="json")
             await session.flush()
-            budget = pack.budget
-            exceeded = (
-                known_tokens > execution.reservation.tokens
-                or known_usd > execution.reservation.estimated_usd
-                or ticket.tokens_used + state.reserved_tokens > budget.ticket_tokens
-                or state.known_estimated_usd + state.reserved_estimated_usd
-                > budget.ticket_estimated_usd
-                or await self._day_cost(session) > budget.day_estimated_usd
-            )
-            budget_stop = exceeded or (
-                not stopped
-                and (
-                    known_tokens >= execution.reservation.tokens
-                    or known_usd >= execution.reservation.estimated_usd
+            budget_stop = False
+            if not terminal:
+                budget = pack.budget
+                exceeded = (
+                    known_tokens > execution.reservation.tokens
+                    or known_usd > execution.reservation.estimated_usd
+                    or ticket.tokens_used + state.reserved_tokens > budget.ticket_tokens
+                    or state.known_estimated_usd + state.reserved_estimated_usd
+                    > budget.ticket_estimated_usd
+                    or await self._day_cost(session) > budget.day_estimated_usd
                 )
-            )
-            if budget_stop:
-                row.cancel_requested_at = row.cancel_requested_at or self._clock()
-                row.status = "cancelled" if stopped else "cancel_requested"
-                _reason(
-                    ticket,
-                    "delivery_budget",
-                    "Delivery spend reached its reservation or approved budget",
+                budget_stop = exceeded or (
+                    not stopped
+                    and (
+                        known_tokens >= execution.reservation.tokens
+                        or known_usd >= execution.reservation.estimated_usd
+                    )
                 )
-                ticket.worker_parked_reason = "delivery_budget"
-            elif rejection is not None:
-                row.status = "cancelled" if stopped else "cancel_requested"
-            elif result is not None and stopped:
-                if complete and result.status in {
-                    "completed",
-                    "needs_input",
-                    "cancelled",
-                }:
-                    row.result = result.model_dump(mode="json")
-                    row.status = {
-                        "completed": "done",
-                        "needs_input": "waiting_input",
-                        "cancelled": "cancelled",
-                    }[result.status]
+                if budget_stop:
+                    row.cancel_requested_at = row.cancel_requested_at or self._clock()
+                    row.status = "cancelled" if stopped else "cancel_requested"
+                    _reason(
+                        ticket,
+                        "delivery_budget",
+                        "Delivery spend reached its reservation or approved budget",
+                    )
+                    ticket.worker_parked_reason = "delivery_budget"
+                elif rejection is not None:
+                    row.status = "cancelled" if stopped else "cancel_requested"
+                elif result is not None and stopped:
+                    if complete and result.status in {
+                        "completed",
+                        "needs_input",
+                        "cancelled",
+                    }:
+                        row.result = result.model_dump(mode="json")
+                        row.status = {
+                            "completed": "done",
+                            "needs_input": "waiting_input",
+                            "cancelled": "cancelled",
+                        }[result.status]
+                    else:
+                        row.status = "uncertain"
+                        if complete:
+                            ticket.worker_parked_reason = (
+                                ticket.worker_parked_reason or "delivery_outcome_uncertain"
+                            )
+                            _reason(
+                                ticket,
+                                "delivery_uncertain",
+                                "Task result reports an uncertain outcome",
+                            )
+                elif observed.status == "running":
+                    row.status = "running"
                 else:
                     row.status = "uncertain"
-                    if complete:
-                        ticket.worker_parked_reason = (
-                            ticket.worker_parked_reason or "delivery_outcome_uncertain"
-                        )
-                        _reason(
-                            ticket,
-                            "delivery_uncertain",
-                            "Task result reports an uncertain outcome",
-                        )
-            elif observed.status == "running":
-                row.status = "running"
-            elif row.status not in _TERMINAL:
-                row.status = "uncertain"
-                _reason(
-                    ticket,
-                    "delivery_uncertain",
-                    "Task dispatch has no confirmed running receipt",
-                )
+                    _reason(
+                        ticket,
+                        "delivery_uncertain",
+                        "Task dispatch has no confirmed running receipt",
+                    )
             if stopped and not complete:
                 ticket.worker_parked_reason = (
                     ticket.worker_parked_reason or "delivery_usage_unknown"

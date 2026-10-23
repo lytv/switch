@@ -56,8 +56,11 @@ or schema migration.
 Start commits the frozen input and usage reservation before it calls Firstmate.
 A repeated execution key returns the same execution. Different input, reservation,
 or duration estimates for that key fail. One database lock serializes each
-execution's process operations. A separate transaction lock serializes budget
-admission and usage accounting across tickets.
+execution's process operations. Concurrent calls wait for the lock without a
+separate wait timeout. Native commands retain their individual timeouts, so a
+start can span several command timeouts. Cancel commits its intent before it
+waits. A separate transaction lock serializes budget admission and usage
+accounting across tickets.
 
 `firstmate_copy.py` calls the delivery checkout's `fm-spawn.sh --scout` and
 `fm-control.sh <task-id> exit`. It uses the native task metadata, brief, status,
@@ -88,6 +91,9 @@ mismatches, mismatched inputs, and forbidden credential values. A result does
 not prove process exit. The service confirms native cancellation before it
 accepts the result or releases unused reservations. Cancellation and generation
 changes reject late results, but still account for their known usage.
+Terminal status and accepted results remain unchanged after later cancellation,
+generation, park, or budget changes. Terminal executions still account for late
+usage, but they never accept a previously unaccepted result.
 
 A durable dispatch marker precedes native spawn. If a crash leaves that marker
 without native task metadata, the execution becomes `uncertain`. It retains its
