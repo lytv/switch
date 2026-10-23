@@ -65,6 +65,11 @@ def _directory(path: Path) -> None:
         raise ValueError("Task directories must not contain symlinks")
     if path.stat().st_mode & 0o077:
         raise ValueError("Task directories must be private")
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def _read(root: Path, name: str) -> bytes | None:
@@ -89,7 +94,7 @@ def _read(root: Path, name: str) -> bytes | None:
         with os.fdopen(artifact, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise ValueError("Artifact must be a regular, unlinked file")
+                raise ValueError("Artifact must be a single-link regular file")
             if info.st_size > MAX_ARTIFACT_BYTES:
                 raise ValueError("Artifact exceeds its size limit")
             data = stream.read(MAX_ARTIFACT_BYTES + 1)

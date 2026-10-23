@@ -79,8 +79,8 @@ def _execution(row: JiraWorkerJob) -> Execution:
 
 def _state(ticket: JiraWorkerTicket) -> DeliveryWorkflowState:
     state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
-    if not isinstance(state, DeliveryWorkflowState) or state.service != "Bug":
-        raise ValueError("Only a frozen Bug delivery contract can start work")
+    if not isinstance(state, DeliveryWorkflowState):
+        raise ValueError("Task accounting requires a frozen delivery contract")
     return state
 
 
@@ -215,7 +215,8 @@ class FirstmateJobs:
                 raise ValueError("Unknown delivery ticket")
             state = _state(ticket)
             if (
-                ticket.instance != job.run.instance
+                state.service != "Bug"
+                or ticket.instance != job.run.instance
                 or ticket.agent_generation != job.run.generation
                 or ticket.worker_parked_reason is not None
                 or state.pack.digest != job.pack_digest
@@ -510,12 +511,15 @@ class FirstmateJobs:
                     }[result.status]
                 else:
                     row.status = "uncertain"
-                    ticket.worker_parked_reason = "delivery_usage_unknown"
-                    _reason(
-                        ticket,
-                        "delivery_usage_unknown",
-                        "Usage is incomplete; the reservation remains held",
-                    )
+                    if complete:
+                        ticket.worker_parked_reason = (
+                            ticket.worker_parked_reason or "delivery_outcome_uncertain"
+                        )
+                        _reason(
+                            ticket,
+                            "delivery_uncertain",
+                            "Task result reports an uncertain outcome",
+                        )
             elif observed.status == "running":
                 row.status = "running"
             elif row.status not in _TERMINAL:
@@ -524,6 +528,15 @@ class FirstmateJobs:
                     ticket,
                     "delivery_uncertain",
                     "Task dispatch has no confirmed running receipt",
+                )
+            if stopped and not complete:
+                ticket.worker_parked_reason = (
+                    ticket.worker_parked_reason or "delivery_usage_unknown"
+                )
+                _reason(
+                    ticket,
+                    "delivery_usage_unknown",
+                    "Usage is incomplete; the reservation remains held",
                 )
             if (
                 row.status == "running"

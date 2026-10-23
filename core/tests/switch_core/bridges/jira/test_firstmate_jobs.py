@@ -32,14 +32,12 @@ from switch_core.bridges.jira.firstmate_jobs import FirstmateJobs
 from switch_core.bridges.jira.packs import FrozenPack, load_pack
 from switch_core.bridges.jira.state import DeliveryWorkflowState
 from switch_core.bridges.jira.worker import JiraWorkerScheduler, set_identity_mapping
-from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
+from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
 from tests.switch_core.bridges.jira.test_activity import ThreadRooms
 from tests.switch_core.bridges.jira.test_admin import (
-    NOW as WAIT_NOW,
-)
-from tests.switch_core.bridges.jira.test_admin import (
     FakeAdminBoard,
-    _waiting_switch_ticket,
+    _seed,
+    _sync_at,
     _worker_config,
 )
 from tests.switch_core.bridges.jira.test_outbox import JiraMock, client_for
@@ -338,6 +336,44 @@ async def test_crash_after_reservation_before_process_is_recoverable(
     assert (lab.copy.location(job) / "starts").read_text() == "1"
 
 
+async def test_cancelled_unknown_usage_blocks_new_attempt(session_factory, lab):
+    job = await _job(session_factory, lab)
+    service = _service(session_factory, lab)
+    await _start(service, job)
+    await service.cancel(job.run.execution_key)
+    data = job.model_dump(mode="json")
+    data["run"].update(attempt=2, execution_key=f"{job.run.ticket_id}/1/reproduce/2")
+    with pytest.raises(ValueError, match="fence"):
+        await _start(service, Job.model_validate_json(json.dumps(data)))
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
+        assert ticket.worker_parked_reason == "delivery_usage_unknown"
+        assert ticket.workflow_state["reserved_tokens"] == 1000
+
+
+async def test_accepted_result_survives_artifact_loss(session_factory, lab):
+    job = await _job(session_factory, lab)
+    service = _service(session_factory, lab)
+    await _start(service, job)
+    _result(lab, job)
+    accepted = await service.get(job.run.execution_key)
+    task = lab.copy.location(job) / "data" / lab.copy.task_id(job)
+    (task / "result.json").unlink()
+    (task / "result.sha256").unlink()
+    recovered = await _service(session_factory, lab).get(job.run.execution_key)
+    assert recovered.status == "done" and recovered.result == accepted.result
+    assert recovered.execution.held_tokens == 0
+    assert recovered.execution.known_tokens == 125
+
+
+async def test_prepared_checkout_requires_frozen_base_commit(session_factory, lab):
+    lab.base_sha = "1" * 40
+    job = await _job(session_factory, lab)
+    with pytest.raises(ValueError, match="frozen commit"):
+        await _start(_service(session_factory, lab), job)
+    assert not (lab.copy.location(job) / "starts").exists()
+
+
 async def test_key_input_and_estimates_are_immutable(session_factory, lab):
     job = await _job(session_factory, lab)
     service = _service(session_factory, lab)
@@ -350,7 +386,7 @@ async def test_key_input_and_estimates_are_immutable(session_factory, lab):
         await service.start(job, reservation=RESERVATION, estimate_seconds=61)
 
 
-@pytest.mark.parametrize("fence", ["cancel", "generation", "park"])
+@pytest.mark.parametrize("fence", ["cancel", "generation", "park", "service"])
 async def test_late_result_is_fenced_but_usage_is_reconciled(
     session_factory, lab, fence
 ):
@@ -364,8 +400,12 @@ async def test_late_result_is_fenced_but_usage_is_reconciled(
     else:
         async with session_factory() as session:
             ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
-            if fence == "generation":
+            if fence in {"generation", "service"}:
                 ticket.agent_generation += 1
+                if fence == "service":
+                    state = dict(ticket.workflow_state)
+                    state.update(service="Feature", step="manual_handoff")
+                    ticket.workflow_state = state
             else:
                 ticket.worker_parked_reason = "human_action"
             await session.commit()
@@ -537,14 +577,23 @@ async def test_scheduler_polls_and_sends_reminders_while_task_runs(
             enabled_projects=("KAN",),
         )
         await session.commit()
-    await _waiting_switch_ticket(
+    now = datetime.now(UTC)
+    waiting_id = await _seed(
         session_factory,
+        status="Waiting for input",
+        reporter_switch_user_id="user-1",
+        wait_channel="switch",
+        room_id="room-1",
+        wait_anchor=now - timedelta(hours=3),
+        wait_fired={},
         card_event_id="card-room-1",
-        jira_read_updated=WAIT_NOW.isoformat(),
+        jira_read_updated=now.isoformat(),
         jira_read_changelog_id="",
     )
+    board = FakeAdminBoard()
+    await _sync_at(session_factory, waiting_id, board, now)
     jira = JiraMock()
-    jira.updated = WAIT_NOW.isoformat()
+    jira.updated = now.isoformat()
     jira.status = "Waiting for input"
     rooms = ThreadRooms()
     await rooms.create_ticket_room(
@@ -559,8 +608,8 @@ async def test_scheduler_polls_and_sends_reminders_while_task_runs(
         config=_worker_config(),
         poll_clients={"acme": client_for(jira)},
         ticket_rooms=rooms,
-        admin_board=FakeAdminBoard(),
-        clock=lambda: WAIT_NOW,
+        admin_board=board,
+        clock=lambda: datetime.now(UTC) + timedelta(seconds=1),
     )
     async with asyncio.timeout(10):
         await scheduler.run_once()
