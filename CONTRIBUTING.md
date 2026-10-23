@@ -94,6 +94,18 @@ The script prints each job's result and duration. Missing tools or failed
 checks return a nonzero exit code. Use Node 24, pnpm 11.5.3, uv, just, and a
 running Docker engine. Console checks install Playwright Chromium.
 Run `bash scripts/local-ci.sh --self-test` to check the path selection.
+Run `bash scripts/local-ci.sh --self-test --reuse` to check same-run reuse.
+
+A retry inside one verified no-mistakes custom gate can reuse a passing job.
+The script asks `no-mistakes axi context --json` for the run, repository, copy, and gate.
+No verified context means every job runs fresh.
+`--fresh` also forces every job to run.
+Use `--fresh` for a final integration check or a pilot check.
+Reuse needs the same commit range, tree, dirty state, and tool versions.
+A failed job is not reused.
+A private receipt does not stop same-user code from changing that receipt.
+The installed gate must provide `axi context`.
+An older gate runs every job fresh.
 
 After `.no-mistakes.yaml` reaches the default branch, new no-mistakes runs
 execute this script after Lint, before Push. Test stays targeted.
