@@ -9,6 +9,7 @@ A Jira action can still race between the final read and the write.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -21,7 +22,10 @@ from sqlalchemy import and_, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.contracts import digest
+from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.observe import _stamp, observe_jira
+from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
@@ -37,6 +41,9 @@ WAIT_REMINDER_COMMAND = "wait_reminder"
 
 
 def _validate_command(command: str, data: Any) -> None:
+    if command == "transition_by_id":
+        ExactTransition.model_validate_json(json.dumps(data))
+        return
     if command == "comment" and isinstance(data, str) and data.strip():
         return
     if command == "transition" and isinstance(data, str) and data.strip():
@@ -49,8 +56,42 @@ def _validate_command(command: str, data: Any) -> None:
     ):
         return
     raise ValueError(
-        "Expected a comment, target status name, or nonempty fields object"
+        "Expected a comment, exact transition, target status name, or nonempty fields object"
     )
+
+
+def check_transition_fence(ticket: JiraWorkerTicket, data: Any) -> ExactTransition:
+    command = ExactTransition.model_validate_json(json.dumps(data))
+    state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
+    if (
+        not isinstance(state, DeliveryWorkflowState)
+        or ticket.worker_parked_reason
+        or ticket.agent_generation != command.generation
+        or state.pack.digest != command.pack_digest
+        or state.step != command.step
+        or (state.gate.id if state.gate else None) != command.gate_id
+        or state.candidate_head != command.candidate_sha
+        or not any(
+            item.jira_id == command.transition_id
+            and item.name == f"{command.source_status_id}->{command.target_status_id}"
+            for item in state.transitions
+        )
+        or (
+            state.gate is not None and command.transition_id == state.gate.transition_id
+        )
+        or command.source_status_id not in {item.jira_id for item in state.statuses}
+        or not any(
+            item.jira_id == command.target_status_id
+            and item.name == command.target_status_name
+            for item in state.statuses
+        )
+        or command.target_status_name.strip().casefold()
+        in {"done", "cancelled", "canceled"}
+    ):
+        raise HumanChange(
+            "Delivery transition fence changed or completion is not authorized"
+        )
+    return command
 
 
 async def enqueue_jira_command(
@@ -73,6 +114,8 @@ async def enqueue_jira_command(
     if not command_key.strip():
         raise ValueError("Jira command key is required")
     _validate_command(command, data)
+    if command == "transition_by_id":
+        check_transition_fence(ticket, data)
     _stamp(based_updated)
     if based_comment_ids is None:
         based_comment_ids = sorted(set(ticket.jira_seen_comment_ids or []))
@@ -365,6 +408,27 @@ class JiraOutboxSender:
         ):
             return
         payload = row.payload or {}
+        if row.status != "sending" and row.command == "transition_by_id":
+            try:
+                check_transition_fence(ticket, payload["data"])
+            except HumanChange as exc:
+                row.status = "cancelled"
+                row.error = str(exc)
+                await session.commit()
+                return
+        if row.status != "sending" and "scope_digest" in payload:
+            state = workflow_state_adapter.validate_json(
+                json.dumps(ticket.workflow_state)
+            )
+            if (
+                not isinstance(state, DeliveryWorkflowState)
+                or state.scope is None
+                or digest(state.scope) != payload["scope_digest"]
+            ):
+                row.status = "cancelled"
+                row.error = "Frozen delivery scope changed"
+                await session.commit()
+                return
         if row.status != "sending" and "intake_generation" in payload:
             if (
                 ticket.worker_parked_reason
@@ -457,15 +521,36 @@ class JiraOutboxSender:
             ticket.jira_worker_account_id = account_id
             path = f"/rest/api/3/issue/{quote(row.issue_key, safe='')}"
             method = "POST"
-            if row.command == "transition":
+            if row.command in {"transition", "transition_by_id"}:
                 available = (await client.request("GET", path + "/transitions")).json()[
                     "transitions"
                 ]
-                matches = [
-                    item["id"]
-                    for item in available
-                    if item.get("to", {}).get("name") == payload["data"]
-                ]
+                if row.command == "transition_by_id":
+                    exact = check_transition_fence(ticket, payload["data"])
+                    matches = [
+                        item["id"]
+                        for item in available
+                        if item.get("id") == exact.transition_id
+                        and item.get("to", {}).get("id") == exact.target_status_id
+                        and item.get("to", {}).get("statusCategory", {}).get("key")
+                        != "done"
+                    ]
+                else:
+                    state = workflow_state_adapter.validate_json(
+                        json.dumps(ticket.workflow_state)
+                    )
+                    if (
+                        isinstance(state, DeliveryWorkflowState)
+                        and state.scope is not None
+                    ):
+                        raise ValueError(
+                            "A frozen delivery scope requires transition_by_id"
+                        )
+                    matches = [
+                        item["id"]
+                        for item in available
+                        if item.get("to", {}).get("name") == payload["data"]
+                    ]
                 if len(matches) != 1:
                     raise ValueError(
                         f"Expected one available transition to {payload['data']}"
@@ -494,6 +579,14 @@ class JiraOutboxSender:
             check_jira_version(version, payload, account_id)
             if not await _still_claimed(session, row):
                 return
+            if row.command == "transition_by_id":
+                await session.refresh(ticket, with_for_update=True)
+                exact = check_transition_fence(ticket, payload["data"])
+                if (
+                    version["fields"].get("status", {}).get("id")
+                    != exact.source_status_id
+                ):
+                    raise HumanChange("Exact transition source status changed")
             row.status = "sending"
             await session.commit()
             sending = True
@@ -551,7 +644,33 @@ class JiraOutboxSender:
         else:
             row.status = "done"
             row.error = None
-            if row.command == "transition" and "intake_generation" in payload:
+            if row.command == "transition_by_id":
+                ticket.status = payload["data"]["target_status_name"]
+                state = workflow_state_adapter.validate_json(
+                    json.dumps(ticket.workflow_state)
+                )
+                predecessor = (
+                    await session.get(JiraWorkerOutbox, payload["after_command"])
+                    if payload.get("after_command")
+                    else None
+                )
+                if (
+                    isinstance(state, DeliveryWorkflowState)
+                    and state.scope is not None
+                    and state.gate is not None
+                    and payload["data"]["target_status_id"]
+                    == state.scope.approval_route.source_status_id
+                    and predecessor is not None
+                    and predecessor.status == "done"
+                    and predecessor.command == "comment"
+                    and (predecessor.payload or {}).get("scope_digest")
+                    == state.gate.contract_digest
+                ):
+                    ticket.workflow_state = {
+                        **state.model_dump(mode="json"),
+                        "gate_ready": True,
+                    }
+            elif row.command == "transition" and "intake_generation" in payload:
                 ticket.status = payload["data"]
         await session.commit()
 
@@ -693,6 +812,11 @@ class JiraOutboxSender:
         self, session: AsyncSession, ticket: JiraWorkerTicket, row: JiraWorkerOutbox
     ) -> None:
         payload = row.payload or {}
+        state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
+        if row.command == "transition_by_id" or (
+            isinstance(state, DeliveryWorkflowState) and state.scope is not None
+        ):
+            return
         # These are ordinary durable commands. They use the original baseline,
         # so a human action during retries also prevents the BLOCKED writes.
         for command, data in (

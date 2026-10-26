@@ -19,9 +19,12 @@ from switch_core.bridges.jira.admin import (
     INTAKE_REASON,
     set_admin_card_reason,
 )
+from switch_core.bridges.jira.contracts import digest
+from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.outbox import (
     INTAKE_QUESTION_COMMAND,
     TOKEN_LIMIT,
+    HumanChange,
     enqueue_jira_command,
     park_ticket,
 )
@@ -263,149 +266,174 @@ class IntakeOrchestrator:
             or not 0 <= decision.tokens_used <= turn.token_budget
         ):
             raise ValueError("Intake model exceeded the ticket token budget")
-        async with self._factory() as session:
-            ticket = await session.get(
-                JiraWorkerTicket, turn.ticket_id, with_for_update=True
-            )
-            assert ticket is not None
-            if (
-                ticket.project_key
-                not in self._config.jira_worker_enabled_projects.get(
-                    ticket.instance, []
+        try:
+            async with self._factory() as session:
+                ticket = await session.get(
+                    JiraWorkerTicket, turn.ticket_id, with_for_update=True
                 )
-                or ticket.worker_parked_reason
-                or ticket.agent_generation != generation
-                or ticket.intake_state != original_state
-            ):
-                return TurnResult(decision.tokens_used, None)
-            if failure is not None:
-                attempts = state.get("model_failures", 0) + 1
-                ticket.intake_state = {
-                    **state,
-                    "history": history,
-                    "pending_replies": replies,
-                    "model_failures": attempts,
-                }
-                logger.warning(
-                    "Jira intake model failed for %s; attempt %d of 3: %s",
-                    ticket.issue_key,
-                    attempts,
-                    failure,
-                )
-                wake_at = None
-                if attempts >= 3:
-                    park_ticket(ticket, "Intake model failed 3 consecutive attempts")
-                else:
-                    now = self._clock()
-                    wake_at = now + _model_retry_delay(
-                        failure.retry_after, attempts, now
+                assert ticket is not None
+                if (
+                    ticket.project_key
+                    not in self._config.jira_worker_enabled_projects.get(
+                        ticket.instance, []
                     )
-                await session.commit()
-                return TurnResult(decision.tokens_used, wake_at)
-            if decision.action == "budget":
-                park_ticket(ticket, TOKEN_LIMIT)
-                await session.commit()
-                return TurnResult(decision.tokens_used, None)
-            count = state.get("questions", 0)
-            cycle = state.get("cycle", 0)
-            history.extend({"reply": reply} for reply in replies)
-            reason = None
-            if decision.action == "question":
-                count = min(count + 1, QUESTION_LIMIT + 1)
-                if count > QUESTION_LIMIT:
-                    phase = "limit"
-                    reason = INTAKE_LIMIT_DETAIL
-                else:
-                    phase = "question"
-                    history.append({"question": decision.content})
-                    predecessor = None
-                    if (
-                        ticket.status
-                        != self._config.jira_worker_statuses.waiting_for_input
-                    ):
-                        predecessor = await self._queue(
+                    or ticket.worker_parked_reason
+                    or ticket.agent_generation != generation
+                    or ticket.intake_state != original_state
+                ):
+                    return TurnResult(decision.tokens_used, None)
+                if failure is not None:
+                    attempts = state.get("model_failures", 0) + 1
+                    ticket.intake_state = {
+                        **state,
+                        "history": history,
+                        "pending_replies": replies,
+                        "model_failures": attempts,
+                    }
+                    logger.warning(
+                        "Jira intake model failed for %s; attempt %d of 3: %s",
+                        ticket.issue_key,
+                        attempts,
+                        failure,
+                    )
+                    wake_at = None
+                    if attempts >= 3:
+                        park_ticket(
+                            ticket, "Intake model failed 3 consecutive attempts"
+                        )
+                    else:
+                        now = self._clock()
+                        wake_at = now + _model_retry_delay(
+                            failure.retry_after, attempts, now
+                        )
+                    await session.commit()
+                    return TurnResult(decision.tokens_used, wake_at)
+                if decision.action == "budget":
+                    park_ticket(ticket, TOKEN_LIMIT)
+                    await session.commit()
+                    return TurnResult(decision.tokens_used, None)
+                count = state.get("questions", 0)
+                cycle = state.get("cycle", 0)
+                history.extend({"reply": reply} for reply in replies)
+                reason = None
+                if decision.action == "question":
+                    count = min(count + 1, QUESTION_LIMIT + 1)
+                    if count > QUESTION_LIMIT:
+                        phase = "limit"
+                        reason = INTAKE_LIMIT_DETAIL
+                    else:
+                        phase = "question"
+                        history.append({"question": decision.content})
+                        predecessor = None
+                        if (
+                            ticket.status
+                            != self._config.jira_worker_statuses.waiting_for_input
+                        ):
+                            predecessor = await self._queue(
+                                session,
+                                ticket,
+                                f"{cycle}:input:{count}",
+                                "jira",
+                                "transition",
+                                self._config.jira_worker_statuses.waiting_for_input,
+                                None,
+                            )
+                        await self._queue(
                             session,
                             ticket,
-                            f"{cycle}:input:{count}",
+                            f"{cycle}:question:{count}",
+                            ticket.wait_channel,
+                            INTAKE_QUESTION_COMMAND
+                            if ticket.wait_channel == "switch"
+                            else "comment",
+                            decision.content,
+                            predecessor,
+                        )
+                elif decision.action == "complete":
+                    target = delivery_state(ticket)
+                    phase = "approval"
+                    content = decision.content
+                    if target is not None:
+                        if target.service != "Bug":
+                            phase = "manual_handoff"
+                            content += "\nManual handling required. No development job will start."
+                            data = target.model_dump(mode="json")
+                            data["step"] = "manual_handoff"
+                            ticket.workflow_state = (
+                                DeliveryWorkflowState.model_validate_json(
+                                    json.dumps(data)
+                                ).model_dump(mode="json")
+                            )
+                        elif (
+                            target.repository is None
+                            or target.repository.outcome != "verified"
+                        ):
+                            phase = "triage"
+                            reason = "Repository triage required before scope approval or checkout"
+                            content += "\n" + reason
+                        else:
+                            content += (
+                                f"\nVerified repository: {target.repository.canonical_url}"
+                                f"\nBase branch: {target.repository.base_branch}"
+                                f"\nBase commit: {target.repository.base_sha}"
+                            )
+                            if target.scope is not None:
+                                scope = target.scope
+                                content += (
+                                    f"\nApproved branch: {scope.branch}"
+                                    f"\nAllowed paths: {json.dumps(scope.allowed_paths)}"
+                                    f"\nForbidden paths: {json.dumps(scope.forbidden_paths)}"
+                                    f"\nAcceptance: {json.dumps(scope.job.acceptance)}"
+                                    f"\nApproved checks: {json.dumps([check.model_dump(mode='json') for check in scope.checks])}"
+                                    f"\nScope digest: {digest(scope)}"
+                                )
+                    if not resuming_scope:
+                        history.append({"complete": decision.content})
+                    summary = await self._queue(
+                        session,
+                        ticket,
+                        f"{cycle}:verified-summary"
+                        if resuming_scope
+                        else f"{cycle}:summary",
+                        "jira",
+                        "comment",
+                        f"Intake summary (not approval):\n{content}",
+                        None,
+                    )
+                    if phase == "approval":
+                        await self._queue(
+                            session,
+                            ticket,
+                            f"{cycle}:approval",
                             "jira",
                             "transition",
-                            self._config.jira_worker_statuses.waiting_for_input,
-                            None,
+                            self._config.jira_worker_statuses.waiting_for_approval,
+                            summary,
                         )
-                    await self._queue(
-                        session,
-                        ticket,
-                        f"{cycle}:question:{count}",
-                        ticket.wait_channel,
-                        INTAKE_QUESTION_COMMAND
-                        if ticket.wait_channel == "switch"
-                        else "comment",
-                        decision.content,
-                        predecessor,
-                    )
-            elif decision.action == "complete":
-                target = delivery_state(ticket)
-                phase = "approval"
-                content = decision.content
-                if target is not None:
-                    if target.service != "Bug":
-                        phase = "manual_handoff"
-                        content += (
-                            "\nManual handling required. No development job will start."
-                        )
-                        data = target.model_dump(mode="json")
-                        data["step"] = "manual_handoff"
-                        ticket.workflow_state = (
-                            DeliveryWorkflowState.model_validate_json(
-                                json.dumps(data)
-                            ).model_dump(mode="json")
-                        )
-                    elif (
-                        target.repository is None
-                        or target.repository.outcome != "verified"
-                    ):
-                        phase = "triage"
-                        reason = "Repository triage required before scope approval or checkout"
-                        content += "\n" + reason
-                    else:
-                        content += (
-                            f"\nVerified repository: {target.repository.canonical_url}"
-                            f"\nBase branch: {target.repository.base_branch}"
-                            f"\nBase commit: {target.repository.base_sha}"
-                        )
-                if not resuming_scope:
-                    history.append({"complete": decision.content})
-                summary = await self._queue(
-                    session,
-                    ticket,
-                    f"{cycle}:verified-summary"
-                    if resuming_scope
-                    else f"{cycle}:summary",
-                    "jira",
-                    "comment",
-                    f"Intake summary (not approval):\n{content}",
-                    None,
+                else:
+                    raise ValueError("Intake model returned an invalid action")
+                ticket.intake_state = {
+                    "phase": phase,
+                    "questions": count,
+                    "cycle": cycle,
+                    "history": history,
+                }
+                instance, issue_key = ticket.instance, ticket.issue_key
+                await session.commit()
+        except HumanChange as exc:
+            async with self._factory() as session:
+                ticket = await session.get(
+                    JiraWorkerTicket, turn.ticket_id, with_for_update=True
                 )
-                if phase == "approval":
-                    await self._queue(
-                        session,
-                        ticket,
-                        f"{cycle}:approval",
-                        "jira",
-                        "transition",
-                        self._config.jira_worker_statuses.waiting_for_approval,
-                        summary,
-                    )
-            else:
-                raise ValueError("Intake model returned an invalid action")
-            ticket.intake_state = {
-                "phase": phase,
-                "questions": count,
-                "cycle": cycle,
-                "history": history,
-            }
-            instance, issue_key = ticket.instance, ticket.issue_key
-            await session.commit()
+                assert ticket is not None
+                if (
+                    ticket.agent_generation == generation
+                    and ticket.intake_state == original_state
+                    and not ticket.worker_parked_reason
+                ):
+                    park_ticket(ticket, str(exc))
+                await session.commit()
+            return TurnResult(decision.tokens_used, None)
         try:
             await set_admin_card_reason(
                 self._factory,
@@ -443,13 +471,50 @@ class IntakeOrchestrator:
                 ticket.jira_read_updated is not None
                 and ticket.jira_read_changelog_id is not None
             )
+            target = delivery_state(ticket)
+            data: Any = body
+            if (
+                command == "transition"
+                and target is not None
+                and target.scope is not None
+            ):
+                try:
+                    source = next(
+                        item.jira_id
+                        for item in target.statuses
+                        if item.name == ticket.status
+                    )
+                    destination = next(
+                        item.jira_id for item in target.statuses if item.name == body
+                    )
+                    transition = next(
+                        item.jira_id
+                        for item in target.transitions
+                        if item.name == f"{source}->{destination}"
+                    )
+                except StopIteration as exc:
+                    raise HumanChange(
+                        "Delivery transition fence changed: frozen workflow mapping is missing"
+                    ) from exc
+                data = ExactTransition(
+                    generation=ticket.agent_generation,
+                    pack_digest=target.pack.digest,
+                    step=target.step,
+                    gate_id=target.gate.id if target.gate else None,
+                    candidate_sha=target.candidate_head,
+                    transition_id=transition,
+                    source_status_id=source,
+                    target_status_id=destination,
+                    target_status_name=body,
+                ).model_dump(mode="json")
+                command = "transition_by_id"
             row_id = await enqueue_jira_command(
                 session,
                 config=self._config,
                 ticket=ticket,
                 command_key=command_key,
                 command=command,
-                data=body,
+                data=data,
                 based_updated=ticket.jira_read_updated,
                 based_changelog_id=ticket.jira_read_changelog_id,
             )
@@ -475,8 +540,14 @@ class IntakeOrchestrator:
             )
             session.add(row)
             await session.flush()
+        target = delivery_state(ticket)
         row.payload = {
             **(row.payload or {}),
+            **(
+                {"scope_digest": digest(target.scope)}
+                if target is not None and target.scope is not None
+                else {}
+            ),
             "intake_generation": ticket.agent_generation,
             "after_command": predecessor,
         }
