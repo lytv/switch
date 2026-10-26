@@ -97,7 +97,9 @@ preserves its original target. Target edits do not clear a park automatically.
 Feature, Docs, and Other finish with a summary and an explicit manual handoff.
 They never queue code work or an approval transition.
 Step 2 does not release tickets parked in triage, scope-ready, or manual-handoff
-phases. Those release paths belong to step 7, phase-aware admin resume.
+phases. Approval-phase tickets whose Service or repository link changes must
+also stay set aside. All these release paths belong to step 7, phase-aware admin
+resume.
 
 ## Firstmate task lifecycle
 
