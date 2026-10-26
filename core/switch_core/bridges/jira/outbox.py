@@ -60,6 +60,36 @@ def _validate_command(command: str, data: Any) -> None:
     )
 
 
+def delivery_complete(state: DeliveryWorkflowState) -> bool:
+    return (
+        state.step == "close"
+        and state.scope is not None
+        and state.scope.verification is not None
+        and state.candidate_head is not None
+        and state.accepted_head
+        == state.review_head
+        == state.qa_head
+        == state.candidate_head
+        and state.merge_receipt is not None
+        and state.merge_receipt.outcome == "merged"
+        and state.merge_receipt.human
+        and state.merge_receipt.actor_id is not None
+        and state.merge_receipt.candidate_sha == state.candidate_head
+        and state.merge_receipt.repository_url
+        == state.scope.job.repository.canonical_url
+        and state.merge_receipt.merged_sha == state.merge_sha
+        and state.smoke is not None
+        and state.smoke.verdict == "PASS"
+        and state.smoke.head == state.merge_sha
+        and not state.unknown_spend
+        and any(
+            approval.gate.kind == "acceptance"
+            and approval.gate.candidate_sha == state.candidate_head
+            for approval in state.approvals
+        )
+    )
+
+
 def check_transition_fence(ticket: JiraWorkerTicket, data: Any) -> ExactTransition:
     command = ExactTransition.model_validate_json(json.dumps(data))
     state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
@@ -85,8 +115,18 @@ def check_transition_fence(ticket: JiraWorkerTicket, data: Any) -> ExactTransiti
             and item.name == command.target_status_name
             for item in state.statuses
         )
-        or command.target_status_name.strip().casefold()
-        in {"done", "cancelled", "canceled"}
+        or (
+            command.target_status_name.strip().casefold()
+            in {"done", "cancelled", "canceled"}
+            and not (
+                command.target_status_name.strip().casefold() == "done"
+                and delivery_complete(state)
+                and state.scope is not None
+                and state.scope.verification is not None
+                and command.transition_id
+                == state.scope.verification.complete_transition_id
+            )
+        )
     ):
         raise HumanChange(
             "Delivery transition fence changed or completion is not authorized"
@@ -286,6 +326,7 @@ class JiraOutboxSender:
         clock: ClockFn,
         rooms: TicketRooms | None = None,
         before_wait_send: Callable[[str], Awaitable[bool]] | None = None,
+        authorize_delivery: Callable[[JiraWorkerTicket], Awaitable[bool]] | None = None,
     ) -> None:
         self._factory = session_factory
         self._engine = cast(AsyncEngine, session_factory.kw["bind"])
@@ -295,6 +336,7 @@ class JiraOutboxSender:
         self._accounts: dict[str, str] = {}
         self._rooms = rooms
         self._before_wait_send = before_wait_send
+        self._authorize_delivery = authorize_delivery
 
     async def run_once(self) -> None:
         scopes = [
@@ -532,8 +574,11 @@ class JiraOutboxSender:
                         for item in available
                         if item.get("id") == exact.transition_id
                         and item.get("to", {}).get("id") == exact.target_status_id
-                        and item.get("to", {}).get("statusCategory", {}).get("key")
-                        != "done"
+                        and (
+                            item.get("to", {}).get("statusCategory", {}).get("key")
+                            != "done"
+                            or exact.step == "close"
+                        )
                     ]
                 else:
                     state = workflow_state_adapter.validate_json(
@@ -583,10 +628,34 @@ class JiraOutboxSender:
                 await session.refresh(ticket, with_for_update=True)
                 exact = check_transition_fence(ticket, payload["data"])
                 if (
+                    exact.step in {"accept", "close"}
+                    and payload.get("delivery_step") != exact.step
+                ):
+                    raise HumanChange(
+                        "Candidate commands require fresh forge authorization"
+                    )
+                if (
                     version["fields"].get("status", {}).get("id")
                     != exact.source_status_id
                 ):
                     raise HumanChange("Exact transition source status changed")
+            if "delivery_step" in payload:
+                await session.refresh(ticket, with_for_update=True)
+                state = workflow_state_adapter.validate_json(
+                    json.dumps(ticket.workflow_state)
+                )
+                if (
+                    not isinstance(state, DeliveryWorkflowState)
+                    or state.step != payload["delivery_step"]
+                    or state.candidate_head != payload["candidate_sha"]
+                    or ticket.agent_generation != payload["intake_generation"]
+                    or ticket.worker_parked_reason
+                    or self._authorize_delivery is None
+                    or not await self._authorize_delivery(ticket)
+                ):
+                    raise HumanChange(
+                        "Delivery candidate authorization changed or is unavailable"
+                    )
             row.status = "sending"
             await session.commit()
             sending = True
@@ -645,7 +714,8 @@ class JiraOutboxSender:
             row.status = "done"
             row.error = None
             if row.command == "transition_by_id":
-                ticket.status = payload["data"]["target_status_name"]
+                if payload["data"]["step"] != "close":
+                    ticket.status = payload["data"]["target_status_name"]
                 state = workflow_state_adapter.validate_json(
                     json.dumps(ticket.workflow_state)
                 )
@@ -663,12 +733,24 @@ class JiraOutboxSender:
                     and predecessor is not None
                     and predecessor.status == "done"
                     and predecessor.command == "comment"
-                    and (predecessor.payload or {}).get("scope_digest")
+                    and (predecessor.payload or {}).get(
+                        "gate_digest"
+                        if state.gate.kind == "acceptance"
+                        else "scope_digest"
+                    )
                     == state.gate.contract_digest
                 ):
                     ticket.workflow_state = {
                         **state.model_dump(mode="json"),
                         "gate_ready": True,
+                    }
+                if (
+                    isinstance(state, DeliveryWorkflowState)
+                    and payload["data"]["step"] == "close"
+                ):
+                    ticket.workflow_state = {
+                        **state.model_dump(mode="json"),
+                        "outcome": "delivered",
                     }
             elif row.command == "transition" and "intake_generation" in payload:
                 ticket.status = payload["data"]

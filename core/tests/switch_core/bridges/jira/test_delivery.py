@@ -24,7 +24,12 @@ from switch_core.bridges.jira.contracts import (
     Usage,
     digest,
 )
-from switch_core.bridges.jira.delivery import DeliverySupervisor, fix_job, stage_scope
+from switch_core.bridges.jira.delivery import (
+    DeliverySupervisor,
+    fix_job,
+    role_job,
+    stage_scope,
+)
 from switch_core.bridges.jira.delivery_contracts import (
     ApprovalRoute,
     ApprovedCheck,
@@ -35,9 +40,15 @@ from switch_core.bridges.jira.delivery_contracts import (
     PreparedExecutionEnvelope,
     RoleProfile,
     ScopeContract,
+    VerificationContract,
+    VerificationRole,
     validate_candidate,
 )
-from switch_core.bridges.jira.firstmate_copy import SecretGuard, TaskObservation
+from switch_core.bridges.jira.firstmate_copy import (
+    FirstmateCopy,
+    SecretGuard,
+    TaskObservation,
+)
 from switch_core.bridges.jira.firstmate_jobs import FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
 from switch_core.bridges.jira.intake import IntakeOrchestrator
@@ -415,6 +426,7 @@ def services(sessions, jira, *, enabled=True, process=None, forge=None, rooms=No
         activity=activity,
         jobs=jobs,
         publisher=publisher,
+        clock=lambda: NOW,
     )
     return activity, supervisor, process, forge, publisher
 
@@ -715,6 +727,19 @@ async def test_disabled_and_unprovisioned_execution_never_starts(session_factory
     assert process.starts == []
     with pytest.raises(ValueError, match="explicitly provisioned"):
         JiraWorkerScheduler(session_factory=session_factory, config=config())
+
+    def disabled_factory(activity):
+        raise AssertionError("Disabled delivery must not construct a supervisor")
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config(enabled=False),
+        poll_clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        delivery_factory=disabled_factory,
+    )
+    await scheduler.run_once()
+    assert process.starts == [] and jira.writes == []
 
 
 @pytest.mark.parametrize("operation", ["push", "create"])
@@ -1145,7 +1170,7 @@ async def test_github_transport_scopes_git_and_api_without_worker_credentials(
                 "sha": HEAD,
                 "repo": {"full_name": "team/project"},
             },
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "repo": {"full_name": "team/project"}},
             "draft": True,
             "state": "open",
         }
@@ -1211,6 +1236,226 @@ async def test_github_transport_scopes_git_and_api_without_worker_credentials(
     )
     assert auth == "Bearer PLACEHOLDER_FORGE_CREDENTIAL"
     assert len(git_calls) == 1
+
+
+async def test_native_verification_uses_only_its_pinned_profile_and_an_isolated_head(
+    session_factory, lifecycle_lab, tmp_path, monkeypatch
+):
+    lab = lifecycle_lab
+    pack = FrozenPack(snapshot=lab.pack, digest=digest(lab.pack))
+    scope = await seed(session_factory, base_sha=lab.base_sha, pack=pack)
+    roles = {}
+    for step in ("review", "qa", "smoke"):
+        content = f"Switch {step} profile. Read-only verification."
+        roles[step] = VerificationRole(
+            profile=RoleProfile(
+                commit="d" * 40,
+                content=content,
+                sha256=hashlib.sha256(content.encode()).hexdigest(),
+            ),
+            reservation=scope.fix_reservation,
+            estimate_seconds=60,
+        )
+    scope = scope.model_copy(
+        update={
+            "checks": tuple(
+                check.model_copy(update={"kind": "behavior"}) for check in scope.checks
+            ),
+            "verification": VerificationContract(
+                **roles,
+                behavior_check_ids=("regression",),
+                smoke_check_ids=("regression",),
+                complete_transition_id="complete",
+            ),
+        }
+    )
+    candidate = handoff(fix_job(scope)).model_copy(update={"head": lab.base_sha})
+    projects = {}
+    for step in ("review", "qa"):
+        project = tmp_path / step
+        subprocess.run(
+            ["git", "clone", "--no-local", str(lab.copy._project), str(project)],
+            check=True,
+            capture_output=True,
+        )
+        git(project, "checkout", "--detach", lab.base_sha)
+        git(project, "remote", "set-url", "origin", URL)
+        projects[step] = project
+    base_project = tmp_path / "qa-base"
+    subprocess.run(
+        ["git", "clone", "--no-local", str(lab.copy._project), str(base_project)],
+        check=True,
+        capture_output=True,
+    )
+    git(base_project, "checkout", "--detach", lab.base_sha)
+    git(base_project, "remote", "set-url", "origin", URL)
+    copy = FirstmateCopy(
+        checkout=lab.checkout,
+        homes=lab.homes,
+        project=lab.copy._project,
+        executable_path=lab.copy._path,
+        secrets=SecretGuard(forbidden_values=("PLACEHOLDER_FORGE_CREDENTIAL",)),
+        projects=lambda job: projects[job.run.step],
+        base_project=base_project,
+    )
+    monkeypatch.setenv("GH_TOKEN", "PLACEHOLDER_FORGE_CREDENTIAL")
+    homes = []
+    for step in ("review", "qa"):
+        job = role_job(scope, step, 1)
+        envelope = ExecutionEnvelope(
+            scope=scope,
+            reproduction=handoff(scope.job, base=lab.base_sha),
+            candidate=candidate,
+            target_sha=lab.base_sha,
+        )
+        if step == "qa":
+            missing_base = FirstmateCopy(
+                checkout=lab.checkout,
+                homes=lab.homes,
+                project=lab.copy._project,
+                executable_path=lab.copy._path,
+                secrets=SecretGuard(forbidden_values=()),
+                projects=lambda run: projects[run.run.step],
+            )
+            with pytest.raises(ValueError, match="separate read-only checkout"):
+                await missing_base.start(
+                    job, lab.pack, scope.fix_reservation, 60, envelope=envelope
+                )
+            assert (await missing_base.get(job)).status == "absent"
+        await copy.start(job, lab.pack, scope.fix_reservation, 60, envelope=envelope)
+        home = copy.location(job)
+        homes.append(home)
+        task = home / "data" / copy.task_id(job)
+        brief = (task / "brief.md").read_text()
+        assert roles[step].profile.content in brief and PROFILE not in brief
+        prepared = PreparedExecutionEnvelope.model_validate_json(
+            (task / "envelope.json").read_bytes()
+        )
+        assert prepared.base_worktree_path == (
+            str(base_project) if step == "qa" else None
+        )
+        assert "GH_TOKEN" not in json.loads((home / "environment.json").read_text())
+        result = Result(
+            run=job.run,
+            input_digest=digest(job),
+            status="completed",
+            question=None,
+            usage=Usage(
+                measurement="complete",
+                provider=lab.pack.provider,
+                model=lab.pack.model,
+                input_tokens=1,
+                output_tokens=1,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+                estimated_usd=Decimal("0.1"),
+                price_source="fixture-prices",
+                billing="estimate_not_subscription_invoice",
+            ),
+        )
+        evidence = handoff(job).model_copy(
+            update={"head": lab.base_sha, "changed_paths": ()}
+        )
+        for name, value in (("result", result), ("handoff", evidence)):
+            raw = value.model_dump_json().encode()
+            (task / f"{name}.json").write_bytes(raw)
+            (task / f"{name}.sha256").write_text(hashlib.sha256(raw).hexdigest())
+        await copy.cancel(job)
+        assert (await copy.get(job)).result == result
+        (projects[step] / "fixture.txt").write_text("unexpected edit")
+        with pytest.raises(ValueError, match="modified its checkout"):
+            await copy.get(job)
+        if step == "qa":
+            git(projects[step], "restore", "fixture.txt")
+            (base_project / "fixture.txt").write_text("unexpected base edit")
+            with pytest.raises(ValueError, match="immutable approved source"):
+                await copy.get(job)
+    assert homes[0] != homes[1] != lab.copy.location(fix_job(scope))
+    assert (lab.copy._project / "fixture.txt").read_text() == "fixture\n"
+    assert git(lab.copy._project, "rev-parse", "HEAD") == lab.base_sha
+
+
+async def test_frozen_step5_scope_keeps_its_original_serialized_shape(session_factory):
+    scope = await seed(session_factory)
+    data = scope.model_dump(mode="json")
+    assert "verification" not in data
+    assert all("kind" not in check for check in data["checks"])
+    assert ScopeContract.model_validate_json(json.dumps(data)) == scope
+    assert hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() == digest(scope)
+
+
+async def test_github_readiness_and_merge_receipt_never_issue_a_merge(
+    session_factory, tmp_path
+):
+    scope = await seed(session_factory)
+    calls = []
+    body = {
+        "html_url": URL + "/pull/1",
+        "node_id": "fixture-request",
+        "head": {
+            "ref": scope.branch,
+            "sha": HEAD,
+            "repo": {"full_name": "team/project"},
+        },
+        "base": {"ref": "main", "repo": {"full_name": "team/project"}},
+        "draft": True,
+        "state": "open",
+        "merged": False,
+    }
+
+    async def handle(request):
+        calls.append((request.method, request.url.path))
+        if "/git/ref/heads/" in request.url.path:
+            return httpx.Response(200, json={"object": {"sha": HEAD}})
+        if request.url.path == "/graphql":
+            assert request.method == "POST"
+            payload = json.loads(request.content)
+            assert "markPullRequestReadyForReview" in payload["query"]
+            assert "mergePullRequest" not in payload["query"]
+            body["draft"] = False
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "markPullRequestReadyForReview": {
+                            "pullRequest": {"isDraft": False}
+                        }
+                    }
+                },
+            )
+        assert request.method == "GET" and request.url.path.endswith("/pulls/1")
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(
+        base_url="https://api.example.invalid", transport=httpx.MockTransport(handle)
+    ) as client:
+        forge = GitHubDraftForge(
+            scope=scope,
+            objects=GitCandidateObjects(tmp_path / "objects.git"),
+            client=client,
+            authorization="Bearer PLACEHOLDER_FORGE_CREDENTIAL",
+        )
+        await forge.ready_request(URL, body["html_url"], HEAD)
+        assert (await forge.merge_receipt(URL, body["html_url"])).outcome == "open"
+        body.update(
+            state="closed",
+            merged=True,
+            merged_at="2026-10-01T00:00:00Z",
+            merge_commit_sha="f" * 40,
+            merged_by={"id": 123, "type": "User"},
+        )
+        receipt = await forge.merge_receipt(URL, body["html_url"])
+        assert (
+            receipt.outcome == "merged"
+            and receipt.human
+            and receipt.merged_sha == "f" * 40
+        )
+        with pytest.raises(ValueError, match="approved repository"):
+            await forge.merge_receipt(URL, "https://other.invalid/team/project/pull/1")
+    assert [method for method, _ in calls].count("POST") == 1
+    assert all(not path.endswith("/merge") for _, path in calls)
 
 
 async def test_github_transport_refuses_credential_redirects(session_factory, tmp_path):

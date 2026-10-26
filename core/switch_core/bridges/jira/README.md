@@ -172,18 +172,87 @@ The adapter disables credential helpers, hooks, and HTTP redirects. Other forges
 need a transport for the same contract, not repository pre-registration.
 
 Publication creates one draft on `switch/<ticket-id>/<generation>`. It never
-forces a push, merges, deploys, deletes branches, or marks the candidate ready.
-A normal git push and a Jira write still have read/write races. Narrow repository
-permissions and a reserved generation-branch namespace remain required. After
-publication, supervision stops at the draft candidate. Review, QA, acceptance,
-merge observation, smoke, close, question relay, and admin resume belong to later
-steps. Legacy version 1 still archives on Done.
+forces a push, merges, deploys, or deletes branches. A normal git push and a Jira
+write still have read/write races. Narrow repository permissions and a reserved
+generation-branch namespace remain required. Legacy version 1 still archives on
+Done. Question relay and phase-aware admin resume remain separate work.
+
+## Independent verification and completion
+
+Trusted admission can include a `VerificationContract` in the scope before scope
+approval. It contains separately rendered, pinned Switch review, QA, and smoke
+profiles, their usage reservations and duration estimates, approved behavioral
+check IDs, approved smoke check IDs, and the exact Complete delivery transition.
+Render these profiles with the skills library's existing dependency validation.
+Do not substitute a default host profile or the dev profile. Intake displays
+these checks and pins before scope approval. Existing scopes without this
+contract retain their original canonical digest and stop at the draft. The
+supervisor never adds verification authority to an already approved scope.
+
+After draft publication, review and QA run sequentially through the existing
+Firstmate lifecycle. Each execution has a separate key, home, and context. Both
+inspect the same candidate SHA. Handoffs bind the job, generation, repository,
+SHA, approved checks, and complete usage. QA must repeat the original approved
+behavioral failure at the base and check acceptance on the candidate. Unit-test
+output alone cannot replace behavioral evidence. Failed verification permits
+at most two rework cycles and three attempts per role, within the existing
+budgets. Rework carries evidence and findings, not a previous conversation.
+Unsupported environments park instead of authorizing more access.
+
+For review, QA, and smoke, `FirstmateCopy` requires an operator-supplied `projects`
+resolver. It must return a prepared, isolated checkout with the approved origin
+and a detached target SHA. It must not return the dev checkout. QA also requires
+an explicit `base_project`: a separate detached, clean checkout at the approved
+base SHA and origin. Both checkout paths must be absolute, canonical, and
+symlink-free, including their parent directories. The prepared envelope exposes
+the base checkout as `base_worktree_path`, so QA can repeat the original failure
+without switching the candidate HEAD.
+The adapter checks both views before launch and after exit. The operator
+must mount these checkouts read-only and deny publisher credentials and push
+access. These filesystem and network restrictions remain operational
+prerequisites, not a prompt-based sandbox. The adapter checks HEAD and clean
+state before launch and after exit. It rejects edits rather than certifying
+changed code. No checkout or sandbox provisioning occurs here.
+
+Bounded dev rework can update only the same open draft through the trusted
+publisher. The sealed object store proves ancestry; the push remains non-forced.
+A changed remote branch prevents the update. An uncertain update or readiness
+write requires remote reconciliation. An inconclusive result never creates
+another request or repeats an uncertain readiness write.
+
+Only passing review and QA authorize the publisher to mark the tested draft
+ready. The supervisor then queues a SHA-bound Jira summary before its dependent
+Request approval transition. That separate candidate gate needs a clean,
+authorized human Jira edge. Chat never accepts a candidate. No live role remains
+during this wait. Acceptance does not merge code. A human must merge through
+the forge. The observer checks the exact repository, request, candidate, base,
+merged SHA, and human merge actor. Missing, changed, unknown, and closed-unmerged
+receipts never certify delivery.
+
+Smoke runs in a fresh isolated context at the actual merged SHA, using only
+checks from the approved contract. Failed or unknown smoke prevents closure.
+No production URL or deployment environment is assumed. After smoke passes, the
+supervisor queues the close summary before the exact Complete delivery command.
+`JiraWorkerScheduler` connects its explicitly configured delivery supervisor's
+publisher authorizer to `JiraOutboxSender.authorize_delivery`. Standalone senders
+must supply `DraftPublisher.authorize_command`; without this trusted send-time
+forge check, candidate acceptance and completion commands fail closed. Every
+such command also checks generation, phase, candidate, Jira history, and its
+predecessor.
+
+The final Jira observation triggers the existing card, room, and channel sync
+and archival mechanisms. Delivery records `delivered`; a human close or cancel
+records `closed_by_human`. A head change invalidates review, QA, and acceptance.
+Late rejected results retain their usage accounting. Done means accepted,
+human-merged, and smoke-checked, not deployed. All execution remains opt-in and
+off by default; no default server factory or release pin changes.
 
 Version 2 Jira writes use `transition_by_id`. The command binds generation, pack
 digest, phase, gate, candidate SHA, source status ID, target status ID, and exact
 transition ID. The sender checks fresh Jira history and the current ticket fence
 before sending. It never substitutes a same-name transition. Legacy name-based
-commands still decode for version 1. Version 2 automatic completion stays disabled.
+commands still decode for version 1. Version 2 completion requires the accepted
+candidate, human merge receipt, successful merged-SHA smoke, and close summary.
 
 ## Firstmate task lifecycle
 

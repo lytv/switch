@@ -15,6 +15,7 @@ from switch_core.bridges.jira.contracts import (
     Contract,
     Count,
     Gate,
+    Job,
     Question,
     Repository,
     Text,
@@ -25,6 +26,7 @@ from switch_core.bridges.jira.delivery_contracts import (
     ScopeContract,
 )
 from switch_core.bridges.jira.packs import FrozenPack
+from switch_core.bridges.jira.verification import MergeReceipt
 
 
 class LegacyWorkflowState(Contract):
@@ -56,6 +58,14 @@ class DeliveryWorkflowState(Contract):
     scope: ScopeContract | None = None
     reproduction: Handoff | None = None
     candidate: Handoff | None = None
+    candidate_job: Job | None = None
+    review: Handoff | None = None
+    qa: Handoff | None = None
+    smoke: Handoff | None = None
+    feedback: Handoff | None = None
+    merge_receipt: MergeReceipt | None = None
+    outcome: Literal["delivered", "closed_by_human"] | None = None
+    attempts: dict[str, Count] = Field(default_factory=dict)
     publication: Publication | None = None
     candidate_head: Commit | None = None
     review_head: Commit | None = None

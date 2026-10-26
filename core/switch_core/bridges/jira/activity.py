@@ -631,6 +631,28 @@ class TicketActivity:
                     ):
                         ticket.status = item["toString"]
             if is_terminal_ticket_status(ticket.status):
+                target = delivery_state(ticket)
+                terminal_actor = next(
+                    (
+                        entry.get("author", {}).get("accountId")
+                        for entry in reversed(version["histories"])
+                        if any(
+                            item.get("field") == "status"
+                            and item.get("toString") == ticket.status
+                            for item in entry.get("items", [])
+                        )
+                    ),
+                    None,
+                )
+                if (
+                    target is not None
+                    and terminal_actor is not None
+                    and terminal_actor != account
+                ):
+                    ticket.workflow_state = {
+                        **target.model_dump(mode="json"),
+                        "outcome": "closed_by_human",
+                    }
                 park_ticket(ticket, "Jira ticket completed or cancelled")
         ticket.jira_seen_comment_ids = list(observation.seen_ids)
         ticket.jira_read_changelog_id = observation.changelog_id

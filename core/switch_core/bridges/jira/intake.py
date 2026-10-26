@@ -387,6 +387,15 @@ class IntakeOrchestrator:
                                     f"\nApproved checks: {json.dumps([check.model_dump(mode='json') for check in scope.checks])}"
                                     f"\nScope digest: {digest(scope)}"
                                 )
+                                if scope.verification is not None:
+                                    policy = scope.verification
+                                    content += (
+                                        f"\nBehavioral checks repeated by QA: {json.dumps(policy.behavior_check_ids)}"
+                                        f"\nMerged-code smoke checks: {json.dumps(policy.smoke_check_ids)}"
+                                        f"\nVerification role pins: {json.dumps({name: {'commit': role.profile.commit, 'sha256': role.profile.sha256} for name, role in (('review', policy.review), ('qa', policy.qa), ('smoke', policy.smoke))})}"
+                                        f"\nComplete delivery transition: {policy.complete_transition_id}"
+                                        "\nCompletion requires human acceptance, separate human merge, and merged-code smoke. No deployment."
+                                    )
                     if not resuming_scope:
                         history.append({"complete": decision.content})
                     summary = await self._queue(

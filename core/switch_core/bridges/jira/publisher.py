@@ -21,6 +21,7 @@ from switch_core.bridges.jira.delivery_contracts import (
     ScopeContract,
 )
 from switch_core.bridges.jira.target import delivery_state
+from switch_core.bridges.jira.verification import MergeReceipt, validate_merge
 from switch_core.db.models import JiraWorkerTicket
 
 
@@ -77,6 +78,18 @@ class Forge(Protocol):
     async def verify_candidate(
         self, scope: ScopeContract, handoff: Handoff
     ) -> None: ...
+
+    async def update_branch(
+        self, repository_url: str, branch: str, previous: str, head: str
+    ) -> None: ...
+
+    async def ready_request(
+        self, repository_url: str, request_url: str, head: str
+    ) -> None: ...
+
+    async def merge_receipt(
+        self, repository_url: str, request_url: str
+    ) -> MergeReceipt: ...
 
 
 class GitCandidateObjects:
@@ -290,16 +303,80 @@ class DraftPublisher:
                 and repository.base_branch is not None
             )
             url, branch, head = repository.canonical_url, scope.branch, candidate.head
-            key = f"{scope.job.run.ticket_id}/{scope.job.run.generation}/fix/1"
-            if previous is not None and (
-                previous.head != head or previous.execution_key != key
+            async with self._sessions() as session:
+                ticket = await session.get(JiraWorkerTicket, ticket_id)
+                assert ticket is not None
+                state = delivery_state(ticket)
+                assert state is not None
+                key = (
+                    state.candidate_job.run.execution_key
+                    if state.candidate_job
+                    else f"{scope.job.run.ticket_id}/{scope.job.run.generation}/fix/1"
+                )
+            replacement = previous is not None and previous.head != head
+            if (
+                previous is not None
+                and replacement
+                and (
+                    not state.rework_count
+                    or previous.status != "published"
+                    or previous.readiness != "draft"
+                )
             ):
                 raise ValueError(
-                    "Publication intent does not match the frozen candidate"
+                    "Publication cannot replace an unverified or accepted candidate"
                 )
             remote = await self._forge.branch_head(url, branch)
             requests = await self._forge.find_requests(url, branch)
+            if replacement:
+                assert previous is not None
+                if (
+                    remote != previous.head
+                    or len(requests) != 1
+                    or not requests[0].draft
+                    or not requests[0].open
+                    or requests[0].head != previous.head
+                    or requests[0].url != previous.pr_url
+                    or requests[0].branch != branch
+                    or requests[0].base_branch != repository.base_branch
+                ):
+                    raise ValueError(
+                        "Rework branch or request changed outside the trusted publisher"
+                    )
+                await self._authorized(ticket_id, scope, head)
+                await self._save(
+                    ticket_id,
+                    Publication(
+                        execution_key=key,
+                        head=head,
+                        previous_head=previous.head,
+                        status="pushing",
+                        pr_url=previous.pr_url,
+                    ),
+                )
+                try:
+                    await self._forge.update_branch(url, branch, previous.head, head)
+                except Exception as exc:
+                    await self._save(
+                        ticket_id,
+                        Publication(
+                            execution_key=key,
+                            head=head,
+                            previous_head=previous.head,
+                            status="uncertain",
+                            uncertain_operation="push",
+                            pr_url=previous.pr_url,
+                        ),
+                    )
+                    raise PublicationUncertain(
+                        "Candidate update requires reconciliation"
+                    ) from exc
+                return
             if remote is not None and remote != head:
+                if previous is not None and previous.previous_head == remote:
+                    raise PublicationUncertain(
+                        "Candidate update requires reconciliation"
+                    )
                 raise ValueError("Approved branch already exists with another head")
             if len(requests) > 1:
                 raise ValueError("Multiple requests exist for the approved branch")
@@ -406,3 +483,126 @@ class DraftPublisher:
                     execution_key=key, head=head, status="published", pr_url=request.url
                 ),
             )
+
+    async def inspect(
+        self, ticket: JiraWorkerTicket
+    ) -> tuple[DraftRequest, MergeReceipt | None]:
+        state = delivery_state(ticket)
+        if (
+            state is None
+            or state.scope is None
+            or state.candidate is None
+            or state.publication is None
+            or state.publication.status != "published"
+            or state.publication.pr_url is None
+            or state.candidate_head != state.publication.head
+            or state.scope.job.run.generation != ticket.agent_generation
+            or ticket.worker_parked_reason
+        ):
+            raise ValueError(
+                "Candidate observation lacks the current publication fence"
+            )
+        scope, publication = state.scope, state.publication
+        url = scope.job.repository.canonical_url
+        assert url is not None
+        requests = await self._forge.find_requests(url, scope.branch)
+        if len(requests) != 1:
+            raise ValueError("Candidate request is missing or ambiguous")
+        request = requests[0]
+        if (
+            request.url != publication.pr_url
+            or request.head != publication.head
+            or request.branch != scope.branch
+            or request.base_branch != scope.job.repository.base_branch
+        ):
+            raise ValueError(
+                "Candidate request changed; review, QA and acceptance are invalid"
+            )
+        if state.step in {"review", "qa"} and not request.draft:
+            raise ValueError(
+                "Candidate became ready before independent verification finished"
+            )
+        receipt = None
+        if state.accepted_head is not None:
+            receipt = await self._forge.merge_receipt(url, request.url)
+            validate_merge(scope, receipt, request.url, state.accepted_head)
+            if receipt.outcome == "closed_unmerged":
+                raise ValueError("Accepted candidate closed without a merge")
+        if receipt is None or receipt.outcome != "merged":
+            if not request.open:
+                raise ValueError("Candidate closed without a confirmed merge")
+            if await self._forge.branch_head(url, scope.branch) != publication.head:
+                raise ValueError(
+                    "Candidate branch changed; all downstream evidence is invalid"
+                )
+        return request, receipt
+
+    async def authorize_command(self, ticket: JiraWorkerTicket) -> bool:
+        request, receipt = await self.inspect(ticket)
+        state = delivery_state(ticket)
+        assert state is not None
+        if state.step == "accept":
+            return (
+                not request.draft
+                and state.review_head == state.qa_head == state.candidate_head
+            )
+        if state.step == "close":
+            return (
+                receipt is not None
+                and receipt.outcome == "merged"
+                and receipt == state.merge_receipt
+                and state.smoke is not None
+                and state.smoke.verdict == "PASS"
+                and state.smoke.head == receipt.merged_sha
+            )
+        return False
+
+    async def make_ready(self, ticket_id: str) -> bool:
+        async with delivery_lock(self._sessions, ticket_id, "publish") as acquired:
+            if not acquired or not await self._authorize(ticket_id):
+                return False
+            async with self._sessions() as session:
+                ticket = await session.get(JiraWorkerTicket, ticket_id)
+                assert ticket is not None
+                state = delivery_state(ticket)
+                if (
+                    state is None
+                    or state.step != "accept"
+                    or state.review_head != state.qa_head
+                    or state.qa_head != state.candidate_head
+                ):
+                    raise ValueError(
+                        "Readiness requires review and QA of the exact candidate"
+                    )
+                request, _ = await self.inspect(ticket)
+            publication = state.publication
+            assert publication is not None
+            if not request.draft:
+                if publication.readiness == "draft":
+                    raise ValueError(
+                        "Candidate readiness changed outside the trusted publisher"
+                    )
+                await self._save(
+                    ticket_id, publication.model_copy(update={"readiness": "ready"})
+                )
+                return True
+            if publication.readiness != "draft":
+                await self._save(
+                    ticket_id, publication.model_copy(update={"readiness": "uncertain"})
+                )
+                return False
+            await self._save(
+                ticket_id, publication.model_copy(update={"readiness": "requesting"})
+            )
+            url = state.scope.job.repository.canonical_url if state.scope else None
+            assert url is not None
+            try:
+                await self._forge.ready_request(url, request.url, request.head)
+            except Exception as exc:
+                await self._save(
+                    ticket_id, publication.model_copy(update={"readiness": "uncertain"})
+                )
+                raise PublicationUncertain(
+                    "Draft readiness requires reconciliation"
+                ) from exc
+            return False

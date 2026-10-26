@@ -250,8 +250,20 @@ class FirstmateJobs:
                 or not state.approvals
                 or state.unknown_spend
                 or (
-                    job.run.step == "fix"
+                    job.run.step != "reproduce"
                     and envelope.reproduction != state.reproduction
+                )
+                or (
+                    job.run.step in {"review", "qa", "smoke"}
+                    and (
+                        envelope.candidate != state.candidate
+                        or envelope.target_sha
+                        != (
+                            state.merge_sha
+                            if job.run.step == "smoke"
+                            else state.candidate_head
+                        )
+                    )
                 )
             ):
                 raise ValueError(

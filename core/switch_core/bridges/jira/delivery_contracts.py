@@ -5,9 +5,14 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import PurePosixPath
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from switch_core.bridges.jira.contracts import (
     Budget,
@@ -26,6 +31,14 @@ class ApprovedCheck(Contract):
     id: Text
     argv: tuple[Text, ...] = Field(min_length=1)
     expected: Text
+    kind: Literal["command", "behavior"] = "command"
+
+    @model_serializer(mode="wrap")
+    def legacy_shape(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if self.kind == "command":
+            data.pop("kind")
+        return data
 
 
 class ApprovalRoute(Contract):
@@ -51,6 +64,21 @@ class RoleProfile(Contract):
         return self
 
 
+class VerificationRole(Contract):
+    profile: RoleProfile
+    reservation: Reservation
+    estimate_seconds: Positive
+
+
+class VerificationContract(Contract):
+    review: VerificationRole
+    qa: VerificationRole
+    smoke: VerificationRole
+    behavior_check_ids: tuple[Text, ...] = Field(min_length=1)
+    smoke_check_ids: tuple[Text, ...] = Field(min_length=1)
+    complete_transition_id: Text
+
+
 class ScopeContract(Contract):
     job: Job
     branch: Text
@@ -63,6 +91,14 @@ class ScopeContract(Contract):
     fix_reservation: Reservation
     reproduction_estimate_seconds: Positive
     fix_estimate_seconds: Positive
+    verification: VerificationContract | None = None
+
+    @model_serializer(mode="wrap")
+    def legacy_shape(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if self.verification is None:
+            data.pop("verification")
+        return data
 
     @model_validator(mode="after")
     def scope_is_bounded(self) -> Self:
@@ -79,6 +115,16 @@ class ScopeContract(Contract):
             raise ValueError("Scope requires the generation's dedicated branch")
         if len({check.id for check in self.checks}) != len(self.checks):
             raise ValueError("Approved check IDs must be unique")
+        if self.verification is not None:
+            approved = {check.id: check for check in self.checks}
+            verification = self.verification
+            if not set(verification.smoke_check_ids).issubset(approved) or any(
+                key not in approved or approved[key].kind != "behavior"
+                for key in verification.behavior_check_ids
+            ):
+                raise ValueError(
+                    "Verification requires approved behavioral and smoke checks"
+                )
         for path in (*self.allowed_paths, *self.forbidden_paths):
             if path.startswith("/") or ".." in PurePosixPath(path).parts:
                 raise ValueError("Scope paths must stay inside the repository")
@@ -111,6 +157,20 @@ class Handoff(Contract):
 class ExecutionEnvelope(Contract):
     scope: ScopeContract
     reproduction: Handoff | None
+    candidate: Handoff | None = None
+    target_sha: Commit | None = None
+    feedback: Handoff | None = None
+
+    def role_profile(self, job: Job) -> RoleProfile:
+        if job.run.step in {"review", "qa", "smoke"}:
+            if self.scope.verification is None:
+                raise ValueError("The frozen scope lacks verification role profiles")
+            return {
+                "review": self.scope.verification.review,
+                "qa": self.scope.verification.qa,
+                "smoke": self.scope.verification.smoke,
+            }[job.run.step].profile
+        return self.scope.profile
 
     def validate_job(self, job: Job) -> None:
         original = self.scope.job
@@ -121,7 +181,7 @@ class ExecutionEnvelope(Contract):
             or job.run.instance != original.run.instance
             or job.run.ticket_id != original.run.ticket_id
             or job.run.generation != original.run.generation
-            or job.run.attempt != 1
+            or job.run.attempt > 3
         ):
             raise ValueError("Execution envelope differs from the approved scope")
         if job.run.step == "reproduce":
@@ -131,11 +191,24 @@ class ExecutionEnvelope(Contract):
             if self.reproduction is None:
                 raise ValueError("A fix requires reproduction evidence")
             validate_reproduction(self.scope, self.reproduction)
+        elif job.run.step in {"review", "qa", "smoke"}:
+            if (
+                self.scope.verification is None
+                or self.candidate is None
+                or self.reproduction is None
+                or self.target_sha is None
+                or (job.run.step != "smoke" and self.target_sha != self.candidate.head)
+            ):
+                raise ValueError(
+                    "Verification requires a pinned candidate and target SHA"
+                )
+            validate_reproduction(self.scope, self.reproduction)
         else:
-            raise ValueError("This envelope only authorizes reproduction and fix")
+            raise ValueError("Unsupported delivery role")
 
 
 class PreparedExecutionEnvelope(ExecutionEnvelope):
+    base_worktree_path: Text | None = None
     worktree_path: Text
     branch: Text
     artifact_directory: Text
@@ -209,6 +282,8 @@ class Publication(Contract):
     status: Literal["pending", "pushing", "creating", "uncertain", "published"]
     pr_url: Text | None = None
     uncertain_operation: Literal["push", "create"] | None = None
+    previous_head: Commit | None = None
+    readiness: Literal["draft", "requesting", "uncertain", "ready"] = "draft"
 
 
 class ExactTransition(Contract):

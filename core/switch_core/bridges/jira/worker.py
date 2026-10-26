@@ -971,14 +971,6 @@ class JiraWorkerScheduler:
         self._clock: ClockFn = clock or (lambda: datetime.now(UTC))
         self._sleep: SleepFn = sleep or asyncio.sleep
         self._owner = owner
-        self._outbox = JiraOutboxSender(
-            session_factory=session_factory,
-            config=config,
-            clients=self._poll_clients,
-            clock=self._clock,
-            rooms=ticket_rooms,
-            before_wait_send=self._before_wait_send,
-        )
         self._ticket_rooms = ticket_rooms
         self._card_updater = card_updater
         self._admin_board = admin_board
@@ -998,6 +990,17 @@ class JiraWorkerScheduler:
             if config.jira_worker_delivery_execution_enabled
             and delivery_factory is not None
             else None
+        )
+        self._outbox = JiraOutboxSender(
+            session_factory=session_factory,
+            config=config,
+            clients=self._poll_clients,
+            clock=self._clock,
+            rooms=ticket_rooms,
+            before_wait_send=self._before_wait_send,
+            authorize_delivery=self._delivery.authorize_command
+            if self._delivery is not None
+            else None,
         )
         self._orchestrator = build_intake_orchestrator(
             session_factory=session_factory,
