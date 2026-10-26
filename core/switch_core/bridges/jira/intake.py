@@ -298,7 +298,9 @@ class IntakeOrchestrator:
                     )
                     wake_at = None
                     if attempts >= 3:
-                        park_ticket(ticket, "Intake model failed 3 consecutive attempts")
+                        park_ticket(
+                            ticket, "Intake model failed 3 consecutive attempts"
+                        )
                     else:
                         now = self._clock()
                         wake_at = now + _model_retry_delay(
@@ -354,9 +356,7 @@ class IntakeOrchestrator:
                     if target is not None:
                         if target.service != "Bug":
                             phase = "manual_handoff"
-                            content += (
-                                "\nManual handling required. No development job will start."
-                            )
+                            content += "\nManual handling required. No development job will start."
                             data = target.model_dump(mode="json")
                             data["step"] = "manual_handoff"
                             ticket.workflow_state = (
