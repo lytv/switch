@@ -55,7 +55,7 @@ from switch_core.bridges.jira.worker import JiraWorkerScheduler
 from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
 from tests.switch_core.bridges.jira import test_firstmate_jobs
 from tests.switch_core.bridges.jira.test_activity import ThreadRooms, message
-from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard
+from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard, _worker_config
 from tests.switch_core.bridges.jira.test_intake import ModelMock
 from tests.switch_core.bridges.jira.test_outbox import BASE, JiraMock, client_for
 from tests.switch_core.bridges.jira.test_worker import _config
@@ -337,17 +337,23 @@ class ForgeDouble:
         self.requests = ()
         self.pushes = []
         self.creates = []
+        self.branch_reads = []
+        self.fail_push = False
         self.lose_push = False
         self.lose_create = False
         self.before_create = None
 
     async def branch_head(self, url, branch):
         assert url == URL and branch == "switch/ticket/1"
+        self.branch_reads.append(self.head)
         return self.head
 
     async def push_new_branch(self, url, branch, head):
         assert self.head is None
         self.pushes.append((url, branch, head))
+        if self.fail_push:
+            self.fail_push = False
+            raise TimeoutError("Push failed before remote write")
         self.head = head
         if self.lose_push:
             self.lose_push = False
@@ -554,6 +560,88 @@ async def test_summary_and_exact_request_must_finish_before_gate_approval(
     assert process.starts == [scope.job.run.execution_key]
 
 
+@pytest.mark.parametrize("action", ["question", "complete"])
+@pytest.mark.parametrize("channel", ["jira_comments", "switch"])
+@pytest.mark.parametrize("missing", [None, "source", "destination", "transition"])
+async def test_intake_fences_missing_frozen_mappings_through_turn(
+    session_factory, action, channel, missing
+):
+    await seed(session_factory, ready=False)
+    jira = DeliveryJira()
+    jira.status = "Outside frozen workflow" if missing == "source" else "In Progress"
+    destination = (
+        "Waiting for input" if action == "question" else "Waiting for approval"
+    )
+    edge = "progress->input" if action == "question" else "progress->approval"
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        state = delivery_state(ticket)
+        statuses = [
+            *state.statuses,
+            WorkflowMapping(name="Waiting for input", jira_id="input"),
+        ]
+        transitions = [
+            *state.transitions,
+            WorkflowMapping(name="progress->input", jira_id="request-input"),
+        ]
+        ticket.workflow_state = {
+            **ticket.workflow_state,
+            "statuses": [
+                item.model_dump(mode="json")
+                for item in statuses
+                if missing != "destination" or item.name != destination
+            ],
+            "transitions": [
+                item.model_dump(mode="json")
+                for item in transitions
+                if missing != "transition" or item.name != edge
+            ],
+        }
+        ticket.status = jira.status
+        ticket.intake_state = {"phase": "intake"}
+        ticket.wait_channel = channel
+        ticket.room_claimed = True
+        ticket.card_event_id = "fixture-card"
+        ticket.agent_state = "wake_requested"
+        await session.commit()
+    activity, _, process, forge, _ = services(session_factory, jira, enabled=False)
+    intake = IntakeOrchestrator(
+        session_factory=session_factory,
+        config=_worker_config(
+            jira_worker_enabled_projects={"acme": ["TEST"]},
+            jira_worker_delivery_execution_enabled=False,
+        ),
+        model=ModelMock(action),
+        board=FakeAdminBoard(),
+        clock=lambda: NOW,
+    )
+    assert await activity.run_one_turn(intake) == "ticket"
+    ticket, _ = await current(session_factory)
+    assert ticket.tokens_used == 10
+    async with session_factory() as session:
+        commands = list((await session.scalars(select(JiraWorkerOutbox))).all())
+        job = await session.scalar(select(JiraWorkerJob))
+        assert job.status == "done"
+    if missing is None:
+        assert ticket.worker_parked_reason is None
+        assert ticket.intake_state["phase"] == (
+            "question" if action == "question" else "approval"
+        )
+        intake_commands = [
+            command
+            for command in commands
+            if "intake_generation" in (command.payload or {})
+        ]
+        assert len(intake_commands) == 2
+        assert any(command.command == "transition_by_id" for command in intake_commands)
+    else:
+        assert "transition fence changed" in ticket.worker_parked_reason
+        assert ticket.agent_state == "parked"
+        assert ticket.intake_state == {"phase": "intake"}
+        assert commands == []
+    assert not jira.writes and not process.starts and not forge.pushes
+
+
 async def test_gate_without_displayed_summary_never_starts_work(session_factory):
     await seed(session_factory, ready=False)
     jira = DeliveryJira()
@@ -643,6 +731,78 @@ async def test_uncertain_publication_discovers_existing_side_effects(
     _, state = await current(session_factory)
     assert state.publication.status == "published"
     assert len(forge.pushes) == len(forge.creates) == 1
+
+
+@pytest.mark.parametrize("status", ["uncertain", "pushing"])
+async def test_uncertain_push_retries_only_after_fresh_absence(
+    session_factory, status
+):
+    jira = DeliveryJira()
+    scope, _, _, forge, publisher = await candidate(session_factory, jira)
+    forge.fail_push = True
+    with pytest.raises(PublicationUncertain, match="push requires reconciliation"):
+        await publisher.publish("ticket")
+    _, state = await current(session_factory)
+    assert state.publication.status == "uncertain"
+    assert state.publication.uncertain_operation == "push"
+    assert forge.head is None and forge.creates == []
+    if status == "pushing":
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, "ticket")
+            ticket.workflow_state = {
+                **ticket.workflow_state,
+                "publication": {
+                    **ticket.workflow_state["publication"],
+                    "status": "pushing",
+                    "uncertain_operation": None,
+                },
+            }
+            await session.commit()
+    reads = len(forge.branch_reads)
+    await publisher.publish("ticket")
+    assert forge.branch_reads[reads] is None
+    await publisher.publish("ticket")
+    _, state = await current(session_factory)
+    assert state.publication.status == "published"
+    assert forge.pushes == [(URL, scope.branch, HEAD)] * 2
+    assert forge.head == HEAD and forge.creates == ["ticket/1/fix/1"]
+
+
+@pytest.mark.parametrize("change", ["remote_head", "candidate_head", "authorization"])
+async def test_uncertain_push_retry_preserves_publication_fences(
+    session_factory, change
+):
+    jira = DeliveryJira()
+    _, _, _, forge, publisher = await candidate(session_factory, jira)
+    forge.fail_push = True
+    with pytest.raises(PublicationUncertain):
+        await publisher.publish("ticket")
+    if change == "remote_head":
+        forge.head = "f" * 40
+    elif change == "candidate_head":
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, "ticket")
+            ticket.workflow_state = {
+                **ticket.workflow_state,
+                "candidate_head": "f" * 40,
+                "candidate": {
+                    **ticket.workflow_state["candidate"],
+                    "head": "f" * 40,
+                    "fix_commit": "f" * 40,
+                    "checks": [
+                        {**check, "commit": "f" * 40}
+                        for check in ticket.workflow_state["candidate"]["checks"]
+                    ],
+                },
+            }
+            await session.commit()
+    else:
+        jira.change("approver")
+        jira.histories[-1]["items"] = [{"field": "summary"}]
+    with pytest.raises(ValueError):
+        await publisher.publish("ticket")
+    assert forge.pushes == [(URL, "switch/ticket/1", HEAD)]
+    assert forge.creates == []
 
 
 async def test_human_action_after_push_fences_request_creation(session_factory):

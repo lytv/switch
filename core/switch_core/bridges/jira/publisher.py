@@ -334,7 +334,7 @@ class DraftPublisher:
                 operation = previous.uncertain_operation or (
                     "push" if previous.status == "pushing" else "create"
                 )
-                if remote != head or operation != "push":
+                if operation != "push":
                     await self._save(
                         ticket_id,
                         Publication(
