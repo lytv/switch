@@ -31,6 +31,33 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _plain_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    if value.get("type") == "hardBreak":
+        return "\n"
+    separator = (
+        "\n"
+        if value.get("type")
+        in (
+            "doc",
+            "bulletList",
+            "orderedList",
+            "listItem",
+            "blockquote",
+            "table",
+            "tableRow",
+        )
+        else ""
+    )
+    return separator.join(_plain_text(node) for node in value.get("content", []))
+
+
 def _field(fields: dict[str, Any], name: str) -> Any:
     return fields.get(name)
 

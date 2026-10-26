@@ -40,6 +40,8 @@ class DeliveryWorkflowState(Contract):
     pack: FrozenPack
     service: Literal["Bug", "Feature", "Docs", "Other"]
     repository: Repository | None = None
+    service_field: Text | None = None
+    repository_url_field: Text = "description"
     step: Text = "intake"
     gate: Gate | None = None
     checkpoints: tuple[Text, ...] = ()

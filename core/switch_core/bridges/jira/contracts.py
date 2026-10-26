@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from decimal import Decimal
 from typing import Annotated, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -92,6 +94,35 @@ class Run(Contract):
         return self
 
 
+def repository_identity(value: str) -> tuple[str, int | None, str]:
+    """Compare repository identities without fetching untrusted URLs."""
+    if any(char.isspace() or ord(char) < 32 for char in value) or "\\" in value:
+        raise ValueError("Repository URL contains invalid characters")
+    if "://" not in value:
+        remote = re.fullmatch(r"([^/@:\s]+)@([^/:\s]+):(.+)", value)
+        if remote is None:
+            raise ValueError("Repository requires an HTTPS or SSH URL")
+        value = f"ssh://{remote[1]}@{remote[2]}/{remote[3]}"
+    url = urlsplit(value)
+    if (
+        url.scheme not in {"https", "ssh"}
+        or not url.hostname
+        or url.password is not None
+        or (url.username is not None and url.scheme != "ssh")
+        or url.query
+        or url.fragment
+        or "%" in value
+    ):
+        raise ValueError("Repository requires a credential-free HTTPS or SSH URL")
+    path = url.path.rstrip("/")
+    if not path or any(part in {"", ".", ".."} for part in path[1:].split("/")):
+        raise ValueError("Repository URL requires an explicit repository path")
+    port = url.port
+    if port == (443 if url.scheme == "https" else 22):
+        port = None
+    return url.hostname.lower(), port, path.removesuffix(".git")
+
+
 class Repository(Contract):
     supplied_url: Text
     outcome: Literal["verified", "unknown", "invalid"]
@@ -107,6 +138,12 @@ class Repository(Contract):
             raise ValueError("Verified repository requires all checkout pins")
         if self.outcome != "verified" and any(pin is not None for pin in pins):
             raise ValueError("Unknown or invalid repository cannot authorize checkout")
+        if self.outcome == "verified":
+            assert self.canonical_url is not None
+            if repository_identity(self.supplied_url) != repository_identity(
+                self.canonical_url
+            ):
+                raise ValueError("Triage repository does not match the ticket URL")
         return self
 
 

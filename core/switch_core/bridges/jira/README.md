@@ -20,9 +20,9 @@ Jira status or a human decision.
 
 ## Frozen workflow state
 
-Existing tickets retain the `delivery@1` legacy intake policy. New intake tickets
-also use that policy. The additive workflow schema does not enable delivery,
-start coding jobs, or change approval behavior.
+Existing tickets retain the `delivery@1` legacy intake policy. New tickets also
+use that policy unless their project has a draft delivery field mapping.
+Draft delivery intake does not start coding jobs or grant approval authority.
 
 `packs.py` loads the immutable `delivery@2.0.0-draft` fixture. It checks the
 historical digest before it creates a snapshot with configured budgets.
@@ -45,6 +45,61 @@ watermark polls, not role jobs or unknown kinds. Execution keys remain unique
 after completion. Only one active role execution may hold a ticket generation.
 Downgrade refuses delivery workflow or execution records, including completed
 executions, to preserve their snapshots and audit history.
+
+## Service and repository intake
+
+`JIRA_WORKER_DELIVERY_PROJECTS` maps instance and project keys to Jira fields.
+It affects new tickets only. It does not enable execution. For example:
+
+```json
+{"acme":{"TEST":{"service_field":"customfield_12345","repository_url_field":"description"}}}
+```
+
+The Service field must contain `Bug`, `Feature`, `Docs`, or `Other` as its
+single-select value. An absent or unknown value parks that ticket with an admin
+card reason. Other tickets in the poll batch still commit.
+Admin release of that ticket reads Service and the repository link again. If
+Service is still not accepted, the ticket stays set aside. An accepted Service
+stores the delivery target, and intake runs the repository check before any
+scope-approval request.
+Projects without a mapping retain legacy behavior. Existing legacy tickets never
+upgrade because an operator adds a mapping.
+
+The repository field defaults to `description`. Supply exactly one line:
+
+```text
+Repository URL: https://forge.example/team/project
+```
+
+Plain text and Jira document descriptions use the same extraction. An explicitly
+configured custom field contains the URL directly. No repository registration
+list applies. Poll and version reads request labels and all configured target
+fields. Webhook and poll admission freeze the same draft pack, Service, source
+field names, and unverified repository URL in `workflow_state`.
+
+A ticket URL does not authorize checkout. A trusted triage adapter calls
+`target.record_repository_triage` with the ticket id, current generation, and
+`Repository` result. It supplies canonical URL, base branch, exact commit, and
+evidence for a verified result. HTTPS, SSH, and Git SCP-style URLs must identify
+the same host and repository path. Credential-bearing HTTPS URLs, queries,
+fragments, and path traversal cannot authorize checkout. Unknown or invalid
+results contain no checkout pins. A verified target stays frozen.
+The intake model cannot verify repositories. This change adds no triage runtime,
+checkout, Firstmate launcher, or new outbox command type.
+
+Bug intake without a verified target records its summary and requests trusted
+triage. It does not queue scope approval until trusted triage verifies the target.
+Verification resumes completed intake once, without another model decision, and
+queues a summary with the verified repository before requesting scope approval.
+Repeated triage results do not queue another approval. Missing or ambiguous URLs
+cannot form a checkout job. A changed Service or Bug repository URL parks the ticket and
+preserves its original target. Target edits do not clear a park automatically.
+Feature, Docs, and Other finish with a summary and an explicit manual handoff.
+They never queue code work or an approval transition.
+Step 2 does not release tickets parked in triage, scope-ready, or manual-handoff
+phases. Approval-phase tickets whose Service or repository link changes must
+also stay set aside. All these release paths belong to step 7, phase-aware admin
+resume.
 
 ## Firstmate task lifecycle
 

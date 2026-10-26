@@ -25,6 +25,9 @@ from switch_core.bridges.jira.outbox import (
     enqueue_jira_command,
     park_ticket,
 )
+from switch_core.bridges.jira.parse import _plain_text
+from switch_core.bridges.jira.state import DeliveryWorkflowState
+from switch_core.bridges.jira.target import delivery_state
 from switch_core.config import SwitchConfig
 from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
 
@@ -79,33 +82,6 @@ def _model_retry_delay(
                 "Intake model sent an invalid Retry-After header; using fixed delay"
             )
     return MODEL_RETRY_DELAYS[attempts - 1]
-
-
-def _plain_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if not isinstance(value, dict):
-        return ""
-    text = value.get("text")
-    if isinstance(text, str):
-        return text
-    if value.get("type") == "hardBreak":
-        return "\n"
-    separator = (
-        "\n"
-        if value.get("type")
-        in (
-            "doc",
-            "bulletList",
-            "orderedList",
-            "listItem",
-            "blockquote",
-            "table",
-            "tableRow",
-        )
-        else ""
-    )
-    return separator.join(_plain_text(node) for node in value.get("content", []))
 
 
 def _reply_text(value: Any) -> str:
@@ -220,8 +196,9 @@ class IntakeOrchestrator:
             original_state = ticket.intake_state
             state = dict(original_state or {})
             phase = state.get("phase", "intake")
+            resuming_scope = phase == "scope_ready"
             if (
-                phase == "approval"
+                phase in ("approval", "triage", "manual_handoff")
                 or ticket.status
                 == self._config.jira_worker_statuses.waiting_for_approval
             ):
@@ -249,7 +226,15 @@ class IntakeOrchestrator:
                 if key in ("reply", "question", "complete", "jira_rejection")
             ]
         failure = None
-        if phase == "intake" and state.get("cycle", 0) > 0:
+        if resuming_scope:
+            decision = IntakeDecision(
+                "complete",
+                next(
+                    item["complete"] for item in reversed(history) if "complete" in item
+                ),
+                0,
+            )
+        elif phase == "intake" and state.get("cycle", 0) > 0:
             decision = IntakeDecision(
                 "question",
                 "Which requirements in the intake summary need correction?",
@@ -359,26 +344,58 @@ class IntakeOrchestrator:
                         predecessor,
                     )
             elif decision.action == "complete":
+                target = delivery_state(ticket)
                 phase = "approval"
-                history.append({"complete": decision.content})
+                content = decision.content
+                if target is not None:
+                    if target.service != "Bug":
+                        phase = "manual_handoff"
+                        content += (
+                            "\nManual handling required. No development job will start."
+                        )
+                        data = target.model_dump(mode="json")
+                        data["step"] = "manual_handoff"
+                        ticket.workflow_state = (
+                            DeliveryWorkflowState.model_validate_json(
+                                json.dumps(data)
+                            ).model_dump(mode="json")
+                        )
+                    elif (
+                        target.repository is None
+                        or target.repository.outcome != "verified"
+                    ):
+                        phase = "triage"
+                        reason = "Repository triage required before scope approval or checkout"
+                        content += "\n" + reason
+                    else:
+                        content += (
+                            f"\nVerified repository: {target.repository.canonical_url}"
+                            f"\nBase branch: {target.repository.base_branch}"
+                            f"\nBase commit: {target.repository.base_sha}"
+                        )
+                if not resuming_scope:
+                    history.append({"complete": decision.content})
                 summary = await self._queue(
                     session,
                     ticket,
-                    f"{cycle}:summary",
+                    f"{cycle}:verified-summary"
+                    if resuming_scope
+                    else f"{cycle}:summary",
                     "jira",
                     "comment",
-                    f"Intake summary (not approval):\n{decision.content}",
+                    f"Intake summary (not approval):\n{content}",
                     None,
                 )
-                await self._queue(
-                    session,
-                    ticket,
-                    f"{cycle}:approval",
-                    "jira",
-                    "transition",
-                    self._config.jira_worker_statuses.waiting_for_approval,
-                    summary,
-                )
+                if phase == "approval":
+                    await self._queue(
+                        session,
+                        ticket,
+                        f"{cycle}:approval",
+                        "jira",
+                        "transition",
+                        self._config.jira_worker_statuses.waiting_for_approval,
+                        summary,
+                    )
             else:
                 raise ValueError("Intake model returned an invalid action")
             ticket.intake_state = {

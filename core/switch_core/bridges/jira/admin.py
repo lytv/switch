@@ -35,6 +35,11 @@ from switch_core.bridges.jira.outbox import (
     needs_person,
     read_jira_version,
 )
+from switch_core.bridges.jira.target import (
+    UNACCEPTED_SERVICE,
+    delivery_state,
+    initialize_target,
+)
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -773,6 +778,10 @@ async def release_parked_ticket(
                                     ),
                                 },
                             )
+                    if reason == UNACCEPTED_SERVICE:
+                        initialize_target(ticket, version["fields"], config)
+                        if delivery_state(ticket) is None:
+                            raise ValueError(UNACCEPTED_SERVICE)
                     ticket.jira_worker_account_id = worker_account
                     ticket.jira_read_updated = version["updated"]
                     ticket.jira_seen_comment_ids = sorted(

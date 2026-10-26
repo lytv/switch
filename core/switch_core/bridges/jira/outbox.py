@@ -145,7 +145,7 @@ async def read_jira_version(client: JiraPollClient, issue_key: str) -> dict[str,
         await client.request(
             "GET",
             path,
-            params={"fields": "updated,status,summary,description,project,reporter"},
+            params={"fields": client.issue_fields},
         )
     ).json()["fields"]
     before = fields["updated"]

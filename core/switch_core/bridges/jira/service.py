@@ -153,6 +153,7 @@ class JiraBridgeService:
                     instance, []
                 ),
                 webhook_identifier=webhook_identifier,
+                config=self._config,
             )
             await session.commit()
         await sync_ticket_room(

@@ -31,6 +31,7 @@ from switch_core.bridges.jira.outbox import (
     park_ticket,
     read_jira_version,
 )
+from switch_core.bridges.jira.target import check_target_fields
 from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -597,6 +598,7 @@ class TicketActivity:
         except HumanChange as exc:
             park_ticket(ticket, str(exc))
             return None, None
+        check_target_fields(ticket, version["fields"], complete=True)
         seen_raw = ticket.jira_seen_comment_ids
         observation = observe_jira(
             version,
