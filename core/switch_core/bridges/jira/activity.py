@@ -14,6 +14,7 @@ from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.delivery import observe_scope_approval
 from switch_core.bridges.jira.observe import (
     Observation,
     _stamp,
@@ -31,7 +32,7 @@ from switch_core.bridges.jira.outbox import (
     park_ticket,
     read_jira_version,
 )
-from switch_core.bridges.jira.target import check_target_fields
+from switch_core.bridges.jira.target import check_target_fields, delivery_state
 from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -420,7 +421,13 @@ class TicketActivity:
                 or is_terminal_ticket_status(ticket.status)
             ):
                 return False
-            if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
+            target = delivery_state(ticket)
+            token_limit = (
+                target.pack.snapshot.budget.ticket_tokens
+                if target is not None
+                else self._config.jira_worker_limits.tokens_per_ticket
+            )
+            if ticket.tokens_used >= token_limit:
                 park_ticket(ticket, TOKEN_LIMIT)
             status_before = ticket.status
             version, observation = await self._read_jira(ticket, force=force_jira)
@@ -612,7 +619,10 @@ class TicketActivity:
             worker_account=account,
             reporter_account=ticket.reporter_account_id,
         )
-        observation = self._resume_rejection(ticket, version, observation)
+        if self._config.jira_worker_delivery_execution_enabled:
+            observation = observe_scope_approval(ticket, version, observation)
+        if delivery_state(ticket) is None:
+            observation = self._resume_rejection(ticket, version, observation)
         if observation.park != "regressed":
             for entry in version["histories"]:
                 for item in entry.get("items", []):
@@ -918,10 +928,15 @@ class TicketActivity:
             )
             if ticket is None:
                 return None
+            target = delivery_state(ticket)
             if (
                 not self._enabled(ticket)
                 or ticket.worker_parked_reason
                 or is_terminal_ticket_status(ticket.status)
+                or (
+                    target is not None
+                    and target.step not in {"intake", "approve_scope", "manual_handoff"}
+                )
                 or ticket.agent_state not in ("wake_requested", "parked")
                 or (
                     (ticket.intake_state or {}).get("model_failures", 0) > 0

@@ -19,6 +19,11 @@ from switch_core.bridges.jira.contracts import (
     Repository,
     Text,
 )
+from switch_core.bridges.jira.delivery_contracts import (
+    Handoff,
+    Publication,
+    ScopeContract,
+)
 from switch_core.bridges.jira.packs import FrozenPack
 
 
@@ -44,9 +49,14 @@ class DeliveryWorkflowState(Contract):
     repository_url_field: Text = "description"
     step: Text = "intake"
     gate: Gate | None = None
+    gate_ready: bool = False
     checkpoints: tuple[Text, ...] = ()
     statuses: tuple[WorkflowMapping, ...]
     transitions: tuple[WorkflowMapping, ...]
+    scope: ScopeContract | None = None
+    reproduction: Handoff | None = None
+    candidate: Handoff | None = None
+    publication: Publication | None = None
     candidate_head: Commit | None = None
     review_head: Commit | None = None
     qa_head: Commit | None = None

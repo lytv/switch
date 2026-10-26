@@ -38,7 +38,7 @@ Typed state and result contracts validate JSON at the workflow boundary.
 
 Costs are USD estimates, not subscription invoices. These settings do not change
 the existing intake limit of 50000 tokens. The delivery lifecycle reserves these budgets before a task starts. Delivery
-execution remains disconnected from the live approval path.
+execution stays off unless an operator supplies the explicit supervisor integration.
 
 The scheduler claims only explicit job kinds. The intake scheduler claims
 watermark polls, not role jobs or unknown kinds. Execution keys remain unique
@@ -84,8 +84,8 @@ evidence for a verified result. HTTPS, SSH, and Git SCP-style URLs must identify
 the same host and repository path. Credential-bearing HTTPS URLs, queries,
 fragments, and path traversal cannot authorize checkout. Unknown or invalid
 results contain no checkout pins. A verified target stays frozen.
-The intake model cannot verify repositories. This change adds no triage runtime,
-checkout, Firstmate launcher, or new outbox command type.
+The intake model cannot verify repositories. Field mapping alone does not provision
+triage, checkout, execution, or publication.
 
 Bug intake without a verified target records its summary and requests trusted
 triage. It does not queue scope approval until trusted triage verifies the target.
@@ -101,11 +101,95 @@ phases. Approval-phase tickets whose Service or repository link changes must
 also stay set aside. All these release paths belong to step 7, phase-aware admin
 resume.
 
+## Scope approval and Bug execution
+
+`JIRA_WORKER_DELIVERY_EXECUTION_ENABLED` defaults to `false`. Enabling it also
+requires an explicitly supplied `delivery_factory` on `JiraWorkerScheduler`.
+Startup refuses a missing factory. The server entry point does not provision
+that factory. This change enables no live project or paid worker.
+
+Trusted admission calls `delivery.stage_scope` under the ticket row lock after
+repository triage. It supplies the Bug Job, approved commands and expected
+outcomes, allowed and forbidden paths, dedicated generation branch, reservations,
+estimates, and the rendered Switch dev profile. Validate and render that profile
+from its exact reviewed skills-library commit. `RoleProfile` records that commit
+and the rendered content digest. No release tag or live pack pin changes here.
+The Job and Result wire schemas remain unchanged.
+
+Admission also supplies frozen status and transition IDs, authorized approver
+account IDs, and a trusted receipt that proves the workflow has one authorized
+approval edge. `WorkflowMapping` uses `source-id->target-id` names for worker
+transitions. The human Approve mapping stays separate. Without the unique-edge
+proof, status endpoints cannot prove an Approve action. Do not enable execution
+on a workflow with bypass routes.
+
+Intake displays the repository, base branch and SHA, scope paths, approved
+checks, acceptance criteria, dedicated branch, and scope digest before approval.
+The gate becomes active only after the summary and its dependent exact approval
+request both succeed. An earlier status edge cannot authorize work.
+A clean Jira Approve edge freezes its receipt against that scope. It starts one
+`reproduce` execution key, never Done. Another human history entry, another field
+in the approval entry, an unauthorized actor, or a concurrent human comment
+parks the ticket. Chat and room text never authorize work. Later acceptance
+belongs to a separate phase and does not start reproduction.
+
+`delivery.py` validates typed scope and job events against the current generation.
+A fix needs a successful reproduction handoff with an approved failing check at
+the frozen base SHA. It starts a separate Firstmate task and home, without the
+reproduction conversation. The execution envelope carries reproduction evidence.
+Missing or invalid evidence parks the ticket instead of starting a speculative
+fix. A candidate needs distinct regression and fix commits, failing evidence at
+the regression commit, passing approved checks at the candidate, and scoped paths.
+
+For each execution, provision a clean project checkout at the frozen base SHA
+on the dedicated branch, with the verified repository as its origin. Do not share
+that checkout with human work or another ticket. The native boundary checks these
+identities before it launches the task. Firstmate retains responsibility for
+isolated worktree and process mechanics. OS confinement, approved-command
+permissions, and the external metered model gateway remain prerequisites for
+live enablement; task text does not implement a sandbox.
+
+The profile uses a bounded `envelope.json` plus a separate `handoff.json`.
+The adapter supplies paths, pack limits, and `handoff-schema.json`. Write the
+handoff checksum to `handoff.sha256`. The lifecycle validates and stores the
+handoff separately from the immutable Result. Artifact size, symlink, hardlink,
+secret, and checksum checks also apply to the handoff.
+
+`publisher.DraftPublisher` runs in the trusted supervisor. It checks fresh worker
+authorization before each external write. It discovers the branch and all requests
+before a retry. Durable `pushing` and `creating` intents survive process failure.
+An unknown outcome reconciles remote evidence instead of repeating creation.
+An absent request after uncertain creation stays visibly uncertain. A changed
+branch head or a non-draft, closed, or mismatched request prevents publication.
+
+`GitCandidateObjects` verifies actual paths and base/regression/fix ancestry in
+a trusted sealed bare object store. Do not point it at worker-controlled config
+or hooks. `forge.GitHubDraftForge` supplies a GitHub-compatible API transport.
+Its approved scope fixes the repository and branch. API credentials stay in the
+supervisor; git authentication enters only the trusted publisher subprocess.
+Neither credentials nor forge configuration enter worker homes or environments.
+The adapter disables credential helpers, hooks, and HTTP redirects. Other forges
+need a transport for the same contract, not repository pre-registration.
+
+Publication creates one draft on `switch/<ticket-id>/<generation>`. It never
+forces a push, merges, deploys, deletes branches, or marks the candidate ready.
+A normal git push and a Jira write still have read/write races. Narrow repository
+permissions and a reserved generation-branch namespace remain required. After
+publication, supervision stops at the draft candidate. Review, QA, acceptance,
+merge observation, smoke, close, question relay, and admin resume belong to later
+steps. Legacy version 1 still archives on Done.
+
+Version 2 Jira writes use `transition_by_id`. The command binds generation, pack
+digest, phase, gate, candidate SHA, source status ID, target status ID, and exact
+transition ID. The sender checks fresh Jira history and the current ticket fence
+before sending. It never substitutes a same-name transition. Legacy name-based
+commands still decode for version 1. Version 2 automatic completion stays disabled.
+
 ## Firstmate task lifecycle
 
 `firstmate_jobs.py` exposes `FirstmateJobs.start`, `get`, and `cancel`.
-No live Approve handler or scheduler calls this service. It uses the existing
-role-job records and the ticket's `agent_generation`. It adds no daemon, queue,
+The opt-in delivery supervisor calls this service after a clean scope approval.
+It uses the existing role-job records and the ticket's `agent_generation`. It adds no daemon, queue,
 or schema migration.
 
 Start commits the frozen input and usage reservation before it calls Firstmate.

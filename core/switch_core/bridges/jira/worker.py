@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from switch_core.bridges.jira.admin import AdminBoard
+    from switch_core.bridges.jira.delivery import DeliverySupervisor
     from switch_core.bridges.jira.rooms import CardUpdater, TicketRooms
 
 POLL_JOB_KIND = "watermark_poll"
@@ -961,6 +962,7 @@ class JiraWorkerScheduler:
         ticket_rooms: TicketRooms | None = None,
         card_updater: CardUpdater | None = None,
         admin_board: AdminBoard | None = None,
+        delivery_factory: Callable[[TicketActivity], DeliverySupervisor] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._engine = cast(AsyncEngine, session_factory.kw["bind"])
@@ -986,6 +988,16 @@ class JiraWorkerScheduler:
             clients=self._poll_clients,
             rooms=ticket_rooms,
             clock=self._clock,
+        )
+        if config.jira_worker_delivery_execution_enabled and delivery_factory is None:
+            raise ValueError(
+                "Delivery execution requires an explicitly provisioned supervisor"
+            )
+        self._delivery = (
+            delivery_factory(self.activity)
+            if config.jira_worker_delivery_execution_enabled
+            and delivery_factory is not None
+            else None
         )
         self._orchestrator = build_intake_orchestrator(
             session_factory=session_factory,
@@ -1075,6 +1087,8 @@ class JiraWorkerScheduler:
             await session.commit()
         await self.sweep_ticket_rooms()
         await self.activity.read_once()
+        if self._delivery is not None:
+            await self._delivery.run_once()
         if self._orchestrator is not None:
             try:
                 await self.activity.run_one_turn(self._orchestrator)

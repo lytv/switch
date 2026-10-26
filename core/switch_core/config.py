@@ -198,6 +198,7 @@ class SwitchConfig(BaseSettings):
     # JIRA_WORKER_ENABLED_PROJECTS='{"acme":["KAN"]}'.
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
+    jira_worker_delivery_execution_enabled: bool = False
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
     # Jira REST credentials used only by the worker for polling and outbox writes.

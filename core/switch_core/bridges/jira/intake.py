@@ -19,6 +19,8 @@ from switch_core.bridges.jira.admin import (
     INTAKE_REASON,
     set_admin_card_reason,
 )
+from switch_core.bridges.jira.contracts import digest
+from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.outbox import (
     INTAKE_QUESTION_COMMAND,
     TOKEN_LIMIT,
@@ -373,6 +375,16 @@ class IntakeOrchestrator:
                             f"\nBase branch: {target.repository.base_branch}"
                             f"\nBase commit: {target.repository.base_sha}"
                         )
+                        if target.scope is not None:
+                            scope = target.scope
+                            content += (
+                                f"\nApproved branch: {scope.branch}"
+                                f"\nAllowed paths: {json.dumps(scope.allowed_paths)}"
+                                f"\nForbidden paths: {json.dumps(scope.forbidden_paths)}"
+                                f"\nAcceptance: {json.dumps(scope.job.acceptance)}"
+                                f"\nApproved checks: {json.dumps([check.model_dump(mode='json') for check in scope.checks])}"
+                                f"\nScope digest: {digest(scope)}"
+                            )
                 if not resuming_scope:
                     history.append({"complete": decision.content})
                 summary = await self._queue(
@@ -443,13 +455,45 @@ class IntakeOrchestrator:
                 ticket.jira_read_updated is not None
                 and ticket.jira_read_changelog_id is not None
             )
+            target = delivery_state(ticket)
+            data: Any = body
+            if (
+                command == "transition"
+                and target is not None
+                and target.scope is not None
+            ):
+                source = next(
+                    item.jira_id
+                    for item in target.statuses
+                    if item.name == ticket.status
+                )
+                destination = next(
+                    item.jira_id for item in target.statuses if item.name == body
+                )
+                transition = next(
+                    item.jira_id
+                    for item in target.transitions
+                    if item.name == f"{source}->{destination}"
+                )
+                data = ExactTransition(
+                    generation=ticket.agent_generation,
+                    pack_digest=target.pack.digest,
+                    step=target.step,
+                    gate_id=target.gate.id if target.gate else None,
+                    candidate_sha=target.candidate_head,
+                    transition_id=transition,
+                    source_status_id=source,
+                    target_status_id=destination,
+                    target_status_name=body,
+                ).model_dump(mode="json")
+                command = "transition_by_id"
             row_id = await enqueue_jira_command(
                 session,
                 config=self._config,
                 ticket=ticket,
                 command_key=command_key,
                 command=command,
-                data=body,
+                data=data,
                 based_updated=ticket.jira_read_updated,
                 based_changelog_id=ticket.jira_read_changelog_id,
             )
@@ -475,8 +519,14 @@ class IntakeOrchestrator:
             )
             session.add(row)
             await session.flush()
+        target = delivery_state(ticket)
         row.payload = {
             **(row.payload or {}),
+            **(
+                {"scope_digest": digest(target.scope)}
+                if target is not None and target.scope is not None
+                else {}
+            ),
             "intake_generation": ticket.agent_generation,
             "after_command": predecessor,
         }

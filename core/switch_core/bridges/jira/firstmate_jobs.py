@@ -1,7 +1,7 @@
 """Durable role executions in the existing Jira job table, not a second queue.
 
-No live approval handler or scheduler invokes this module. Calls return after
-short Firstmate start/get/cancel operations, never after model completion.
+Calls return after short Firstmate start/get/cancel operations, never after
+model completion.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from switch_core.bridges.jira.contracts import (
     Text,
     digest,
 )
+from switch_core.bridges.jira.delivery_contracts import ExecutionEnvelope, Handoff
 from switch_core.bridges.jira.firstmate_copy import SecretGuard, TaskObservation
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
 from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
@@ -42,7 +43,13 @@ _TERMINAL = {"done", "cancelled", "waiting_input", "error"}
 
 class DeliveryCopy(Protocol):
     async def start(
-        self, job: Job, pack: Pack, reservation: Reservation, estimate_seconds: int
+        self,
+        job: Job,
+        pack: Pack,
+        reservation: Reservation,
+        estimate_seconds: int,
+        *,
+        envelope: ExecutionEnvelope | None = None,
     ) -> TaskObservation: ...
 
     async def get(self, job: Job) -> TaskObservation: ...
@@ -52,6 +59,8 @@ class DeliveryCopy(Protocol):
 
 class Execution(Contract):
     contract: Job
+    envelope: ExecutionEnvelope | None = None
+    handoff: Handoff | None = None
     pack: Pack
     reservation: Reservation
     estimate_seconds: Positive
@@ -183,9 +192,16 @@ class FirstmateJobs:
         return result.scalar_one()
 
     async def _reserve(
-        self, job: Job, reservation: Reservation, estimate_seconds: int
+        self,
+        job: Job,
+        reservation: Reservation,
+        estimate_seconds: int,
+        envelope: ExecutionEnvelope | None,
     ) -> None:
         self._secrets.check(job.model_dump_json())
+        if envelope is not None:
+            envelope.validate_job(job)
+            self._secrets.check(envelope.model_dump_json())
         self._secrets.check(reservation.model_dump_json())
         now = self._clock()
         if now.tzinfo is None:
@@ -199,10 +215,16 @@ class FirstmateJobs:
             )
             if existing is not None:
                 saved = _execution(existing)
-                if (saved.contract, saved.reservation, saved.estimate_seconds) != (
+                if (
+                    saved.contract,
+                    saved.reservation,
+                    saved.estimate_seconds,
+                    saved.envelope,
+                ) != (
                     job,
                     reservation,
                     estimate_seconds,
+                    envelope,
                 ):
                     raise ValueError("Execution key was reused with different input")
                 return
@@ -222,6 +244,19 @@ class FirstmateJobs:
                 or state.step != job.run.step
             ):
                 raise ValueError("Job does not match the current frozen ticket fence")
+            if state.scope is not None and (
+                envelope is None
+                or envelope.scope != state.scope
+                or not state.approvals
+                or state.unknown_spend
+                or (
+                    job.run.step == "fix"
+                    and envelope.reproduction != state.reproduction
+                )
+            ):
+                raise ValueError(
+                    "Execution envelope lacks the frozen approval or reproduction"
+                )
             budget = state.pack.snapshot.budget
             if (
                 ticket.tokens_used + state.reserved_tokens + reservation.tokens
@@ -238,6 +273,7 @@ class FirstmateJobs:
                 )
             execution = Execution(
                 contract=job,
+                envelope=envelope,
                 pack=state.pack.snapshot,
                 reservation=reservation,
                 estimate_seconds=estimate_seconds,
@@ -273,10 +309,15 @@ class FirstmateJobs:
             return _view(row), _execution(row).pack
 
     async def start(
-        self, job: Job, *, reservation: Reservation, estimate_seconds: int
+        self,
+        job: Job,
+        *,
+        reservation: Reservation,
+        estimate_seconds: int,
+        envelope: ExecutionEnvelope | None = None,
     ) -> ExecutionView:
         async with self._execution_lock(job.run.execution_key):
-            await self._reserve(job, reservation, estimate_seconds)
+            await self._reserve(job, reservation, estimate_seconds, envelope)
             current, pack = await self._snapshot(job.run.execution_key)
             if current.status not in _TERMINAL:
                 # The durable row and reservation precede every external operation.
@@ -290,7 +331,18 @@ class FirstmateJobs:
                     )
                 if not cancelled:
                     try:
-                        await self._copy.start(job, pack, reservation, estimate_seconds)
+                        if envelope is None:
+                            await self._copy.start(
+                                job, pack, reservation, estimate_seconds
+                            )
+                        else:
+                            await self._copy.start(
+                                job,
+                                pack,
+                                reservation,
+                                estimate_seconds,
+                                envelope=envelope,
+                            )
                     except Exception:
                         await self._uncertain(
                             job.run.execution_key, "Firstmate start outcome is unknown"
@@ -344,7 +396,12 @@ class FirstmateJobs:
                 await self._copy.cancel(job)
                 stopped = True
             observed = (
-                TaskObservation(task_id=key, status="running", result=current.result)
+                TaskObservation(
+                    task_id=key,
+                    status="running",
+                    result=current.result,
+                    handoff=current.execution.handoff,
+                )
                 if current.result is not None and stopped
                 else await self._copy.get(job)
             )
@@ -377,6 +434,13 @@ class FirstmateJobs:
             state, execution = _state(ticket), _execution(row)
             terminal = row.status in _TERMINAL or row.result is not None
             result = observed.result
+            handoff = observed.handoff
+            if handoff is not None:
+                self._secrets.check(handoff.model_dump_json())
+                if handoff.input_digest != digest(execution.contract):
+                    raise ValueError("Handoff does not match the frozen execution")
+                if execution.handoff is not None and execution.handoff != handoff:
+                    raise ValueError("Terminal evidence handoff is immutable")
             if result is not None:
                 self._secrets.check(result.model_dump_json())
                 if (
@@ -459,6 +523,9 @@ class FirstmateJobs:
                     rejection = "stale_generation"
                 elif ticket.worker_parked_reason is not None:
                     rejection = "parked"
+            saved_handoff = execution.handoff
+            if result is not None and stopped and handoff is not None:
+                saved_handoff = handoff
             execution = _replace(
                 execution,
                 known_tokens=known_tokens,
@@ -469,6 +536,9 @@ class FirstmateJobs:
                 usage_unknown=not complete,
                 exit_confirmed=stopped,
                 rejection=rejection,
+                handoff=saved_handoff.model_dump(mode="json")
+                if saved_handoff
+                else None,
             )
             row.payload = execution.model_dump(mode="json")
             await session.flush()
