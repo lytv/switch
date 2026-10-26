@@ -374,7 +374,9 @@ class DraftPublisher:
                 return
             if remote is not None and remote != head:
                 if previous is not None and previous.previous_head == remote:
-                    return
+                    raise PublicationUncertain(
+                        "Candidate update requires reconciliation"
+                    )
                 raise ValueError("Approved branch already exists with another head")
             if len(requests) > 1:
                 raise ValueError("Multiple requests exist for the approved branch")

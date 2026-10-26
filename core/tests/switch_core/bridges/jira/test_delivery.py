@@ -728,6 +728,19 @@ async def test_disabled_and_unprovisioned_execution_never_starts(session_factory
     with pytest.raises(ValueError, match="explicitly provisioned"):
         JiraWorkerScheduler(session_factory=session_factory, config=config())
 
+    def disabled_factory(activity):
+        raise AssertionError("Disabled delivery must not construct a supervisor")
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=config(enabled=False),
+        poll_clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        delivery_factory=disabled_factory,
+    )
+    await scheduler.run_once()
+    assert process.starts == [] and jira.writes == []
+
 
 @pytest.mark.parametrize("operation", ["push", "create"])
 async def test_uncertain_publication_discovers_existing_side_effects(

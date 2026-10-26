@@ -203,8 +203,10 @@ For review, QA, and smoke, `FirstmateCopy` requires an operator-supplied `projec
 resolver. It must return a prepared, isolated checkout with the approved origin
 and a detached target SHA. It must not return the dev checkout. QA also requires
 an explicit `base_project`: a separate detached, clean checkout at the approved
-base SHA and origin. Its prepared envelope exposes this as `base_worktree_path`,
-so QA can repeat the original failure without switching the candidate HEAD.
+base SHA and origin. Both checkout paths must be absolute, canonical, and
+symlink-free, including their parent directories. The prepared envelope exposes
+the base checkout as `base_worktree_path`, so QA can repeat the original failure
+without switching the candidate HEAD.
 The adapter checks both views before launch and after exit. The operator
 must mount these checkouts read-only and deny publisher credentials and push
 access. These filesystem and network restrictions remain operational
@@ -231,10 +233,12 @@ Smoke runs in a fresh isolated context at the actual merged SHA, using only
 checks from the approved contract. Failed or unknown smoke prevents closure.
 No production URL or deployment environment is assumed. After smoke passes, the
 supervisor queues the close summary before the exact Complete delivery command.
-Configure `JiraOutboxSender.authorize_delivery` with
-`DraftPublisher.authorize_command`; without this trusted send-time forge check,
-candidate acceptance and completion commands fail closed. Every such command
-also checks generation, phase, candidate, Jira history, and its predecessor.
+`JiraWorkerScheduler` connects its explicitly configured delivery supervisor's
+publisher authorizer to `JiraOutboxSender.authorize_delivery`. Standalone senders
+must supply `DraftPublisher.authorize_command`; without this trusted send-time
+forge check, candidate acceptance and completion commands fail closed. Every
+such command also checks generation, phase, candidate, Jira history, and its
+predecessor.
 
 The final Jira observation triggers the existing card, room, and channel sync
 and archival mechanisms. Delivery records `delivered`; a human close or cancel

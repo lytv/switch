@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from switch_core.bridges.jira.contracts import digest
-from switch_core.bridges.jira.delivery import fix_job, role_job
+from switch_core.bridges.jira.delivery import DeliverySupervisor, fix_job, role_job
 from switch_core.bridges.jira.delivery_contracts import (
     ScopeContract,
     VerificationContract,
@@ -21,10 +21,11 @@ from switch_core.bridges.jira.delivery_contracts import (
 from switch_core.bridges.jira.firstmate_copy import SecretGuard
 from switch_core.bridges.jira.firstmate_jobs import FirstmateJobs
 from switch_core.bridges.jira.outbox import JiraOutboxSender
-from switch_core.bridges.jira.publisher import PublicationUncertain
+from switch_core.bridges.jira.publisher import DraftPublisher, PublicationUncertain
 from switch_core.bridges.jira.state import WorkflowMapping
 from switch_core.bridges.jira.target import delivery_state
 from switch_core.bridges.jira.verification import MergeReceipt
+from switch_core.bridges.jira.worker import JiraWorkerScheduler
 from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
 from tests.switch_core.bridges.jira.test_delivery import (
     BASE_SHA,
@@ -128,6 +129,8 @@ class ClosingForge(ForgeDouble):
         self.hide_ready = False
         self.read_error = False
         self.updates = []
+        self.update_error = None
+        self.hide_update = False
 
     async def find_requests(self, url, branch):
         if self.read_error:
@@ -171,8 +174,11 @@ class ClosingForge(ForgeDouble):
     async def update_branch(self, url, branch, previous, head):
         assert self.head == previous
         self.updates.append((previous, head))
-        self.head = head
-        self.requests = (self.requests[0].model_copy(update={"head": head}),)
+        if not self.hide_update:
+            self.head = head
+            self.requests = (self.requests[0].model_copy(update={"head": head}),)
+        if self.update_error is not None:
+            raise self.update_error
 
     async def verify_candidate(self, scope, candidate):
         assert candidate.verdict == "PASS"
@@ -280,6 +286,79 @@ async def accepted(sessions, jira):
     ticket, state = await current(sessions)
     assert state.accepted_head == HEAD and state.step == "merge"
     return bundle
+
+
+async def test_scheduler_sends_acceptance_and_completion_with_configured_publisher(
+    session_factory,
+):
+    jira = ClosingJira()
+    scope, _, _, process, forge, _ = await _tested(session_factory, jira)
+    settings = config()
+    activities = []
+
+    def delivery_factory(activity):
+        activities.append(activity)
+        jobs = FirstmateJobs(
+            session_factory=session_factory,
+            delivery_copy=process,
+            secrets=SecretGuard(forbidden_values=()),
+            clock=lambda: NOW,
+        )
+
+        async def authorize(ticket_id):
+            return await activity.read_ticket(ticket_id, force_jira=True)
+
+        publisher = DraftPublisher(
+            session_factory=session_factory, forge=forge, authorize=authorize
+        )
+        return DeliverySupervisor(
+            session_factory=session_factory,
+            config=settings,
+            activity=activity,
+            jobs=jobs,
+            publisher=publisher,
+            clock=lambda: NOW,
+        )
+
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=settings,
+        poll_clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        delivery_factory=delivery_factory,
+    )
+    assert activities == [scheduler.activity]
+    for _ in range(3):
+        await scheduler.run_once()
+    ticket, state = await current(session_factory)
+    assert not ticket.worker_parked_reason, ticket.worker_parked_reason
+    assert state.gate_ready and state.accepted_head is None
+    assert jira.status == "Waiting for approval" and len(jira.writes) == 2
+    jira.approve()
+    await scheduler.run_once()
+    _, state = await current(session_factory)
+    assert state.accepted_head == HEAD and state.step == "merge"
+    assert "ticket/1/smoke/1" not in process.starts
+    forge.merge()
+    await scheduler.run_once()
+    await scheduler.run_once()
+    assert process.envelopes["ticket/1/smoke/1"].target_sha == MERGED
+    process.complete(role_job(scope, "smoke", 1))
+    for _ in range(3):
+        await scheduler.run_once()
+    assert jira.status == "Done"
+    await scheduler.activity.read_ticket("ticket", force_jira=True)
+    ticket, state = await current(session_factory)
+    assert ticket.status == "Done" and state.outcome == "delivered"
+    assert len(jira.writes) == 4
+    assert len(forge.creates) == len(forge.pushes) == 1
+    async with session_factory() as session:
+        commands = (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(JiraWorkerOutbox.channel == "jira")
+            )
+        ).all()
+        assert len(commands) == 4 and all(row.status == "done" for row in commands)
 
 
 async def test_accept_merge_smoke_close_orders_every_public_boundary(session_factory):
@@ -628,8 +707,18 @@ async def test_late_stale_review_usage_stays_accounted_after_candidate_invalidat
         assert row.status == "cancelled" and row.payload["held_tokens"] == 0
 
 
+@pytest.mark.parametrize(
+    "interruption,visible",
+    [
+        (None, True),
+        (TimeoutError, True),
+        (TimeoutError, False),
+        (asyncio.CancelledError, True),
+        (asyncio.CancelledError, False),
+    ],
+)
 async def test_rework_updates_only_the_original_draft_and_uses_new_attempts(
-    session_factory,
+    session_factory, interruption, visible
 ):
     jira = ClosingJira()
     scope, _, supervisor, process, forge, _ = await setup(session_factory, jira)
@@ -654,6 +743,35 @@ async def test_rework_updates_only_the_original_draft_and_uses_new_attempts(
         update={"handoff": evidence}
     )
     await supervisor.reconcile("ticket")
+    if interruption is not None:
+        forge.update_error = interruption("Branch update outcome is unknown")
+        forge.hide_update = not visible
+        with pytest.raises(
+            PublicationUncertain if interruption is TimeoutError else interruption
+        ):
+            await supervisor.reconcile("ticket")
+        _, state = await current(session_factory)
+        assert state.publication.status == (
+            "uncertain" if interruption is TimeoutError else "pushing"
+        )
+        _, supervisor, _, _, _ = services(
+            session_factory, jira, process=process, forge=forge
+        )
+        if not visible:
+            for _ in range(2):
+                with pytest.raises(
+                    PublicationUncertain, match="update requires reconciliation"
+                ):
+                    await supervisor.reconcile("ticket")
+            ticket, pending = await current(session_factory)
+            assert not ticket.worker_parked_reason
+            assert pending.publication == state.publication
+            assert pending.step == "fix" and "ticket/1/review/2" not in process.starts
+            assert forge.head == HEAD and forge.requests[0].head == HEAD
+            assert forge.updates == [(HEAD, new)]
+            assert len(forge.creates) == len(forge.pushes) == 1
+            forge.head = new
+            forge.requests = (forge.requests[0].model_copy(update={"head": new}),)
     for _ in range(4):
         await supervisor.reconcile("ticket")
     ticket, state = await current(session_factory)

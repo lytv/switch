@@ -405,6 +405,9 @@ class DeliverySupervisor:
         self._publisher = publisher
         self._clock = clock
 
+    async def authorize_command(self, ticket: JiraWorkerTicket) -> bool:
+        return await self._publisher.authorize_command(ticket)
+
     async def run_once(self) -> None:
         async with self._sessions() as session:
             ids = list(
