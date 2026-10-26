@@ -248,8 +248,12 @@ def _result(lab: Lab, job: Job, *, usage: Usage | None = None, **changes) -> Non
         usage=usage if usage is not None else _usage(),
     )
     data = result.model_dump(mode="json") | changes
-    raw = json.dumps(data).encode()
     task = lab.copy.location(job) / "data" / lab.copy.task_id(job)
+    if data.get("question") is not None:
+        checkpoint = b'{"checkpoint":"fixture"}'
+        (task / "checkpoint.json").write_bytes(checkpoint)
+        data["question"]["checkpoint_digest"] = hashlib.sha256(checkpoint).hexdigest()
+    raw = json.dumps(data).encode()
     (task / "result.json").write_bytes(raw)
     (task / "result.sha256").write_text(hashlib.sha256(raw).hexdigest())
 
@@ -389,7 +393,9 @@ async def test_key_input_and_estimates_are_immutable(session_factory, lab):
 @pytest.mark.parametrize("state", ["done", "running"])
 async def test_zero_spend_reads_do_not_add_daily_entries(session_factory, lab, state):
     job = await _job(session_factory, lab)
-    service = _service(session_factory, lab)
+    service = _service(
+        session_factory, lab, clock=lambda: NOW.replace(hour=23, minute=59, second=50)
+    )
     await _start(service, job)
     if state == "done":
         _result(lab, job)
@@ -402,10 +408,23 @@ async def test_zero_spend_reads_do_not_add_daily_entries(session_factory, lab, s
                 )
             )
         ).payload
-    next_day = _service(session_factory, lab, clock=lambda: NOW + timedelta(days=1))
+    next_day = _service(
+        session_factory,
+        lab,
+        clock=lambda: (NOW + timedelta(days=1)).replace(hour=0, minute=0, second=0),
+    )
     for _ in range(2):
-        assert await next_day.get(job.run.execution_key) == accepted
-        assert await _start(next_day, job) == accepted
+        read = await next_day.get(job.run.execution_key)
+        restarted = await _start(next_day, job)
+        if state == "done":
+            assert read == restarted == accepted
+        else:
+            assert read.status == restarted.status == "running"
+            assert (
+                read.execution.cost_by_day
+                == restarted.execution.cost_by_day
+                == accepted.execution.cost_by_day
+            )
     if state == "done":
         assert await next_day.cancel(job.run.execution_key) == accepted
     async with session_factory() as session:
@@ -415,7 +434,9 @@ async def test_zero_spend_reads_do_not_add_daily_entries(session_factory, lab, s
             )
         )
         ticket = await session.get(JiraWorkerTicket, job.run.ticket_id)
-        assert row.payload == stored
+        assert {
+            key: value for key, value in row.payload.items() if key != "active_seconds"
+        } == {key: value for key, value in stored.items() if key != "active_seconds"}
         assert row.result == (
             accepted.result.model_dump(mode="json")
             if accepted.result is not None

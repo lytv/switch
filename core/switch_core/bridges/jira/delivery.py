@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import select
 
+from switch_core.bridges.jira.accounting import CapacityUnavailable
+from switch_core.bridges.jira.commands import enqueue_ticket_command
 from switch_core.bridges.jira.contracts import (
     Approval,
     Contract,
@@ -174,6 +176,8 @@ def apply_event(
     job, result, handoff = event.job, event.result, event.handoff
     envelope = ExecutionEnvelope(
         scope=scope,
+        resume_answer=state.answer if job.run.input_revision else None,
+        reproduction_job=state.reproduction_job,
         reproduction=state.reproduction if job.run.step != "reproduce" else None,
         candidate=state.candidate
         if job.run.step in {"review", "qa", "smoke"}
@@ -194,9 +198,13 @@ def apply_event(
             "Job result lacks the current phase, approval, or complete usage"
         )
     if job.run.step == "reproduce":
-        validate_reproduction(scope, handoff)
+        validate_reproduction(scope, handoff, job)
         replace_state(
-            ticket, state, reproduction=handoff.model_dump(mode="json"), step="fix"
+            ticket,
+            state,
+            reproduction=handoff.model_dump(mode="json"),
+            reproduction_job=job.model_dump(mode="json"),
+            step="fix",
         )
     elif job.run.step == "fix":
         validate_candidate(scope, job, handoff)
@@ -373,6 +381,7 @@ def role_job(
     scope: ScopeContract,
     step: Literal["reproduce", "fix", "review", "qa", "smoke"],
     attempt: int,
+    input_revision: int = 0,
 ) -> Job:
     data = scope.job.model_dump(mode="json")
     run = scope.job.run
@@ -382,7 +391,9 @@ def role_job(
         generation=run.generation,
         step=step,
         attempt=attempt,
-        execution_key=f"{run.ticket_id}/{run.generation}/{step}/{attempt}",
+        execution_key=f"{run.ticket_id}/{run.generation}/{step}/{attempt}"
+        + (f"/input/{input_revision}" if input_revision else ""),
+        input_revision=input_revision,
     ).model_dump(mode="json")
     return Job.model_validate_json(json.dumps(data))
 
@@ -440,6 +451,8 @@ class DeliverySupervisor:
             if acquired:
                 try:
                     await self._reconcile(ticket_id)
+                except CapacityUnavailable:
+                    return
                 except ValueError as exc:
                     async with self._sessions() as session:
                         ticket = await session.get(
@@ -463,6 +476,8 @@ class DeliverySupervisor:
                             park_ticket(ticket, str(exc))
                         await session.commit()
                     await self._cancel_active(ticket_id)
+                finally:
+                    await self._activity.refresh_projection(ticket_id)
 
     async def _cancel_active(self, ticket_id: str) -> None:
         async with self._sessions() as session:
@@ -532,6 +547,16 @@ class DeliverySupervisor:
             ):
                 return
             scope = state.scope
+            if state.question is not None:
+                if (
+                    state.answer is None
+                    or state.answer.classification != "answer"
+                    or state.resume_command is None
+                ):
+                    return
+                resumed = await session.get(JiraWorkerOutbox, state.resume_command)
+                if resumed is None or resumed.status != "done":
+                    return
             if (
                 state.step == "fix"
                 and state.candidate is not None
@@ -587,6 +612,9 @@ class DeliverySupervisor:
                     scope,
                     cast(Literal["reproduce", "fix", "review", "qa", "smoke"], step),
                     state.attempts.get(step, 1),
+                    state.input_revisions.get(
+                        f"{step}/{state.attempts.get(step, 1)}", 0
+                    ),
                 )
                 envelope = ExecutionEnvelope(
                     scope=scope,
@@ -596,6 +624,8 @@ class DeliverySupervisor:
                     if step == "smoke"
                     else state.candidate_head,
                     feedback=state.feedback if step == "fix" else None,
+                    reproduction_job=state.reproduction_job,
+                    resume_answer=state.answer if job.run.input_revision else None,
                 )
                 envelope.validate_job(job)
         if publish:
@@ -627,6 +657,47 @@ class DeliverySupervisor:
             else scope.fix_estimate_seconds,
             envelope=envelope,
         )
+        if view.status == "running":
+            await self._progress(ticket_id, view.execution.progress, job)
+        if view.status == "waiting_input":
+            async with self._sessions() as session:
+                ticket = await session.get(
+                    JiraWorkerTicket, ticket_id, with_for_update=True
+                )
+                assert ticket is not None
+                state = delivery_state(ticket)
+                if (
+                    state is None
+                    or ticket.worker_parked_reason
+                    or ticket.agent_generation != job.run.generation
+                ):
+                    return
+                if view.result is None or view.result.question is None:
+                    raise ValueError("Waiting execution lacks its durable question")
+                if not view.result.question.evidence:
+                    raise ValueError("Delivery question requires missing-fact evidence")
+                if state.question == view.result.question:
+                    return
+                if state.question_count >= 5:
+                    park_ticket(
+                        ticket, "Delivery question limit reached; admin review required"
+                    )
+                else:
+                    replace_state(
+                        ticket,
+                        state,
+                        question=view.result.question.model_dump(mode="json"),
+                        answer=None,
+                        question_count=state.question_count + 1,
+                        question_started_at=self._clock().isoformat(),
+                        question_command=None,
+                        resume_command=None,
+                    )
+                    ticket.wait_anchor = self._clock()
+                    ticket.wait_fired = {}
+                    ticket.agent_state = "wake_requested"
+                await session.commit()
+            return
         if view.status != "done":
             return
         async with self._sessions() as session:
@@ -645,8 +716,67 @@ class DeliverySupervisor:
                         job=job, result=view.result, handoff=view.execution.handoff
                     ),
                 )
+                updated = delivery_state(ticket)
+                assert updated is not None
+                replace_state(
+                    ticket,
+                    updated,
+                    question=None,
+                    answer=None,
+                    question_command=None,
+                    resume_command=None,
+                    question_started_at=None,
+                )
             except ValueError as exc:
                 park_ticket(ticket, str(exc))
+            await session.commit()
+
+    async def _progress(
+        self, ticket_id: str, evidence: Handoff | None, job: Job
+    ) -> None:
+        if evidence is None:
+            return
+        async with self._sessions() as session:
+            ticket = await session.get(
+                JiraWorkerTicket, ticket_id, with_for_update=True
+            )
+            assert ticket is not None
+            if (
+                ticket.worker_parked_reason
+                or ticket.agent_generation != job.run.generation
+            ):
+                return
+            slot = int(self._clock().timestamp()) // 600
+            key = f"delivery-progress:{job.run.execution_key}:{slot}"
+            if await session.scalar(
+                select(JiraWorkerOutbox.id).where(
+                    JiraWorkerOutbox.instance == ticket.instance,
+                    JiraWorkerOutbox.command_key == key,
+                )
+            ):
+                return
+            checks = "; ".join(
+                f"{check.check_id} at {check.commit}: exit {check.exit_code}, evidence {check.artifact_digest}"
+                for check in evidence.checks
+            )
+            body = f"Delivery {job.run.step}: {checks}. Next: finish the approved {job.run.step} checks."
+            command_id = await enqueue_ticket_command(
+                session,
+                config=self._config,
+                ticket=ticket,
+                command_key=key,
+                channel="switch" if ticket.room_id else "jira_comments",
+                command="intake_question" if ticket.room_id else "comment",
+                body=body,
+                predecessor=None,
+                now=self._clock(),
+            )
+            row = await session.get(JiraWorkerOutbox, command_id)
+            assert row is not None
+            row.payload = {
+                **(row.payload or {}),
+                "delivery_progress_execution": job.run.execution_key,
+            }
             await session.commit()
 
     async def _milestone(self, ticket_id: str, *, closing: bool) -> None:

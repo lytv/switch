@@ -7,7 +7,7 @@ positive integer values:
 | Key | Default | Scope |
 | --- | ---: | --- |
 | `open_rooms` | 50 | Open rooms of enabled projects. Done, cancelled, and archived rooms do not count, and a project that is off does not hold a slot |
-| `live_sessions` | 5 | Claimed orchestrator turns of enabled projects. A project that is off does not hold a session |
+| `live_sessions` | 5 | Legacy intake counts enabled projects. With delivery enabled or live roles, intake and role sessions together never exceed five, including disabled projects' live sessions |
 | `room_creates_per_hour` | 20 | Create attempts in the previous rolling hour |
 | `tokens_per_ticket` | 50000 | Cumulative reported usage for one ticket |
 
@@ -96,10 +96,9 @@ cannot form a checkout job. A changed Service or Bug repository URL parks the ti
 preserves its original target. Target edits do not clear a park automatically.
 Feature, Docs, and Other finish with a summary and an explicit manual handoff.
 They never queue code work or an approval transition.
-Step 2 does not release tickets parked in triage, scope-ready, or manual-handoff
-phases. Approval-phase tickets whose Service or repository link changes must
-also stay set aside. All these release paths belong to step 7, phase-aware admin
-resume.
+Admin release supports triage, scope-ready, manual-handoff, and approval phases.
+It reads Service and the repository link again. Delivery release requires fresh
+repository triage and scope approval before another code job can start.
 
 ## Scope approval and Bug execution
 
@@ -114,7 +113,8 @@ outcomes, allowed and forbidden paths, dedicated generation branch, reservations
 estimates, and the rendered Switch dev profile. Validate and render that profile
 from its exact reviewed skills-library commit. `RoleProfile` records that commit
 and the rendered content digest. No release tag or live pack pin changes here.
-The Job and Result wire schemas remain unchanged.
+Initial Job serialization remains unchanged. Checkpoint resumes add a positive
+`run.input_revision` and append `/input/<revision>` to the execution key.
 
 Admission also supplies frozen status and transition IDs, authorized approver
 account IDs, and a trusted receipt that proves the workflow has one authorized
@@ -175,7 +175,44 @@ Publication creates one draft on `switch/<ticket-id>/<generation>`. It never
 forces a push, merges, deploys, or deletes branches. A normal git push and a Jira
 write still have read/write races. Narrow repository permissions and a reserved
 generation-branch namespace remain required. Legacy version 1 still archives on
-Done. Question relay and phase-aware admin resume remain separate work.
+Done. Delivery questions and admin release use the boundaries below.
+
+## Delivery questions, progress, and capacity
+
+A `needs_input` result carries the missing fact in `question.text`, evidence,
+a question identifier, and the SHA-256 digest of `checkpoint.json`.
+The native adapter requires the bounded checkpoint artifact and confirms task exit.
+The existing language-only turn creates one short question on the selected input channel.
+The outbox sets Waiting for input. No mention is necessary for reporter replies.
+
+The language turn classifies replies as `answer`, `clarify`, `scope_change`, or
+`unrelated`. Only an answer completes the semantic wait and queues exact Resume work.
+A fresh isolated task receives the same checkpoint and accepted answer through its inbox.
+Its input revision creates one durable execution key without consuming another retry attempt.
+A clarification grants no repository, tool, scope, or budget authority.
+A scope change invalidates downstream evidence and requires new triage and scope approval.
+Five delivery questions exhaust one generation. The intake limit remains separate.
+Unrelated replies do not reset reminders. Questions, waits, and reminders survive restart.
+Reminders retain the configured work-hours calendar.
+
+Set `JIRA_WORKER_DELIVERY_LANGUAGE_PRICING` before a delivery language call.
+It requires `max_usd_per_token` and `price_source`. The price bounds every input,
+output, and cached token. Language calls reserve at most 8192 remaining tokens.
+Language and role calls share atomic ticket and daily spend admission.
+Unknown usage retains its reservation and parks the ticket.
+
+At most two role jobs run globally, with one live role per ticket.
+Intake and role sessions together never exceed five. Capacity queues change no Jira status.
+Existing room and admin cards show phase, gate, candidate SHA, evidence, and usage.
+The worker posts evidence-based progress at most once per ten-minute slot.
+Tasks write approved check evidence as a `Handoff` in `progress.json`.
+A heartbeat or an unchanged failure does not reset the twenty-minute idle timer.
+Active elapsed time survives restart and checkpoint resumes; human waits do not consume it.
+At twice the estimate, the worker alerts admins and continues within hard budgets.
+
+The additive checkpoint migration follows `7b1e2f3a4c59`. It preserves existing keys.
+Downgrade refuses checkpoint revision records instead of deleting audit data.
+Execution remains explicitly opt-in and off by default.
 
 ## Independent verification and completion
 
@@ -259,7 +296,7 @@ candidate, human merge receipt, successful merged-SHA smoke, and close summary.
 `firstmate_jobs.py` exposes `FirstmateJobs.start`, `get`, and `cancel`.
 The opt-in delivery supervisor calls this service after a clean scope approval.
 It uses the existing role-job records and the ticket's `agent_generation`. It adds no daemon, queue,
-or schema migration.
+or additional table.
 
 Start commits the frozen input and usage reservation before it calls Firstmate.
 A repeated execution key returns the same execution. Different input, reservation,
@@ -465,7 +502,7 @@ Release clears the park reason and accepts a fresh observation baseline.
 It replaces remembered comment IDs with the IDs currently visible in Jira.
 A deleted comment therefore cannot immediately park the ticket again.
 Release queues an update to the existing admin card and keeps other alert reasons.
-It preserves the Jira status, intake state, token usage, generation, and wait timers.
+For legacy intake, it preserves Jira status, intake state, usage, generation, and wait timers.
 It does not retry, recreate, cancel, or otherwise change Jira commands.
 Unread reporter input remains subject to the ticket's existing channel rules.
 
@@ -477,7 +514,8 @@ Release changes only the park reason and observation baseline in these cases.
 Unclear phase/status combinations require separate reconciliation.
 
 Release refuses a ticket that is not parked.
-Release refuses completed, cancelled, and token-limit tickets.
+Release refuses completed and cancelled tickets. Legacy token-limit tickets also remain parked.
+Delivery release requires remaining approved tokens and reconciled usage.
 A current Jira status in the Done category also prevents release.
 Pending or claimed commands require separate reconciliation before release.
 Unknown send outcomes and interrupted or failed turns with unknown token usage
@@ -486,6 +524,22 @@ Active sends, turns, or admin card updates return a retryable conflict.
 An issue stamp change during the history read also returns a conflict.
 If Jira's project or reporter differs from stored routing, release fails.
 Refresh the ticket metadata before retrying that release.
+
+Delivery release also requires `reason` and `previous_generation` in the request.
+It preserves cumulative spend, reservations, the frozen pack, and prior receipts.
+It starts a new generation with fresh repository triage and scope approval.
+It never replays an old approval or validates an uncertain result.
+A release from Waiting for approval queues a new input request before fresh intake.
+Feature, Docs, and Other remain manual-handoff paths with no code jobs.
+
+Admins extend budgets through
+`POST /jira-triggers/worker/tickets/{issue_key}/budget?instance={instance}`.
+The request requires a UUID `request_id`, `reason`, `previous_generation`, and `delta`.
+The delta contains nonnegative `ticket_tokens`, `ticket_estimated_usd`, and
+`day_estimated_usd`. At least one delta must be positive.
+The daily delta applies across tickets for the current UTC accounting day.
+Repeated identical requests return the same receipt. Changed input with the same UUID fails.
+An extension never clears a park, resets usage, releases unknown reservations, or approves a result.
 
 No UI is part of this boundary.
 

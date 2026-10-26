@@ -6,10 +6,17 @@ import hashlib
 import json
 import re
 from decimal import Decimal
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 Text = Annotated[str, Field(min_length=1, pattern=r"\S")]
 Version = Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")]
@@ -85,13 +92,23 @@ class Run(Contract):
     step: Literal["reproduce", "fix", "review", "qa", "smoke"]
     attempt: Positive
     execution_key: Text
+    input_revision: Count = 0
 
     @model_validator(mode="after")
     def key_matches_identity(self) -> Self:
         expected = f"{self.ticket_id}/{self.generation}/{self.step}/{self.attempt}"
+        if self.input_revision:
+            expected += f"/input/{self.input_revision}"
         if self.execution_key != expected:
             raise ValueError("Execution key does not match the frozen run")
         return self
+
+    @model_serializer(mode="wrap")
+    def legacy_shape(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data: dict[str, Any] = handler(self)
+        if not self.input_revision:
+            data.pop("input_revision")
+        return data
 
 
 def repository_identity(value: str) -> tuple[str, int | None, str]:
@@ -193,6 +210,7 @@ class Question(Contract):
     id: Text
     checkpoint_digest: Digest
     text: Text
+    evidence: tuple[Text, ...] = ()
 
 
 class Answer(Contract):

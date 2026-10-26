@@ -61,6 +61,10 @@ def config(**overrides):
         jira_worker_delivery_projects={
             "acme": {"TEST": {"service_field": SERVICE_FIELD}}
         },
+        jira_worker_delivery_language_pricing={
+            "max_usd_per_token": "0.00001",
+            "price_source": "fixture-upper-bound",
+        },
         jira_worker_credentials={
             "acme": {
                 "base_url": "https://jira.example",
@@ -570,6 +574,8 @@ async def test_release_rereads_unaccepted_service_before_approval(session_factor
                 request_id=str(uuid.uuid4()),
                 admin_user_id=admin_id,
                 now=NOW,
+                release_reason="Recheck the reporter target",
+                previous_generation=stored.agent_generation,
             )
 
         for _ in range(2):

@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
+from switch_core.bridges.jira.accounting import LIVE_ROLES, accounting_lock
 from switch_core.bridges.jira.activity import (
     EXPLICIT_INPUT,
     is_terminal_ticket_status,
@@ -24,6 +25,7 @@ from switch_core.bridges.jira.activity import (
     request_wake,
     ticket_turn_lock,
 )
+from switch_core.bridges.jira.commands import enqueue_ticket_command
 from switch_core.bridges.jira.observe import _stamp, comment_actor
 from switch_core.bridges.jira.outbox import (
     INTERRUPTED_TURN,
@@ -35,10 +37,14 @@ from switch_core.bridges.jira.outbox import (
     needs_person,
     read_jira_version,
 )
+from switch_core.bridges.jira.parse import _plain_text
+from switch_core.bridges.jira.projection import delivery_lines
 from switch_core.bridges.jira.target import (
     UNACCEPTED_SERVICE,
     delivery_state,
     initialize_target,
+    reset_delivery_scope,
+    ticket_repository_url,
 )
 from switch_core.config import JiraWorkerCalendar, SwitchConfig
 from switch_core.db.models import (
@@ -531,6 +537,8 @@ async def release_parked_ticket(
     request_id: str,
     admin_user_id: str,
     now: datetime,
+    release_reason: str | None = None,
+    previous_generation: int | None = None,
 ) -> JiraWorkerEvent:
     """Clear a park against a fresh baseline without replaying commands."""
     request_id = str(uuid.UUID(request_id))
@@ -541,6 +549,7 @@ async def release_parked_ticket(
         if not locked:
             raise BlockingIOError("Ticket turn is active; retry release later")
         async with session_factory() as session:
+            await accounting_lock(session)
             admin = await session.get(User, admin_user_id)
             if admin is None or admin.role != "admin":
                 raise PermissionError("Only an admin may release a parked ticket")
@@ -583,16 +592,51 @@ async def release_parked_ticket(
                     raise ValueError("release request key belongs to another event")
                 if (receipt.payload or {}).get("released_by") != admin_user_id:
                     raise ValueError("release request belongs to another admin")
+                if (receipt.payload or {}).get("reason") != release_reason or (
+                    previous_generation is not None
+                    and (receipt.payload or {}).get("previous_generation")
+                    != previous_generation
+                ):
+                    raise ValueError(
+                        "Release request UUID was reused with different input"
+                    )
             else:
                 reason = ticket.worker_parked_reason
+                generation_before = ticket.agent_generation
+                delivery = delivery_state(ticket)
+                if delivery is not None:
+                    if (
+                        not release_reason
+                        or not release_reason.strip()
+                        or previous_generation != generation_before
+                    ):
+                        raise ValueError(
+                            "Delivery release requires a reason and the current previous generation"
+                        )
+                    active_role = await session.scalar(
+                        select(JiraWorkerJob.id)
+                        .where(
+                            JiraWorkerJob.ticket_id == ticket.id,
+                            JiraWorkerJob.kind == "role_job",
+                            JiraWorkerJob.status.in_(LIVE_ROLES),
+                        )
+                        .limit(1)
+                    )
+                    if delivery.unknown_spend or active_role:
+                        raise ValueError(
+                            "Delivery usage and task exit require reconciliation before release"
+                        )
                 if reason:
-                    if reason in (TOKEN_LIMIT, "Jira ticket completed or cancelled"):
+                    if reason == "Jira ticket completed or cancelled" or (
+                        reason == TOKEN_LIMIT and delivery is None
+                    ):
                         raise ValueError(
                             "Terminal or token-limit tickets cannot be released"
                         )
-                    if (
-                        ticket.tokens_used
-                        >= config.jira_worker_limits.tokens_per_ticket
+                    if ticket.tokens_used >= (
+                        delivery.budget.ticket_tokens
+                        if delivery
+                        else config.jira_worker_limits.tokens_per_ticket
                     ):
                         raise ValueError("Ticket token limit still applies")
                     last_release = (
@@ -726,17 +770,20 @@ async def release_parked_ticket(
                         == statuses.waiting_for_approval
                         and transition.get("toString") == statuses.in_progress
                     )
-                    if phase not in ("intake", "question", "limit", "approval") or not (
-                        (
-                            status in (statuses.to_do, statuses.waiting_for_input)
-                            and not approval_done
+                    if delivery is None and (
+                        phase not in ("intake", "question", "limit", "approval")
+                        or not (
+                            (
+                                status in (statuses.to_do, statuses.waiting_for_input)
+                                and not approval_done
+                            )
+                            or (
+                                phase == "approval"
+                                and status == statuses.waiting_for_approval
+                            )
+                            or worker_blocked
+                            or approved
                         )
-                        or (
-                            phase == "approval"
-                            and status == statuses.waiting_for_approval
-                        )
-                        or worker_blocked
-                        or approved
                     ):
                         raise ValueError(
                             "Unknown intake phase/status combination; reconcile before release"
@@ -778,7 +825,29 @@ async def release_parked_ticket(
                                     ),
                                 },
                             )
-                    if reason == UNACCEPTED_SERVICE:
+                    if delivery is not None:
+                        fields = version["fields"]
+                        service = (
+                            fields.get(delivery.service_field)
+                            if delivery.service_field
+                            else delivery.service
+                        )
+                        if isinstance(service, dict):
+                            service = service.get("value")
+                        if service not in {"Bug", "Feature", "Docs", "Other"}:
+                            raise ValueError(UNACCEPTED_SERVICE)
+                        reset_delivery_scope(
+                            ticket,
+                            delivery,
+                            service=service,
+                            supplied_url=ticket_repository_url(
+                                fields, delivery.repository_url_field
+                            ),
+                        )
+                        ticket.summary = str(fields.get("summary") or ticket.summary)
+                        ticket.description = _plain_text(fields.get("description"))
+                        ticket.status = status
+                    if reason == UNACCEPTED_SERVICE and delivery is None:
                         initialize_target(ticket, version["fields"], config)
                         if delivery_state(ticket) is None:
                             raise ValueError(UNACCEPTED_SERVICE)
@@ -789,6 +858,18 @@ async def release_parked_ticket(
                     )
                     ticket.jira_read_changelog_id = version["changelog_id"]
                     ticket.worker_parked_reason = None
+                    if delivery is not None and status == statuses.waiting_for_approval:
+                        await enqueue_ticket_command(
+                            session,
+                            config=config,
+                            ticket=ticket,
+                            command_key=f"admin-release:{ticket.id}:{request_id}:input",
+                            channel="jira",
+                            command="transition",
+                            body=statuses.waiting_for_input,
+                            predecessor=None,
+                            now=now,
+                        )
                     previous = set(ticket.admin_reasons or {})
                     reasons = dict(ticket.admin_reasons or {})
                     reasons.pop("parked", None)
@@ -809,6 +890,12 @@ async def release_parked_ticket(
                         "released_by": admin_user_id,
                         "released_at": now.isoformat(),
                         "previous_reason": reason,
+                        "request_id": request_id,
+                        "reason": release_reason,
+                        "previous_generation": generation_before,
+                        "previous_workflow_state": delivery.model_dump(mode="json")
+                        if delivery is not None
+                        else None,
                     },
                 )
                 session.add(receipt)
@@ -975,7 +1062,11 @@ async def _sync_admin_card(
         reasons = {
             str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
         }
-        needs_card = bool(reasons) or ticket.admin_card_event_id is not None
+        needs_card = (
+            bool(reasons)
+            or ticket.admin_card_event_id is not None
+            or delivery_state(ticket) is not None
+        )
         if not needs_card:
             await _consume_follow_ups(session, ticket.id)
         await session.commit()
@@ -992,7 +1083,11 @@ async def _sync_admin_card(
         reasons = {
             str(key): str(value) for key, value in (ticket.admin_reasons or {}).items()
         }
-        if not reasons and ticket.admin_card_event_id is None:
+        if (
+            not reasons
+            and ticket.admin_card_event_id is None
+            and delivery_state(ticket) is None
+        ):
             await _consume_follow_ups(session, ticket.id)
             await session.commit()
             return True
@@ -1008,6 +1103,7 @@ async def _sync_admin_card(
             room_url=_room_url(config, ticket.room_id),
             reasons=reasons,
         )
+        body += delivery_lines(ticket)
         event_id = ticket.admin_card_event_id or await board.find_card(room_id, marker)
         if event_id is None:
             event_id = await board.post_card(room_id, body=body)
@@ -1029,6 +1125,9 @@ async def wait_send_cancelled(
     statuses = config.jira_worker_statuses
     if ticket.status not in (statuses.waiting_for_input, statuses.waiting_for_approval):
         return True
+    delivery = delivery_state(ticket)
+    if delivery is not None and delivery.question is not None:
+        return delivery.answer is not None
     return (
         ticket.status == statuses.waiting_for_input
         and ticket.wait_anchor is not None
@@ -1092,6 +1191,9 @@ async def _latest_wait_reply(
     ticket: JiraWorkerTicket,
     after: datetime,
 ) -> datetime | None:
+    delivery = delivery_state(ticket)
+    if delivery is not None and delivery.question is not None:
+        return None
     if after.tzinfo is None:
         after = after.replace(tzinfo=UTC)
     matched = [JiraWorkerEvent.event_kind == EXPLICIT_INPUT]
@@ -1153,6 +1255,16 @@ async def _apply_wait(
     now: datetime,
     reasons: dict[str, str],
 ) -> None:
+    delivery = delivery_state(ticket)
+    if (
+        delivery is not None
+        and delivery.question is not None
+        and delivery.answer is not None
+    ):
+        ticket.wait_anchor = None
+        ticket.wait_fired = None
+        await _cancel_wait_commands(session, ticket)
+        return
     waiting_for_input = ticket.status == config.jira_worker_statuses.waiting_for_input
     waiting = waiting_for_input or (
         ticket.status == config.jira_worker_statuses.waiting_for_approval
@@ -1267,15 +1379,16 @@ async def _enqueue_blocked(
 ) -> None:
     if not ticket.jira_read_updated or not ticket.jira_read_changelog_id:
         raise _WaitNotReady()
-    command_id = await enqueue_jira_command(
+    command_id = await enqueue_ticket_command(
         session,
         config=config,
         ticket=ticket,
         command_key=f"wait-blocked:{ticket.id}:{anchor.isoformat()}",
+        channel="jira",
         command="transition",
-        data=config.jira_worker_statuses.blocked,
-        based_updated=ticket.jira_read_updated,
-        based_changelog_id=ticket.jira_read_changelog_id,
+        body=config.jira_worker_statuses.blocked,
+        predecessor=None,
+        now=anchor,
     )
     if command_id is None:
         raise _WaitNotReady()

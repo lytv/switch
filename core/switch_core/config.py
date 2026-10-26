@@ -27,6 +27,13 @@ class JiraWorkerDeliveryProject(BaseModel):
     )
 
 
+class JiraWorkerLanguagePricing(BaseModel):
+    """Conservative maximum price for each input, output or cached token."""
+
+    max_usd_per_token: Decimal = Field(gt=0)
+    price_source: str = Field(min_length=1, pattern=r"\S")
+
+
 class JiraWorkerStatuses(BaseModel):
     to_do: str = Field(default="To Do", min_length=1, pattern=r"\S")
     in_progress: str = Field(default="In Progress", min_length=1, pattern=r"\S")
@@ -199,6 +206,7 @@ class SwitchConfig(BaseSettings):
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
     jira_worker_delivery_execution_enabled: bool = False
+    jira_worker_delivery_language_pricing: JiraWorkerLanguagePricing | None = None
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
     # Jira REST credentials used only by the worker for polling and outbox writes.

@@ -15,9 +15,18 @@ from decimal import Decimal
 from typing import Literal, Protocol
 
 from pydantic import Field
-from sqlalchemy import Numeric, cast, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.accounting import (
+    LIVE_ROLES,
+    CapacityUnavailable,
+    accounting_lock,
+    day_cost,
+    day_limit,
+    live_role_sessions,
+    live_sessions,
+)
 from switch_core.bridges.jira.admin import _record_reason_alerts
 from switch_core.bridges.jira.contracts import (
     USD,
@@ -36,8 +45,6 @@ from switch_core.bridges.jira.firstmate_copy import SecretGuard, TaskObservation
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
 from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
 
-# Serialize admission and accounting across tickets, including at UTC midnight.
-_BUDGET_LOCK = 73429106
 _TERMINAL = {"done", "cancelled", "waiting_input", "error"}
 
 
@@ -72,6 +79,10 @@ class Execution(Contract):
     cost_by_day: dict[str, USD] = Field(default_factory=dict)
     usage_unknown: bool = True
     exit_confirmed: bool = False
+    progress: Handoff | None = None
+    progress_signatures: tuple[tuple[str, str, int], ...] = ()
+    prior_active_seconds: Count = 0
+    active_seconds: Count = 0
     rejection: Literal["cancelled", "stale_generation", "parked"] | None = None
 
 
@@ -151,7 +162,7 @@ class FirstmateJobs:
             await asyncio.sleep(0.05)
 
     async def _budget_lock(self, session: AsyncSession) -> None:
-        await session.execute(text(f"SELECT pg_advisory_xact_lock({_BUDGET_LOCK})"))
+        await accounting_lock(session)
 
     async def _row(self, session: AsyncSession, key: str) -> JiraWorkerJob:
         row = await session.scalar(
@@ -174,22 +185,7 @@ class FirstmateJobs:
         return ticket
 
     async def _day_cost(self, session: AsyncSession) -> Decimal:
-        payload = JiraWorkerJob.payload
-        day = self._clock().astimezone(UTC).date().isoformat()
-        result = await session.execute(
-            select(
-                func.coalesce(
-                    func.sum(
-                        func.coalesce(cast(payload["held_usd"].astext, Numeric), 0)
-                        + func.coalesce(
-                            cast(payload["cost_by_day"][day].astext, Numeric), 0
-                        )
-                    ),
-                    0,
-                )
-            ).where(JiraWorkerJob.kind == "role_job")
-        )
-        return result.scalar_one()
+        return await day_cost(session, self._clock())
 
     async def _reserve(
         self,
@@ -249,6 +245,13 @@ class FirstmateJobs:
                 or envelope.scope != state.scope
                 or not state.approvals
                 or state.unknown_spend
+                or job.run.attempt != state.attempts.get(job.run.step, 1)
+                or job.run.input_revision
+                != state.input_revisions.get(f"{job.run.step}/{job.run.attempt}", 0)
+                or envelope.resume_answer
+                != (state.answer if job.run.input_revision else None)
+                or envelope.reproduction_job != state.reproduction_job
+                or (state.question is not None and state.answer is None)
                 or (
                     job.run.step != "reproduce"
                     and envelope.reproduction != state.reproduction
@@ -269,7 +272,26 @@ class FirstmateJobs:
                 raise ValueError(
                     "Execution envelope lacks the frozen approval or reproduction"
                 )
-            budget = state.pack.snapshot.budget
+            roles = await live_role_sessions(session)
+            same_ticket = await session.scalar(
+                select(JiraWorkerJob.id)
+                .where(
+                    JiraWorkerJob.kind == "role_job",
+                    JiraWorkerJob.ticket_id == ticket.id,
+                    JiraWorkerJob.status.in_(LIVE_ROLES),
+                )
+                .limit(1)
+            )
+            if (
+                roles >= 2
+                or same_ticket is not None
+                or await live_sessions(session) >= 5
+            ):
+                ticket.queue_reason = "Delivery capacity: waiting for a model session"
+                await session.commit()
+                raise CapacityUnavailable(ticket.queue_reason)
+            ticket.queue_reason = None
+            budget = state.budget
             if (
                 ticket.tokens_used + state.reserved_tokens + reservation.tokens
                 > budget.ticket_tokens
@@ -278,13 +300,31 @@ class FirstmateJobs:
                 + reservation.estimated_usd
                 > budget.ticket_estimated_usd
                 or await self._day_cost(session) + reservation.estimated_usd
-                > budget.day_estimated_usd
+                > await day_limit(session, now, budget.day_estimated_usd)
             ):
                 raise ValueError(
                     "Delivery usage reservation exceeds the approved budget"
                 )
+            prior_seconds = 0
+            if envelope is not None and envelope.resume_answer is not None:
+                prior = await session.scalar(
+                    select(JiraWorkerJob).where(
+                        JiraWorkerJob.execution_key
+                        == envelope.resume_answer.question.run.execution_key
+                    )
+                )
+                if (
+                    prior is None
+                    or prior.status != "done"
+                    or not _execution(prior).exit_confirmed
+                ):
+                    raise ValueError(
+                        "Checkpoint resume requires the exited prior execution"
+                    )
+                prior_seconds = _execution(prior).active_seconds
             execution = Execution(
                 contract=job,
+                prior_active_seconds=prior_seconds,
                 envelope=envelope,
                 pack=state.pack.snapshot,
                 reservation=reservation,
@@ -302,6 +342,7 @@ class FirstmateJobs:
                     generation=job.run.generation,
                     execution_key=job.run.execution_key,
                     due_at=now,
+                    last_progress_at=now,
                     status="claimed",
                     payload=execution.model_dump(mode="json"),
                 )
@@ -447,6 +488,40 @@ class FirstmateJobs:
             terminal = row.status in _TERMINAL or row.result is not None
             result = observed.result
             handoff = observed.handoff
+            progress = execution.progress
+            progress_signatures = set(execution.progress_signatures)
+            if observed.progress is not None and not terminal:
+                incoming = observed.progress
+                self._secrets.check(incoming.model_dump_json())
+                checks = (
+                    {check.id: check for check in execution.envelope.scope.checks}
+                    if execution.envelope
+                    else {}
+                )
+                if incoming.input_digest != digest(execution.contract) or any(
+                    check.check_id not in checks
+                    or check.expected != checks[check.check_id].expected
+                    for check in incoming.checks
+                ):
+                    raise ValueError("Progress lacks approved execution evidence")
+
+                def signatures(value: Handoff | None) -> set[tuple[str, str, int]]:
+                    return (
+                        {
+                            (check.check_id, check.commit, check.exit_code)
+                            for check in value.checks
+                        }
+                        if value
+                        else set()
+                    )
+
+                progress_signatures.update(signatures(progress))
+                incoming_signatures = signatures(incoming)
+                if incoming_signatures - progress_signatures:
+                    row.last_progress_at = self._clock()
+                    progress = incoming
+                progress_signatures.update(incoming_signatures)
+            row.last_heartbeat_at = self._clock()
             if handoff is not None:
                 self._secrets.check(handoff.model_dump_json())
                 if handoff.input_digest != digest(execution.contract):
@@ -542,12 +617,25 @@ class FirstmateJobs:
                 execution,
                 known_tokens=known_tokens,
                 known_usd=known_usd,
+                active_seconds=execution.active_seconds
+                if execution.exit_confirmed
+                else execution.prior_active_seconds
+                + max(
+                    0,
+                    int(
+                        (
+                            self._clock() - datetime.fromisoformat(execution.started_at)
+                        ).total_seconds()
+                    ),
+                ),
                 held_tokens=held_tokens,
                 held_usd=held_usd,
                 cost_by_day=daily,
                 usage_unknown=not complete,
                 exit_confirmed=stopped,
                 rejection=rejection,
+                progress=progress.model_dump(mode="json") if progress else None,
+                progress_signatures=sorted(progress_signatures),
                 handoff=saved_handoff.model_dump(mode="json")
                 if saved_handoff
                 else None,
@@ -556,14 +644,15 @@ class FirstmateJobs:
             await session.flush()
             budget_stop = False
             if not terminal:
-                budget = pack.budget
+                budget = state.budget
                 exceeded = (
                     known_tokens > execution.reservation.tokens
                     or known_usd > execution.reservation.estimated_usd
                     or ticket.tokens_used + state.reserved_tokens > budget.ticket_tokens
                     or state.known_estimated_usd + state.reserved_estimated_usd
                     > budget.ticket_estimated_usd
-                    or await self._day_cost(session) > budget.day_estimated_usd
+                    or await self._day_cost(session)
+                    > await day_limit(session, self._clock(), budget.day_estimated_usd)
                 )
                 budget_stop = exceeded or (
                     not stopped
@@ -616,6 +705,20 @@ class FirstmateJobs:
                         "delivery_uncertain",
                         "Task dispatch has no confirmed running receipt",
                     )
+            if (
+                row.status == "running"
+                and row.last_progress_at is not None
+                and (self._clock() - row.last_progress_at).total_seconds() >= 1200
+            ):
+                ticket.worker_parked_reason = "delivery_idle"
+                _reason(
+                    ticket,
+                    "delivery_idle",
+                    "No new check evidence for twenty active minutes; admin review required",
+                )
+                row.cancel_requested_at = row.cancel_requested_at or self._clock()
+                row.status = "cancel_requested"
+                budget_stop = True
             if stopped and not complete:
                 ticket.worker_parked_reason = (
                     ticket.worker_parked_reason or "delivery_usage_unknown"
@@ -627,10 +730,7 @@ class FirstmateJobs:
                 )
             if (
                 row.status == "running"
-                and (
-                    self._clock() - datetime.fromisoformat(execution.started_at)
-                ).total_seconds()
-                >= 2 * execution.estimate_seconds
+                and execution.active_seconds >= 2 * execution.estimate_seconds
             ):
                 _reason(
                     ticket,
@@ -640,7 +740,7 @@ class FirstmateJobs:
             unknown = await session.scalar(
                 select(func.count()).where(
                     JiraWorkerJob.ticket_id == ticket.id,
-                    JiraWorkerJob.kind == "role_job",
+                    JiraWorkerJob.kind.in_(("role_job", "orchestrator_turn")),
                     JiraWorkerJob.payload["usage_unknown"].astext == "true",
                 )
             )

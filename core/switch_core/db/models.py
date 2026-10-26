@@ -1205,7 +1205,7 @@ class JiraWorkerJob(Base):
         CheckConstraint(
             "kind <> 'role_job' OR (ticket_id IS NOT NULL "
             "AND execution_key IS NOT NULL AND generation IS NOT NULL AND generation > 0 "
-            "AND execution_key ~ '^[^/]+/[1-9][0-9]*/(reproduce|fix|review|qa|smoke)/[1-9][0-9]*$' "
+            "AND execution_key ~ '^[^/]+/[1-9][0-9]*/(reproduce|fix|review|qa|smoke)/[1-9][0-9]*(/input/[1-9][0-9]*)?$' "
             "AND split_part(execution_key, '/', 1) = ticket_id "
             "AND split_part(execution_key, '/', 2) = generation::text)",
             name="ck_jira_worker_role_identity",

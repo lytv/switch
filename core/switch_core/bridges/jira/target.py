@@ -83,6 +83,60 @@ def initialize_target(
     ticket.workflow_state = state.model_dump(mode="json")
 
 
+def reset_delivery_scope(
+    ticket: JiraWorkerTicket,
+    state: DeliveryWorkflowState,
+    *,
+    service: str,
+    supplied_url: str,
+) -> None:
+    """Retain cumulative accounting and frozen policy, but require new triage and approval."""
+    data = {
+        key: state.model_dump(mode="json")[key]
+        for key in (
+            "pack",
+            "service_field",
+            "repository_url_field",
+            "statuses",
+            "transitions",
+            "reserved_tokens",
+            "reserved_estimated_usd",
+            "known_estimated_usd",
+            "unknown_spend",
+            "budget_override",
+        )
+    }
+    data.update(
+        service=service,
+        repository=Repository(
+            supplied_url=supplied_url,
+            outcome="unknown",
+            canonical_url=None,
+            base_branch=None,
+            base_sha=None,
+            evidence="Fresh repository triage required before scope approval",
+        ).model_dump(mode="json")
+        if supplied_url
+        else None,
+    )
+    ticket.workflow_state = DeliveryWorkflowState.model_validate_json(
+        json.dumps(data)
+    ).model_dump(mode="json")
+    ticket.service_value = service
+    ticket.agent_generation += 1
+    intake = ticket.intake_state or {}
+    ticket.intake_state = {
+        "phase": "intake",
+        "cycle": intake.get("cycle", 0) + 1,
+        "questions": 0,
+        "history": intake.get("history", []),
+    }
+    ticket.agent_state = "wake_requested"
+    ticket.wait_anchor = None
+    ticket.wait_fired = None
+    ticket.wake_at = None
+
+
 def check_target_fields(
     ticket: JiraWorkerTicket, fields: dict[str, Any], *, complete: bool
 ) -> None:

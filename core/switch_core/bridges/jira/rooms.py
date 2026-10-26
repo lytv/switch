@@ -34,6 +34,7 @@ from switch_core.bridges.jira.activity import (
     ticket_turn_lock,
 )
 from switch_core.bridges.jira.admin import enqueue_admin_card_follow_up
+from switch_core.bridges.jira.projection import delivery_lines
 from switch_core.bridges.jira.worker import (
     SYNC_TICKET_ROOM_COMMAND,
     is_terminal_ticket_status,
@@ -204,7 +205,7 @@ async def _render_card(
         status=ticket.status,
         reporter_label=await _reporter_label(session, rooms, switch_user_id),
         issue_url=rooms.issue_url(instance=ticket.instance, issue_key=ticket.issue_key),
-    )
+    ) + delivery_lines(ticket)
 
 
 async def _relock_ticket(

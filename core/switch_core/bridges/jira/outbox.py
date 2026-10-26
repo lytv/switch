@@ -27,7 +27,7 @@ from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
 from switch_core.config import SwitchConfig
-from switch_core.db.models import JiraWorkerOutbox, JiraWorkerTicket
+from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
 
 if TYPE_CHECKING:
     from switch_core.bridges.jira.rooms import TicketRooms
@@ -450,6 +450,45 @@ class JiraOutboxSender:
         ):
             return
         payload = row.payload or {}
+        if row.status != "sending" and (
+            "delivery_question" in payload or "delivery_progress_execution" in payload
+        ):
+            state = workflow_state_adapter.validate_json(
+                json.dumps(ticket.workflow_state)
+            )
+            valid = False
+            if (
+                isinstance(state, DeliveryWorkflowState)
+                and not ticket.worker_parked_reason
+            ):
+                valid = True
+                if "delivery_question" in payload:
+                    valid = bool(
+                        state.question is not None
+                        and {
+                            "id": state.question.id,
+                            "execution_key": state.question.run.execution_key,
+                        }
+                        == payload["delivery_question"]
+                        and (state.answer is not None) == payload["requires_answer"]
+                    )
+                if "delivery_progress_execution" in payload:
+                    execution = await session.scalar(
+                        select(JiraWorkerJob).where(
+                            JiraWorkerJob.execution_key
+                            == payload["delivery_progress_execution"]
+                        )
+                    )
+                    valid = bool(
+                        execution is not None
+                        and execution.status == "running"
+                        and state.question is None
+                    )
+            if not valid:
+                row.status = "cancelled"
+                row.error = "Delivery question or progress phase ended before send"
+                await session.commit()
+                return
         if row.status != "sending" and row.command == "transition_by_id":
             try:
                 check_transition_fence(ticket, payload["data"])
