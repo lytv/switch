@@ -734,9 +734,7 @@ async def test_uncertain_publication_discovers_existing_side_effects(
 
 
 @pytest.mark.parametrize("status", ["uncertain", "pushing"])
-async def test_uncertain_push_retries_only_after_fresh_absence(
-    session_factory, status
-):
+async def test_uncertain_push_retries_only_after_fresh_absence(session_factory, status):
     jira = DeliveryJira()
     scope, _, _, forge, publisher = await candidate(session_factory, jira)
     forge.fail_push = True
