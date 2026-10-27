@@ -131,21 +131,24 @@ class JiraBridgeService:
 
         await self._prune_delivery_log()
 
-    async def record_worker_intake(
+    async def persist_worker_intake(
         self,
         *,
         instance: str,
         event: NormalizedTriggerEvent,
         webhook_identifier: str | None,
-    ) -> None:
-        """Record worker intake and reconcile its ticket room when enabled.
+    ) -> bool:
+        """Durably record one webhook event. Returns True when the event was new.
 
-        Returns immediately when the event's project is not enabled, leaving
-        the existing bridge behaviour unchanged."""
+        Commits before returning so the route can answer 202 only after the
+        acknowledged event survives a restart. Duplicate deliveries and
+        disabled projects return False without writing. Raises on storage
+        failure so the route answers 503 and Jira retries. Performs no room
+        or bridge I/O."""
         if not is_worker_enabled(self._config, instance, event.project):
-            return
+            return False
         async with self._session_factory() as session:
-            await record_webhook_event(
+            recorded = await record_webhook_event(
                 session,
                 event,
                 instance=instance,
@@ -156,15 +159,37 @@ class JiraBridgeService:
                 config=self._config,
             )
             await session.commit()
+            return recorded
+
+    async def sync_worker_room(self, *, instance: str, issue_key: str) -> None:
+        """Reconcile one ticket room. Safe to run as a background task."""
         await sync_ticket_room(
             self._session_factory,
             instance=instance,
-            issue_key=event.key,
+            issue_key=issue_key,
             rooms=self._ticket_rooms,
             jira_agent_name=self._config.jira_agent_name,
             cards=self._card_updater,
             config=self._config,
         )
+
+    async def record_worker_intake(
+        self,
+        *,
+        instance: str,
+        event: NormalizedTriggerEvent,
+        webhook_identifier: str | None,
+    ) -> None:
+        """Record worker intake and reconcile its ticket room when enabled.
+
+        Returns immediately when the event's project is not enabled, leaving
+        the existing bridge behaviour unchanged. Room reconcile runs only for
+        newly recorded events; redeliveries converge through the scheduler
+        sweep and the backup poll."""
+        if await self.persist_worker_intake(
+            instance=instance, event=event, webhook_identifier=webhook_identifier
+        ):
+            await self.sync_worker_room(instance=instance, issue_key=event.key)
 
     async def _resolve_jira_agent(self) -> str | None:
         async with self._session_factory() as session:

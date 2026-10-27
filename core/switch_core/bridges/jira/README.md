@@ -626,3 +626,98 @@ five-question budget.
 Any accompanying human field change, unrelated comment, or
 existing human park still stops the worker. The worker never clears that park.
 Role agents, code work, routing, attachments, and linked tickets remain out of scope.
+
+## Hardening and recovery
+
+This section is the step 8 record: what must hold across component faults,
+how to verify it, and how to stop safely. New proofs live in
+`core/tests/switch_core/bridges/jira/test_hardening.py`; older proofs are
+referenced, not duplicated.
+
+### Fault matrix
+
+| Cell | Fault | Required behavior | Proof |
+| --- | --- | --- | --- |
+| WH-1 | Webhook accepted | The comment event row commits before HTTP 202 | `test_hardening.py` WH-1 |
+| WH-2 | Webhook redelivered | Second delivery stays 202 with one event row | `test_hardening.py` WH-2 |
+| WH-3 | Storage down at webhook | 503, no 202, no rule fan-out, Jira retries | `test_hardening.py` WH-3, `test_routes.py` 503 |
+| WH-4 | Wrong or missing secret | 401; the provided value appears in no log or body | `test_hardening.py` WH-4, `test_auth.py` |
+| CG-1 | Unknown job kind claimed | Handler leaves the row claimed; never resolves it | `test_hardening.py` CG-1 |
+| CG-2 | Scheduler pass with new rows | Pending `role_job` and unknown rows stay pending | `test_worker.py` unrecognized-kinds test |
+| CG-3 | Downgrade with delivery rows | Migration refuses while version 2 records exist | `test_worker.py` downgrade-refusal test |
+| HU-1 | Human Done during a live role | Cancel, fence, park; no late result advances | `test_delivery_close.py` human-done test |
+| HU-2 | Human close during review | Records `closed_by_human`, never agent delivery | `test_delivery_close.py` human-close test |
+| HU-3 | Head change before acceptance | Acceptance and completion block on the new head | `test_delivery_close.py` send-time head tests |
+| HU-4 | Dirty gate history | Parks; chat and room text never authorize work | `test_delivery.py` gate-fence tests |
+| RS-1 | Crash before Firstmate start | Reservation kept; retry reuses the execution key | `test_firstmate_jobs.py` crash-before-reservation test |
+| RS-2 | Crash after ambiguous spawn | `uncertain`, reservation held, no repeat spawn | `test_firstmate_jobs.py` ambiguous-start test |
+| RS-3 | Fresh supervisor after publish | Resumes by receipt; no duplicate draft or request | `test_delivery_close.py` fresh-supervisor test |
+| RS-4 | Restart across a reminder | One reminder; unknown sends never replay | `test_admin.py` reminder-restart tests |
+| CN-1 | Cancel during start | Intent commits before the launch call returns | `test_firstmate_jobs.py` cancel-during-start test |
+| CN-2 | Corrupt result artifact | Cancellation still lands; usage still reconciles | `test_firstmate_jobs.py` corrupt-artifact test |
+| SC-1 | Crafted brief or environment | Credentials never enter task homes or processes | `test_firstmate_jobs.py` credentials test |
+
+Untested boundaries (honest gaps): live AGD approval refusal, real provider
+metering at the spend limit, OS-level sandboxing of checkouts, and actual
+Jira/forge latency or duplication. The pilot gate must prove those live.
+
+### Isolation checklist
+
+- Each execution receives its own Firstmate home, OS HOME directory, and tmux
+  server under a worker-homes root admitted only by the
+  `.switch-delivery-workers` marker file. No checkout is shared between the
+  dev, review, QA, and smoke contexts.
+- Review and QA checkouts are read-only views at the frozen candidate SHA;
+  only the trusted publisher writes, and only the open draft branch.
+- Credentials live in the supervisor process. The adapter injects every
+  configured secret into `SecretGuard.forbidden_values` and rejects task
+  briefs, environments, envelopes, handoffs, results, usage, and progress
+  that contain them.
+
+### Cancellation ordering
+
+Cancel commits `cancel_requested_at` first, then waits for the in-flight
+launch or control call. Reconcile stops the native task before reading any
+artifact, so a result that arrives after cancellation is fenced as stale
+while its known usage is still accounted. Terminal accepted results never
+change after later cancellation, generation, park, or budget events.
+
+### Durable webhook behavior
+
+`POST /integrations/jira/{instance}` authenticates the shared header, parses
+the payload, then awaits `persist_worker_intake` before answering 202. The
+event row (idempotency key, ticket upsert) commits in that await. Only then
+do rule fan-out and room reconcile run as background tasks. Storage failure
+returns 503 so Jira retries; nothing is acknowledged and nothing fans out.
+Redeliveries return 202 without a second row or a second room sync; missed
+room state converges through the scheduler sweep and the backup poll.
+
+### Compatibility guard
+
+The scheduler claims only `watermark_poll` jobs, and its unknown-kind branch
+logs an error and leaves the row exactly as claimed. Downgrade migrations
+refuse while any version 2 workflow or execution record exists. This guard
+ships with the new binary: binaries built before step 8 predate it, so never
+assume an old binary enforces it. During rollback keep the schema, disable
+admission first, and cancel active tasks before touching code.
+
+### Disable and rollback runbook
+
+1. Set `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=false` and restart. No new
+   role job starts; intake-only behavior continues.
+2. Cancel each active execution through the delivery supervisor (or
+   `FirstmateJobs.cancel`); confirm `cancelled` or `uncertain` state.
+3. Reconcile every `uncertain` row: match receipts, branches, and remote
+   evidence by execution key before releasing capacity.
+4. Confirm no `role_job` row is pending, claimed, running, waiting, or
+   uncertain; only then consider a code rollback.
+5. Never drop new columns or erase usage, packs, or audit data. Version 1
+   legacy intake keeps working where its project policy allows it.
+
+### Remaining limits
+
+Two role jobs globally, one live role per ticket, five live sessions total,
+200000 tokens and the configured USD estimates per ticket, five delivery
+questions per generation, three attempts per step, two rework cycles. At
+twice the time estimate the worker alerts and continues within hard budgets.
+Unknown spend always retains its reservation and parks the ticket.

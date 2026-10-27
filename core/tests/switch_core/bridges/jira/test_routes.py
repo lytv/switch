@@ -63,7 +63,7 @@ class TestJiraWebhookRoute:
         )
         assert resp.status_code == 401
 
-    def test_valid_secret_returns_202_and_processes(self) -> None:
+    def test_valid_secret_returns_202_and_persists_before_accept(self) -> None:
         service = AsyncMock()
         client = _client({"acme": "s3cret"}, service)
         resp = client.post(
@@ -73,7 +73,8 @@ class TestJiraWebhookRoute:
         )
         assert resp.status_code == 202
         assert resp.json()["status"] == "accepted"
-        service.process_event.assert_awaited()
+        service.persist_worker_intake.assert_awaited_once()
+        service.process_event.assert_awaited_once()
 
     def test_worker_intake_uses_authenticated_instance_and_header_key(self) -> None:
         service = AsyncMock()
@@ -87,9 +88,22 @@ class TestJiraWebhookRoute:
             },
         )
         assert response.status_code == 202
-        service.record_worker_intake.assert_awaited_once_with(
+        service.persist_worker_intake.assert_awaited_once_with(
             instance="acme", event=ANY, webhook_identifier="atlassian-event-1"
         )
+
+    def test_persistence_failure_returns_503_and_skips_fan_out(self) -> None:
+        service = AsyncMock()
+        service.persist_worker_intake.side_effect = RuntimeError("db is down")
+        client = _client({"acme": "s3cret"}, service)
+        response = client.post(
+            "/integrations/jira/acme",
+            json=_payload(),
+            headers={SECRET_HEADER: "s3cret"},
+        )
+        assert response.status_code == 503
+        service.process_event.assert_not_called()
+        service.sync_worker_room.assert_not_called()
 
     def test_malformed_payload_400(self) -> None:
         service = AsyncMock()

@@ -1254,7 +1254,16 @@ class JiraWorkerScheduler:
 
     async def _handle_job(self, job: JiraWorkerJob) -> None:
         if job.kind != POLL_JOB_KIND:
-            logger.warning("Jira worker ignoring unknown job kind %r", job.kind)
+            # Compatibility guard: this scheduler only consumes watermark polls.
+            # Role executions and future job kinds stay untouched so an old or
+            # new binary never resolves work it does not understand. The claim
+            # filter in run_once() is the primary fence; this branch pins the
+            # fallback to leave the row exactly as claimed.
+            logger.error(
+                "Jira worker refusing unknown job kind %r (job %s); leaving claimed",
+                job.kind,
+                job.id,
+            )
             return
         await self._handle_poll_job(job)
 
