@@ -337,23 +337,41 @@ def test_readiness_cli_refuses_invalid_input_without_disclosing_it(
 def test_every_pilot_case_and_required_subrun_has_an_evidence_place():
     root = Path(__file__).resolve().parents[5] / "docs" / "jira-delivery-pilot"
     index = (root / "evidence-index.md").read_text()
+    rows = [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in index.splitlines()
+        if line.startswith("|")
+    ]
+    case_places = {cells[0]: cells[2] for cells in rows if len(cells) == 4}
     for case in range(1, 21):
-        assert f"V2-P{case:02d}" in index
-        assert f"P{case:02d}/result.md" in index
-    for subrun in (
-        "P09/reproduce",
-        "P09/fix",
-        "P09/review",
-        "P09/qa",
-        "P09/smoke",
-        "P15/A",
-        "P15/B",
-        "P15/C",
-        "P19/A",
-        "P19/A2",
-        "P19/B",
-        "P19/C",
-        "P19/D",
-    ):
-        assert subrun in index
+        assert case_places[f"V2-P{case:02d}"] == f"P{case:02d}/result.md"
+    required_subruns = {
+        "P0": [f"{number:02d}" for number in range(1, 13)],
+        "P04": "question restart unrelated answer".split(),
+        "P09": "reproduce fix review qa smoke".split(),
+        "P10": "intake reproduce fix review qa accept merge smoke reopen".split(),
+        "P11": "create approval concurrent stale-generation publication".split(),
+        "P12": "launch result publication worker-loss".split(),
+        "P13": "ticket repository hooks output traversal symlink oversize credential-url digest".split(),
+        "P14": "capacity token ticket-cost day-cost unknown rollover budget-request resume disable-start disable-retry disable-resume disable-running".split(),
+        "P15": "A B C".split(),
+        "P16": "reminder alert blocked restart".split(),
+        "P17": "rate-limit jira-unknown forge-unknown".split(),
+        "P18": "wrong-place chat-scope chat-candidate unmapped".split(),
+        "P19": "A A2 B C D".split(),
+        "P20": "unmerged head-change failed-smoke".split(),
+    }
+    subrun_places = {cells[0]: cells[1] for cells in rows if len(cells) == 2}
+    for case, subruns in required_subruns.items():
+        tokens = subrun_places[case].replace(",", " ").replace(";", " ").split()
+        allocated = {token for token in tokens if token.startswith(f"{case}/")}
+        if tokens[1] == "through":
+            first_case, first = tokens[0].split("/")
+            last_case, last = tokens[2].split("/")
+            assert first_case == last_case == case
+            allocated = {
+                f"{case}/{number:02d}" for number in range(int(first), int(last) + 1)
+            }
+        expected = {f"{case}/{subrun}" for subrun in subruns}
+        assert expected <= allocated, expected - allocated
     assert "Not run" in index
