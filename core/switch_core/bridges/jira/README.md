@@ -1,5 +1,9 @@
 # Jira ticket activity
 
+For isolated readiness checks, evidence templates, and the final human pilot gate,
+use the [delivery pilot procedure](../../../../docs/jira-delivery-pilot/README.md).
+Live results require separate authorization.
+
 The ticket worker remains off by default. `JIRA_WORKER_ENABLED_PROJECTS` enables
 projects by Jira instance. `JIRA_WORKER_LIMITS` accepts a JSON object with these
 positive integer values:
