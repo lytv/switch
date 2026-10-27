@@ -184,8 +184,8 @@ class ClosingForge(ForgeDouble):
         assert candidate.verdict == "PASS"
 
 
-async def setup(sessions, jira):
-    scope = await seed(sessions)
+async def seed_verification_scope(sessions, *, ready=True):
+    scope = await seed(sessions, ready=ready)
     roles = {}
     for step in ("review", "qa", "smoke"):
         content = f"Switch {step} profile. Return typed evidence. Never edit or push."
@@ -227,6 +227,11 @@ async def setup(sessions, jira):
             }
         ).model_dump(mode="json")
         await session.commit()
+    return scope
+
+
+async def setup(sessions, jira):
+    scope = await seed_verification_scope(sessions)
     process, forge = Verifier(), ClosingForge()
     activity, supervisor, _, _, publisher = services(
         sessions, jira, process=process, forge=forge
