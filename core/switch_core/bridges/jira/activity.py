@@ -242,6 +242,43 @@ class TurnResult:
     wake_at: datetime | None
 
 
+class MeasuredTurnError(ValueError):
+    def __init__(
+        self, message: str, tokens_used: int, response: dict[str, Any]
+    ) -> None:
+        super().__init__(message)
+        self.tokens_used = tokens_used
+        self.response = response
+
+
+def _record_turn_usage(
+    ticket: JiraWorkerTicket, job: JiraWorkerJob, tokens_used: int, now: datetime
+) -> None:
+    ticket.tokens_used += tokens_used
+    target = delivery_state(ticket)
+    if target is not None and job.payload is not None and "held_usd" in job.payload:
+        payload = job.payload
+        known_usd = Decimal(payload["max_usd_per_token"]) * tokens_used
+        if tokens_used > payload["held_tokens"]:
+            park_ticket(ticket, "Delivery language usage exceeded its reservation")
+        ticket.workflow_state = {
+            **target.model_dump(mode="json"),
+            "reserved_tokens": target.reserved_tokens - payload["held_tokens"],
+            "reserved_estimated_usd": str(
+                target.reserved_estimated_usd - Decimal(payload["held_usd"])
+            ),
+            "known_estimated_usd": str(target.known_estimated_usd + known_usd),
+            "unknown_spend": False,
+        }
+        job.payload = {
+            **payload,
+            "held_tokens": 0,
+            "held_usd": "0",
+            "usage_unknown": False,
+            "cost_by_day": {now.astimezone(UTC).date().isoformat(): str(known_usd)},
+        }
+
+
 Orchestrator = Callable[[TicketTurn], Awaitable[TurnResult]]
 
 
@@ -937,8 +974,9 @@ class TicketActivity:
                         raise ValueError(
                             "Orchestrator wake time must include a timezone"
                         )
-                except BaseException:
+                except BaseException as exc:
                     async with self._factory() as session:
+                        await accounting_lock(session)
                         ticket = await session.get(
                             JiraWorkerTicket, ticket_id, with_for_update=True
                         )
@@ -946,6 +984,21 @@ class TicketActivity:
                         assert ticket is not None and job is not None
                         job.status = "error"
                         job.error = TURN_FAILED
+                        if (
+                            isinstance(exc, MeasuredTurnError)
+                            and delivery_state(ticket) is not None
+                            and job.payload is not None
+                            and "held_usd" in job.payload
+                        ):
+                            _record_turn_usage(
+                                ticket, job, exc.tokens_used, self._clock()
+                            )
+                            job.error = "Language decision failed with known usage; admin release required"
+                            job.payload = {
+                                **job.payload,
+                                "failed_response": exc.response,
+                                "failure": str(exc),
+                            }
                         park_ticket(ticket, job.error)
                         await session.commit()
                     raise
@@ -1131,37 +1184,8 @@ class TicketActivity:
             job = await session.get(JiraWorkerJob, job_id)
             assert ticket is not None and job is not None
             job.status = "done"
-            ticket.tokens_used += result.tokens_used
+            _record_turn_usage(ticket, job, result.tokens_used, self._clock())
             target = delivery_state(ticket)
-            if (
-                target is not None
-                and job.payload is not None
-                and "held_usd" in job.payload
-            ):
-                payload = job.payload
-                known_usd = Decimal(payload["max_usd_per_token"]) * result.tokens_used
-                if result.tokens_used > payload["held_tokens"]:
-                    park_ticket(
-                        ticket, "Delivery language usage exceeded its reservation"
-                    )
-                ticket.workflow_state = {
-                    **target.model_dump(mode="json"),
-                    "reserved_tokens": target.reserved_tokens - payload["held_tokens"],
-                    "reserved_estimated_usd": str(
-                        target.reserved_estimated_usd - Decimal(payload["held_usd"])
-                    ),
-                    "known_estimated_usd": str(target.known_estimated_usd + known_usd),
-                    "unknown_spend": False,
-                }
-                job.payload = {
-                    **payload,
-                    "held_tokens": 0,
-                    "held_usd": "0",
-                    "usage_unknown": False,
-                    "cost_by_day": {
-                        self._clock().astimezone(UTC).date().isoformat(): str(known_usd)
-                    },
-                }
             token_limit = (
                 target.budget.ticket_tokens
                 if target

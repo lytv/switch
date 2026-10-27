@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from switch_core.bridges.jira.activity import TicketTurn, TurnResult
+from switch_core.bridges.jira.activity import MeasuredTurnError, TicketTurn, TurnResult
 from switch_core.bridges.jira.admin import (
     INTAKE_LIMIT_DETAIL,
     INTAKE_REASON,
@@ -68,6 +68,18 @@ class RetryableModelError(Exception):
         self.retry_after = retry_after
 
 
+class IncompleteModelDecision(MeasuredTurnError):
+    def __init__(
+        self,
+        message: str,
+        tokens_used: int,
+        response: dict[str, Any],
+        retry_after: str | None,
+    ) -> None:
+        super().__init__(message, tokens_used, response)
+        self.retry_after = retry_after
+
+
 def _model_retry_delay(
     retry_after: str | None, attempts: int, now: datetime
 ) -> timedelta:
@@ -118,7 +130,9 @@ Never approve scope, select a repository, grant tools or increase budgets.
             data,
             token_budget,
             prompt,
-            ("question", "answer", "clarify", "scope_change", "unrelated"),
+            ("answer", "clarify", "scope_change", "unrelated")
+            if data["replies"]
+            else ("question",),
         )
 
     async def _decide(
@@ -163,9 +177,8 @@ Never approve scope, select a repository, grant tools or increase budgets.
                     f"HTTP {status}", 0, exc.response.headers.get("Retry-After")
                 ) from exc
             raise
-        choice = result["choices"][0]
         usage = result.get("usage")
-        if choice["finish_reason"] != "stop" and usage is None:
+        if usage is None and result["choices"][0]["finish_reason"] != "stop":
             raise RetryableModelError(
                 "Intake model did not finish its decision",
                 0,
@@ -187,18 +200,29 @@ Never approve scope, select a repository, grant tools or increase budgets.
             raise ValueError(
                 "Intake model violated its token budget or tokenizer contract"
             )
-        if choice["finish_reason"] != "stop":
-            raise RetryableModelError(
-                "Intake model did not finish its decision",
-                total,
-                response.headers.get("Retry-After"),
-            )
-        decision = json.loads(choice["message"]["content"])
-        if not isinstance(decision, dict) or set(decision) != {"action", "content"}:
-            raise ValueError("Intake model must return one action and content")
-        action, content = decision["action"], decision["content"]
-        if action not in actions or not isinstance(content, str) or not content.strip():
-            raise ValueError("Intake model returned an invalid decision")
+        try:
+            choice = result["choices"][0]
+            if choice["finish_reason"] != "stop":
+                raise IncompleteModelDecision(
+                    "Intake model did not finish its decision",
+                    total,
+                    result,
+                    response.headers.get("Retry-After"),
+                )
+            decision = json.loads(choice["message"]["content"])
+            if not isinstance(decision, dict) or set(decision) != {"action", "content"}:
+                raise ValueError("Intake model must return one action and content")
+            action, content = decision["action"], decision["content"]
+            if (
+                action not in actions
+                or not isinstance(content, str)
+                or not content.strip()
+            ):
+                raise ValueError("Intake model returned an invalid decision")
+        except MeasuredTurnError:
+            raise
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            raise MeasuredTurnError(str(exc), total, result) from exc
         return IntakeDecision(action, content.strip(), total)
 
 
@@ -295,7 +319,7 @@ class IntakeOrchestrator:
                     },
                     turn.token_budget,
                 )
-            except RetryableModelError as exc:
+            except (RetryableModelError, IncompleteModelDecision) as exc:
                 if target is not None:
                     raise
                 failure = exc
