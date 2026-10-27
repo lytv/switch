@@ -25,17 +25,17 @@ private repository addresses, account identifiers, or unsanitized logs here.
    The command reads configuration and a scope file. It never contacts Jira,
    opens a database, enables delivery, changes a setting, or starts a job.
    It reports each local check and returns nonzero on any blocker.
-   It validates the existing pack, not a replacement pack or a new release pin.
+   It validates the selected immutable pack and its digest pin.
    Scope validation includes bounded commands, paths, repository triage pins,
    role profile digests, reservations, and the unique approval route.
-   Price configuration covers the language upper bound. Role reservations must
-   separately name approved price sources and retain trusted metering evidence.
+   With the live pack, it also validates the server runtime, pinned Firstmate and pi,
+   trusted policy, and role reservations against the configured price table.
 
-**Current refusal is intentional:** the only bundled pack is fixture-only.
-The default server entry point supplies no delivery factory. Local checks cannot
-certify live workflow restrictions, sandboxing, provider metering, or permissions.
-Do not change the pack, model, budgets, or server integration to bypass this refusal.
-Record these prerequisites as Blocked until separately approved work resolves them.
+The default fixture pack still refuses `live_pack`. Select the live pack and runtime
+with the [local setup procedure](local-setup.md). A configured live setup passes every
+local item except `live_prerequisites`. That item stays blocked until P0 evidence exists.
+Local checks cannot certify live workflow restrictions, sandboxing, provider limit
+behavior, or permissions. Do not change the pack, model, or budgets to bypass a refusal.
 
 ## Shared preflight P0
 

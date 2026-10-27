@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -408,6 +408,7 @@ class DeliverySupervisor:
         jobs: FirstmateJobs,
         publisher: DraftPublisher,
         clock: Callable[[], datetime],
+        admission: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._sessions = session_factory
         self._config = config
@@ -415,6 +416,7 @@ class DeliverySupervisor:
         self._jobs = jobs
         self._publisher = publisher
         self._clock = clock
+        self._admission = admission
 
     async def authorize_command(self, ticket: JiraWorkerTicket) -> bool:
         return await self._publisher.authorize_command(ticket)
@@ -531,6 +533,8 @@ class DeliverySupervisor:
             return
         if not await self._activity.read_ticket(ticket_id, force_jira=True):
             return
+        if self._admission is not None:
+            await self._admission(ticket_id)
         async with self._sessions() as session:
             ticket = await session.get(JiraWorkerTicket, ticket_id)
             assert ticket is not None

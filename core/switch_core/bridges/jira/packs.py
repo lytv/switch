@@ -26,16 +26,18 @@ class FrozenPack(Contract):
 
 
 def load_pack(config: SwitchConfig) -> FrozenPack:
-    """Check the historical fixture before freezing user-configured budgets."""
+    """Check the immutable release before freezing user-configured budgets."""
+    version = config.jira_worker_delivery_pack
     source = files("switch_core.bridges.jira").joinpath(
-        "packs/delivery/2.0.0-draft.json"
+        f"packs/delivery/{version}.json"
     )
     pack = Pack.model_validate_json(source.read_text(encoding="utf-8"))
-    if (
-        digest(pack)
-        != "965793653f39572b8b0a85134ef1ebeb5c0a77c19cbe81cc689354166d428fbf"
-    ):
-        raise ValueError("Historical delivery@2.0.0-draft pack changed")
+    pins = {
+        "2.0.0-draft": "965793653f39572b8b0a85134ef1ebeb5c0a77c19cbe81cc689354166d428fbf",
+        "2.0.0": "aa1e6a26ec686cd0097d6fe416258cac5989029511dca798fbb34e94314a07b6",
+    }
+    if digest(pack) != pins[version]:
+        raise ValueError(f"Historical immutable delivery@{version} pack changed")
     budget = Budget(
         ticket_tokens=config.jira_worker_delivery_ticket_tokens,
         ticket_estimated_usd=config.jira_worker_delivery_ticket_estimated_usd,

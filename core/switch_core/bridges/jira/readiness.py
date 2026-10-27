@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from switch_core.bridges.jira.delivery_contracts import ScopeContract
+from switch_core.bridges.jira.delivery_contracts import ScopeContract, ScopePolicy
+from switch_core.bridges.jira.live import load_policies, runtime_config
 from switch_core.bridges.jira.packs import load_pack
 from switch_core.config import SwitchConfig
 
@@ -44,7 +45,7 @@ def check_readiness(
         else "The scope lacks review, QA, smoke, and completion configuration.",
         "live_prerequisites": (
             "Not checked: authorization, live refusal/bypass tests, automation, "
-            "sandbox, metering, delivery factory, permissions, channels, and waits. "
+            "OS sandbox, provider limit behavior, permissions, channels, and waits. "
             "Complete pilot P0 separately."
         ),
     }
@@ -65,6 +66,24 @@ def check_readiness(
             "The pack is fixture-only; live delivery is not supported by this pack."
             if pack.snapshot.fixture_only
             else None
+        )
+    try:
+        runtime = runtime_config(config)
+        policies = load_policies(config, runtime)
+    except (ValueError, OSError):
+        checks["delivery_runtime"] = (
+            "The live runtime, trusted policies, roots, or role prices failed validation."
+        )
+        checks["trusted_scope"] = "Cannot compare the scope to an invalid live policy."
+    else:
+        checks["delivery_runtime"] = None
+        policy = policies.get((instance, project))
+        proposed = scope.model_dump_json(exclude={"job", "branch"})
+        checks["trusted_scope"] = (
+            None
+            if policy is not None
+            and policy.scope == ScopePolicy.model_validate_json(proposed)
+            else "The scope differs from the configured trusted policy."
         )
     return checks
 

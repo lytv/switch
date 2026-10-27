@@ -2,10 +2,11 @@ import re
 import ssl
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # A Postgres time value: a bare count of milliseconds, or a count with a unit.
@@ -25,6 +26,31 @@ class JiraWorkerDeliveryProject(BaseModel):
     repository_url_field: str = Field(
         default="description", min_length=1, pattern=r"\S"
     )
+
+
+class JiraWorkerModelPrices(BaseModel):
+    """USD per token; the live supervisor freezes these into each execution meter."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    input: Decimal = Field(ge=0)
+    output: Decimal = Field(ge=0)
+    cache_read: Decimal = Field(ge=0)
+    cache_write: Decimal = Field(ge=0)
+    source: str = Field(min_length=1, pattern=r"\S")
+
+
+class JiraWorkerDeliveryRuntime(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    checkout: Path
+    homes: Path
+    repositories: Path
+    executable_path: str = Field(min_length=1)
+    model_url: str
+    prices: JiraWorkerModelPrices
+    forge_api_url: str = "https://api.github.com"
+    forge_repository_host: str = "github.com"
+    forge_authorization: SecretStr
+    policies: dict[str, dict[str, Path]]
 
 
 class JiraWorkerLanguagePricing(BaseModel):
@@ -206,6 +232,8 @@ class SwitchConfig(BaseSettings):
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
     jira_worker_delivery_execution_enabled: bool = False
+    jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0"] = "2.0.0-draft"
+    jira_worker_delivery_runtime: JiraWorkerDeliveryRuntime | None = None
     jira_worker_delivery_language_pricing: JiraWorkerLanguagePricing | None = None
     # Watermark poll period for enabled projects (read-only Jira search).
     jira_worker_poll_interval_seconds: int = 300
