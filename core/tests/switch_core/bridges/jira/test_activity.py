@@ -1175,8 +1175,10 @@ async def test_same_stamp_human_comment_parks_after_the_first_read(
     )
 
 
-async def test_off_project_claimed_turn_does_not_hold_a_session(
+@pytest.mark.parametrize("delivery_enabled", [False, True])
+async def test_off_project_capacity_preserves_legacy_and_counts_delivery_sessions(
     session_factory,
+    delivery_enabled,
 ) -> None:
     key = await seed(session_factory)
     rooms = ThreadRooms()
@@ -1216,13 +1218,14 @@ async def test_off_project_claimed_turn_does_not_hold_a_session(
         JiraMock(),
         rooms,
         jira_worker_limits=JiraWorkerLimits(live_sessions=1),
+        jira_worker_delivery_execution_enabled=delivery_enabled,
     )
 
     async def fake(turn: TicketTurn) -> TurnResult:
         assert turn.issue_key == "KAN-1"
         return TurnResult(1, None)
 
-    assert await reader.run_one_turn(fake) == key
+    assert await reader.run_one_turn(fake) == (None if delivery_enabled else key)
     async with session_factory() as session:
         job = await session.scalar(
             select(JiraWorkerJob).where(JiraWorkerJob.project_key == "WEB")
@@ -1231,7 +1234,9 @@ async def test_off_project_claimed_turn_does_not_hold_a_session(
     assert job is not None and job.status == "claimed" and job.error is None
     assert web_row is not None
     assert web_row.agent_state == "live" and web_row.worker_parked_reason is None
-    assert (await ticket(session_factory, key)).tokens_used == 1
+    assert (await ticket(session_factory, key)).tokens_used == (
+        0 if delivery_enabled else 1
+    )
 
 
 async def test_switch_channel_old_comment_is_baseline_across_reads(

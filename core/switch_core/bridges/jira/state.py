@@ -11,6 +11,7 @@ from switch_core.bridges.jira.contracts import (
     USD,
     Answer,
     Approval,
+    Budget,
     Commit,
     Contract,
     Count,
@@ -57,6 +58,7 @@ class DeliveryWorkflowState(Contract):
     transitions: tuple[WorkflowMapping, ...]
     scope: ScopeContract | None = None
     reproduction: Handoff | None = None
+    reproduction_job: Job | None = None
     candidate: Handoff | None = None
     candidate_job: Job | None = None
     review: Handoff | None = None
@@ -76,11 +78,21 @@ class DeliveryWorkflowState(Contract):
     approvals: tuple[Approval, ...] = ()
     question: Question | None = None
     answer: Answer | None = None
+    question_count: Count = 0
+    question_started_at: Text | None = None
+    question_command: Text | None = None
+    resume_command: Text | None = None
+    input_revisions: dict[str, Count] = Field(default_factory=dict)
+    budget_override: Budget | None = None
     rework_count: Count = 0
     reserved_tokens: Count = 0
     reserved_estimated_usd: USD = Decimal("0")
     known_estimated_usd: USD = Decimal("0")
     unknown_spend: bool = False
+
+    @property
+    def budget(self) -> Budget:
+        return self.budget_override or self.pack.snapshot.budget
 
     @model_validator(mode="after")
     def state_matches_contract(self) -> Self:

@@ -63,6 +63,7 @@ from switch_core.bridges.jira.publisher import (
 from switch_core.bridges.jira.state import DeliveryWorkflowState, WorkflowMapping
 from switch_core.bridges.jira.target import delivery_state
 from switch_core.bridges.jira.worker import JiraWorkerScheduler
+from switch_core.config import JiraWorkerLanguagePricing
 from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
 from tests.switch_core.bridges.jira import test_firstmate_jobs
 from tests.switch_core.bridges.jira.test_activity import ThreadRooms, message
@@ -88,6 +89,9 @@ def config(enabled=True):
             "acme": {"TEST": {"service_field": "customfield_12345"}}
         },
         jira_worker_delivery_execution_enabled=enabled,
+        jira_worker_delivery_language_pricing=JiraWorkerLanguagePricing(
+            max_usd_per_token=Decimal("0.00001"), price_source="fixture-upper-bound"
+        ),
     )
 
 

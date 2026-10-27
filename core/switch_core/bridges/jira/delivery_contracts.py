@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from switch_core.bridges.jira.contracts import (
+    Answer,
     Budget,
     Commit,
     Contract,
@@ -160,6 +161,8 @@ class ExecutionEnvelope(Contract):
     candidate: Handoff | None = None
     target_sha: Commit | None = None
     feedback: Handoff | None = None
+    resume_answer: Answer | None = None
+    reproduction_job: Job | None = None
 
     def role_profile(self, job: Job) -> RoleProfile:
         if job.run.step in {"review", "qa", "smoke"}:
@@ -184,13 +187,30 @@ class ExecutionEnvelope(Contract):
             or job.run.attempt > 3
         ):
             raise ValueError("Execution envelope differs from the approved scope")
+        if job.run.input_revision:
+            answer = self.resume_answer
+            if (
+                answer is None
+                or answer.classification != "answer"
+                or answer.question.run.ticket_id != job.run.ticket_id
+                or answer.question.run.generation != job.run.generation
+                or answer.question.run.step != job.run.step
+                or answer.question.run.attempt != job.run.attempt
+                or answer.question.run.input_revision + 1 != job.run.input_revision
+            ):
+                raise ValueError("Checkpoint resume requires its accepted answer")
+        elif self.resume_answer is not None:
+            raise ValueError("An initial execution cannot consume a checkpoint answer")
         if job.run.step == "reproduce":
-            if job != original or self.reproduction is not None:
+            if (
+                role_identity(job) != role_identity(original)
+                or self.reproduction is not None
+            ):
                 raise ValueError("Reproduction must start at the frozen base")
         elif job.run.step == "fix":
             if self.reproduction is None:
                 raise ValueError("A fix requires reproduction evidence")
-            validate_reproduction(self.scope, self.reproduction)
+            validate_reproduction(self.scope, self.reproduction, self.reproduction_job)
         elif job.run.step in {"review", "qa", "smoke"}:
             if (
                 self.scope.verification is None
@@ -202,7 +222,7 @@ class ExecutionEnvelope(Contract):
                 raise ValueError(
                     "Verification requires a pinned candidate and target SHA"
                 )
-            validate_reproduction(self.scope, self.reproduction)
+            validate_reproduction(self.scope, self.reproduction, self.reproduction_job)
         else:
             raise ValueError("Unsupported delivery role")
 
@@ -217,11 +237,23 @@ class PreparedExecutionEnvelope(ExecutionEnvelope):
     pack_limits: Budget
 
 
-def validate_reproduction(scope: ScopeContract, handoff: Handoff) -> None:
+def role_identity(job: Job) -> dict[str, Any]:
+    data = job.model_dump(mode="json")
+    data["run"].pop("input_revision", None)
+    data["run"]["execution_key"] = (
+        f"{job.run.ticket_id}/{job.run.generation}/{job.run.step}/{job.run.attempt}"
+    )
+    return data
+
+
+def validate_reproduction(
+    scope: ScopeContract, handoff: Handoff, job: Job | None = None
+) -> None:
     base = scope.job.repository.base_sha
     checks = {check.id: check for check in scope.checks}
     if (
-        handoff.input_digest != digest(scope.job)
+        (job is not None and role_identity(job) != role_identity(scope.job))
+        or handoff.input_digest != digest(job or scope.job)
         or handoff.verdict != "PASS"
         or handoff.head != base
         or not any(

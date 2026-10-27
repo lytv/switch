@@ -7,13 +7,22 @@ import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.jira.accounting import (
+    accounting_lock,
+    day_cost,
+    day_limit,
+    live_role_sessions,
+    live_sessions,
+)
+from switch_core.bridges.jira.accounting import capacity_lock as capacity_lock
 from switch_core.bridges.jira.delivery import observe_scope_approval
 from switch_core.bridges.jira.observe import (
     Observation,
@@ -100,11 +109,6 @@ async def record_event(
     )
     await session.flush()
     return result.scalar_one_or_none()
-
-
-async def capacity_lock(session: AsyncSession) -> None:
-    # ponytail: one admission lock; split room and turn locks if admission throughput matters.
-    await session.execute(text("SELECT pg_advisory_xact_lock(73429105)"))
 
 
 async def admit_room(
@@ -238,6 +242,43 @@ class TurnResult:
     wake_at: datetime | None
 
 
+class MeasuredTurnError(ValueError):
+    def __init__(
+        self, message: str, tokens_used: int, response: dict[str, Any]
+    ) -> None:
+        super().__init__(message)
+        self.tokens_used = tokens_used
+        self.response = response
+
+
+def _record_turn_usage(
+    ticket: JiraWorkerTicket, job: JiraWorkerJob, tokens_used: int, now: datetime
+) -> None:
+    ticket.tokens_used += tokens_used
+    target = delivery_state(ticket)
+    if target is not None and job.payload is not None and "held_usd" in job.payload:
+        payload = job.payload
+        known_usd = Decimal(payload["max_usd_per_token"]) * tokens_used
+        if tokens_used > payload["held_tokens"]:
+            park_ticket(ticket, "Delivery language usage exceeded its reservation")
+        ticket.workflow_state = {
+            **target.model_dump(mode="json"),
+            "reserved_tokens": target.reserved_tokens - payload["held_tokens"],
+            "reserved_estimated_usd": str(
+                target.reserved_estimated_usd - Decimal(payload["held_usd"])
+            ),
+            "known_estimated_usd": str(target.known_estimated_usd + known_usd),
+            "unknown_spend": False,
+        }
+        job.payload = {
+            **payload,
+            "held_tokens": 0,
+            "held_usd": "0",
+            "usage_unknown": False,
+            "cost_by_day": {now.astimezone(UTC).date().isoformat(): str(known_usd)},
+        }
+
+
 Orchestrator = Callable[[TicketTurn], Awaitable[TurnResult]]
 
 
@@ -276,6 +317,15 @@ class TicketActivity:
                 if projects
             )
         )
+
+    async def refresh_projection(self, ticket_id: str) -> None:
+        async with self._factory() as session:
+            ticket = await session.get(
+                JiraWorkerTicket, ticket_id, with_for_update=True
+            )
+            if ticket is not None:
+                await _enqueue_terminal_completion_sync(session, ticket)
+                await session.commit()
 
     async def read_once(self) -> None:
         if not any(self._config.jira_worker_enabled_projects.values()):
@@ -423,7 +473,7 @@ class TicketActivity:
                 return False
             target = delivery_state(ticket)
             token_limit = (
-                target.pack.snapshot.budget.ticket_tokens
+                target.budget.ticket_tokens
                 if target is not None
                 else self._config.jira_worker_limits.tokens_per_ticket
             )
@@ -924,8 +974,9 @@ class TicketActivity:
                         raise ValueError(
                             "Orchestrator wake time must include a timezone"
                         )
-                except BaseException:
+                except BaseException as exc:
                     async with self._factory() as session:
+                        await accounting_lock(session)
                         ticket = await session.get(
                             JiraWorkerTicket, ticket_id, with_for_update=True
                         )
@@ -933,6 +984,21 @@ class TicketActivity:
                         assert ticket is not None and job is not None
                         job.status = "error"
                         job.error = TURN_FAILED
+                        if (
+                            isinstance(exc, MeasuredTurnError)
+                            and delivery_state(ticket) is not None
+                            and job.payload is not None
+                            and "held_usd" in job.payload
+                        ):
+                            _record_turn_usage(
+                                ticket, job, exc.tokens_used, self._clock()
+                            )
+                            job.error = "Language decision failed with known usage; admin release required"
+                            job.payload = {
+                                **job.payload,
+                                "failed_response": exc.response,
+                                "failure": str(exc),
+                            }
                         park_ticket(ticket, job.error)
                         await session.commit()
                     raise
@@ -944,7 +1010,7 @@ class TicketActivity:
 
     async def _claim_turn(self, ticket_id: str):
         async with self._factory() as session:
-            await capacity_lock(session)
+            await accounting_lock(session)
             ticket = await session.get(
                 JiraWorkerTicket, ticket_id, with_for_update=True
             )
@@ -958,6 +1024,7 @@ class TicketActivity:
                 or (
                     target is not None
                     and target.step not in {"intake", "approve_scope", "manual_handoff"}
+                    and (target.question is None or target.answer is not None)
                 )
                 or ticket.agent_state not in ("wake_requested", "parked")
                 or (
@@ -967,25 +1034,41 @@ class TicketActivity:
                 )
             ):
                 return None
-            if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
+            token_limit = (
+                target.budget.ticket_tokens
+                if target
+                else self._config.jira_worker_limits.tokens_per_ticket
+            )
+            if ticket.tokens_used >= token_limit:
                 park_ticket(ticket, TOKEN_LIMIT)
                 await session.commit()
                 return None
-            live = await session.scalar(
-                select(func.count())
-                .select_from(JiraWorkerJob)
-                .outerjoin(
-                    JiraWorkerTicket,
-                    JiraWorkerJob.payload["ticket_id"].astext == JiraWorkerTicket.id,
+            limit = self._config.jira_worker_limits.live_sessions
+            if (
+                self._config.jira_worker_delivery_execution_enabled
+                or await live_role_sessions(session)
+            ):
+                live = await live_sessions(session)
+                limit = min(5, limit)
+            else:
+                live = int(
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(JiraWorkerJob)
+                        .outerjoin(
+                            JiraWorkerTicket,
+                            JiraWorkerJob.payload["ticket_id"].astext
+                            == JiraWorkerTicket.id,
+                        )
+                        .where(
+                            JiraWorkerJob.kind == TURN,
+                            JiraWorkerJob.status == "claimed",
+                            or_(JiraWorkerTicket.id.is_(None), self._scope()),
+                        )
+                    )
+                    or 0
                 )
-                .where(
-                    JiraWorkerJob.kind == TURN,
-                    JiraWorkerJob.status == "claimed",
-                    or_(JiraWorkerTicket.id.is_(None), self._scope()),
-                )
-            )
-            assert live is not None
-            if live >= self._config.jira_worker_limits.live_sessions:
+            if live >= limit:
                 ticket.queue_reason = "To Do: live orchestrator session limit"
                 ticket.agent_state = "parked"
                 await session.commit()
@@ -1004,6 +1087,53 @@ class TicketActivity:
                     )
                 ).all()
             )
+            token_budget = token_limit - ticket.tokens_used
+            payload: dict[str, Any] = {"ticket_id": ticket.id}
+            if target is not None:
+                pricing = self._config.jira_worker_delivery_language_pricing
+                if pricing is None:
+                    park_ticket(
+                        ticket,
+                        "Delivery language pricing is required before a model call",
+                    )
+                    await session.commit()
+                    return None
+                if target.unknown_spend:
+                    return None
+                remaining_usd = min(
+                    target.budget.ticket_estimated_usd
+                    - target.known_estimated_usd
+                    - target.reserved_estimated_usd,
+                    await day_limit(
+                        session, self._clock(), target.budget.day_estimated_usd
+                    )
+                    - await day_cost(session, self._clock()),
+                )
+                token_budget = min(
+                    8192,
+                    token_budget - target.reserved_tokens,
+                    int(remaining_usd / pricing.max_usd_per_token),
+                )
+                if token_budget <= 0:
+                    park_ticket(ticket, "Delivery language budget exhausted")
+                    await session.commit()
+                    return None
+                held_usd = pricing.max_usd_per_token * token_budget
+                payload.update(
+                    held_tokens=token_budget,
+                    held_usd=str(held_usd),
+                    usage_unknown=True,
+                    max_usd_per_token=str(pricing.max_usd_per_token),
+                    price_source=pricing.price_source,
+                )
+                ticket.workflow_state = {
+                    **target.model_dump(mode="json"),
+                    "reserved_tokens": target.reserved_tokens + token_budget,
+                    "reserved_estimated_usd": str(
+                        target.reserved_estimated_usd + held_usd
+                    ),
+                    "unknown_spend": True,
+                }
             ticket.agent_state = "live"
             ticket.queue_reason = None
             job = JiraWorkerJob(
@@ -1012,7 +1142,8 @@ class TicketActivity:
                 project_key=ticket.project_key,
                 due_at=self._clock(),
                 status="claimed",
-                payload={"ticket_id": ticket.id},
+                ticket_id=ticket.id if target is not None else None,
+                payload=payload,
             )
             session.add(job)
             await session.flush()
@@ -1023,9 +1154,16 @@ class TicketActivity:
                 {
                     "ticket_text": ticket.summary,
                     "description": ticket.description,
-                    "events": [event.payload for event in events],
+                    "events": [
+                        {
+                            **(event.payload or {}),
+                            "event_id": event.id,
+                            "received_at": _stamp(str(event.received_at)).isoformat(),
+                        }
+                        for event in events
+                    ],
                 },
-                self._config.jira_worker_limits.tokens_per_ticket - ticket.tokens_used,
+                token_budget,
             )
             await session.commit()
             return job.id, ticket.agent_generation, turn, [event.id for event in events]
@@ -1039,14 +1177,21 @@ class TicketActivity:
         event_ids: list[str],
     ) -> None:
         async with self._factory() as session:
+            await accounting_lock(session)
             ticket = await session.get(
                 JiraWorkerTicket, ticket_id, with_for_update=True
             )
             job = await session.get(JiraWorkerJob, job_id)
             assert ticket is not None and job is not None
             job.status = "done"
-            ticket.tokens_used += result.tokens_used
-            if ticket.tokens_used >= self._config.jira_worker_limits.tokens_per_ticket:
+            _record_turn_usage(ticket, job, result.tokens_used, self._clock())
+            target = delivery_state(ticket)
+            token_limit = (
+                target.budget.ticket_tokens
+                if target
+                else self._config.jira_worker_limits.tokens_per_ticket
+            )
+            if ticket.tokens_used >= token_limit:
                 park_ticket(ticket, TOKEN_LIMIT)
             elif (
                 ticket.agent_generation == generation

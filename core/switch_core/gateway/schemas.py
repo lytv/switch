@@ -1128,6 +1128,8 @@ class JiraRotateSecretResponse(BaseModel):
 
 class JiraWorkerReleaseRequest(BaseModel):
     request_id: UUID
+    reason: str | None = Field(default=None, min_length=1, pattern=r"\S")
+    previous_generation: int | None = Field(default=None, gt=0)
 
 
 class JiraWorkerReleaseResponse(BaseModel):

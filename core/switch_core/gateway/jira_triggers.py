@@ -16,6 +16,7 @@ from switch_core.bridges.jira.admin import (
     accept_ignored_input,
     release_parked_ticket,
 )
+from switch_core.bridges.jira.budget import BudgetRequest, extend_budget
 from switch_core.bridges.jira.matching import explain_match
 from switch_core.bridges.jira.outbox import HumanChange
 from switch_core.bridges.jira.parse import (
@@ -704,6 +705,8 @@ async def release_worker_ticket(
             request_id=str(req.request_id),
             admin_user_id=admin.id,
             now=datetime.now(UTC),
+            release_reason=req.reason,
+            previous_generation=req.previous_generation,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -716,6 +719,43 @@ async def release_worker_ticket(
     finally:
         for client in clients.values():
             await client.aclose()
+    assert receipt.payload is not None
+    return JiraWorkerReleaseResponse(
+        id=receipt.id, issue_key=receipt.issue_key, payload=receipt.payload
+    )
+
+
+@router.post("/worker/tickets/{issue_key}/budget")
+async def extend_worker_budget(
+    issue_key: str,
+    req: BudgetRequest,
+    instance: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    admin: Annotated[User, Depends(require_admin)],
+    session_factory: Annotated[Any, Depends(get_session_factory)],
+) -> JiraWorkerReleaseResponse:
+    ticket = await session.scalar(
+        select(JiraWorkerTicket).where(
+            JiraWorkerTicket.instance == instance.strip(),
+            JiraWorkerTicket.issue_key == issue_key.strip(),
+        )
+    )
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket not found")
+    try:
+        receipt = await extend_budget(
+            session_factory,
+            config=config,
+            ticket_id=ticket.id,
+            request=req,
+            actor=admin.id,
+            now=datetime.now(UTC),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     assert receipt.payload is not None
     return JiraWorkerReleaseResponse(
         id=receipt.id, issue_key=receipt.issue_key, payload=receipt.payload
