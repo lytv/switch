@@ -270,6 +270,54 @@ async def test_upgrade_preserves_active_v1_records(mig_url: str) -> None:
         await engine.dispose()
 
 
+async def test_role_job_guard_blocks_upgrade_until_pending_rows_are_resolved(
+    mig_url: str,
+) -> None:
+    engine = create_async_engine(mig_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda c: _run_migrations(c, "head"))
+            await connection.run_sync(lambda c: _run_migrations(c, "8c2f4a6b8d70"))
+            await connection.execute(
+                insert(JiraWorkerTicket).values(
+                    id="ticket", instance="fixture", issue_key="TEST-1"
+                )
+            )
+            await connection.execute(
+                insert(JiraWorkerJob).values(
+                    kind="role_job",
+                    ticket_id="ticket",
+                    generation=1,
+                    execution_key="ticket/1/reproduce/1",
+                    due_at=datetime.now(UTC),
+                    status="pending",
+                )
+            )
+        with pytest.raises(RuntimeError, match="pending role jobs"):
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda c: _run_migrations(c, "head"))
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE jira_worker_job_record SET status = 'cancelled' "
+                    "WHERE kind = 'role_job'"
+                )
+            )
+            await connection.run_sync(lambda c: _run_migrations(c, "head"))
+        async with engine.connect() as connection:
+            guard = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_constraint "
+                        "WHERE conname = 'ck_jira_worker_role_not_pending'"
+                    )
+                )
+            ).scalar_one()
+            assert guard == 1
+    finally:
+        await engine.dispose()
+
+
 @pytest.mark.parametrize("status", ["running", "done"])
 async def test_downgrade_refuses_v2_execution_records(
     mig_url: str, status: str
@@ -1117,6 +1165,7 @@ async def test_scheduler_leaves_unrecognized_due_jobs_untouched(
         )
         session.add(ticket)
         await session.flush()
+        status = "claimed" if kind == "role_job" else "pending"
         job = JiraWorkerJob(
             ticket_id=ticket.id,
             generation=1,
@@ -1125,6 +1174,7 @@ async def test_scheduler_leaves_unrecognized_due_jobs_untouched(
             instance="acme",
             project_key="KAN",
             due_at=datetime.now(UTC) - timedelta(hours=1),
+            status=status,
             payload={"preserve": "input"},
         )
         session.add(job)
@@ -1139,7 +1189,7 @@ async def test_scheduler_leaves_unrecognized_due_jobs_untouched(
     async with session_factory() as session:
         persisted = await session.get(JiraWorkerJob, job_id)
         assert persisted is not None
-        assert persisted.status == "pending"
+        assert persisted.status == status
         assert persisted.attempts == 0
         assert persisted.claimed_at is None
         assert persisted.completed_at is None

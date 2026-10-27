@@ -89,11 +89,27 @@ async def jira_webhook(
     )
 
     service = _require_service()
+    try:
+        await service.record_worker_intake(
+            instance=instance,
+            event=event,
+            webhook_identifier=x_atlassian_webhook_identifier,
+        )
+    except Exception as exc:
+        logger.error(
+            "Jira webhook for instance %r could not persist worker intake: %s",
+            instance,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503, detail="Jira event was not persisted"
+        ) from exc
+
     background_tasks.add_task(service.process_event, instance=instance, event=event)
     background_tasks.add_task(
-        service.record_worker_intake,
+        service.reconcile_worker_room,
         instance=instance,
-        event=event,
-        webhook_identifier=x_atlassian_webhook_identifier,
+        project=event.project,
+        issue_key=event.key,
     )
     return JSONResponse(status_code=202, content={"status": "accepted"})

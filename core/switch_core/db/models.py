@@ -1216,6 +1216,10 @@ class JiraWorkerJob(Base):
             "'cancelled','uncertain','done','error')",
             name="ck_jira_worker_role_status",
         ),
+        CheckConstraint(
+            "kind <> 'role_job' OR status <> 'pending'",
+            name="ck_jira_worker_role_not_pending",
+        ),
     )
 
     id: Mapped[str] = mapped_column(Text, primary_key=True, default=_uuid)

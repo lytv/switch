@@ -543,6 +543,65 @@ An extension never clears a park, resets usage, releases unknown reservations, o
 
 No UI is part of this boundary.
 
+## Failure recovery, rollback, and local checks
+
+### Fault matrix
+
+| Boundary | Failure | Durable signal | Action |
+| --- | --- | --- | --- |
+| Jira webhook | Switch cannot persist the event | HTTP 503; Jira retries | Restore the database and let Jira retry. A repeated delivery id is a no-op. |
+| Webhook accepted | Process stops after the commit | Event log row, ticket row, room-sync row | Restart. `sweep_ticket_rooms` and pending sync rows retry. Do not resend the webhook. |
+| Room bridge | Channel create or close fails | Admin card reason, room-sync row | Fix the bridge and retry. Do not archive or reopen the room by hand. |
+| Firstmate start | Crash after the dispatch marker | Job `uncertain`, reservation retained | Find the native task. Do not reset the marker; cancel or release through the documented path. |
+| Firstmate result | Late or invalid result | Job status, usage accounting | The generation fence rejects it. Known usage stays charged. Do not edit the job row. |
+| Forge publish | Unknown push or request outcome | Durable `pushing` or `creating` intent | Reconcile remote evidence. Do not repeat the request. |
+| Human Jira action | Done, Blocked, or cancel during any phase | Ticket `closed_by_human` or park reason | The human action wins. Running role jobs are cancelled and late results fail the fence. |
+
+A restart never turns an uncertain external outcome into a retry. The event log,
+job rows, outbox rows, and admin card keep the outcome visible.
+
+### Disable and roll back
+
+1. Set `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=false` and remove the project from
+   `JIRA_WORKER_ENABLED_PROJECTS`. Restart Switch.
+2. Cancel live delivery tasks in the delivery copy with
+   `fm-control.sh <task-id> exit`. The removed project starts no new intake, poll,
+   or role job. Pending outbox commands remain stored and do not send while the
+   project is disabled.
+3. Keep the schema during a mixed-version window. Role jobs are created
+   `claimed`, the database rejects a `pending` role job, and the migration refuses
+   to add that guard while a pending row exists. An older binary cannot claim a
+   role job.
+4. Downgrade one revision with `alembic downgrade 8c2f4a6b8d70` only after no
+   pending role job remains. A downgrade to version 1 is refused while delivery
+   workflow or execution records exist.
+
+### Isolation checks
+
+Before a live run, confirm these paths are absolute, symlink-free, and not shared
+with human work: delivery checkout, worker-homes root, dev checkout, review
+checkout, and QA base checkout. Confirm each role has its own `HOME`, Firstmate
+home, and tmux server. Confirm the supervisor holds forge and Jira credentials and
+the worker environment does not. The automated checks are in
+`test_firstmate_jobs.py`, `test_delivery.py`, and `test_hardening.py`.
+
+### Local checks
+
+Docker is required for the PostgreSQL fixture.
+
+```bash
+docker info
+uv run --project core pytest -c core/pyproject.toml core/tests/switch_core/bridges/jira/
+uv run --project core pytest -c core/pyproject.toml core/tests/switch_core/gateway/test_jira_triggers.py
+just check
+just typecheck
+bash scripts/local-ci.sh
+```
+
+Tests use a disposable `postgres:16-alpine` database and fake Firstmate
+processes. They never call a paid model, a live Jira site, or a standing worker
+home.
+
 ## One-turn integration
 
 The worker loop calls `scheduler.activity.run_one_turn(callback)` when intake

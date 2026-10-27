@@ -159,7 +159,7 @@ def test_non_bug_state_cannot_select_development_step(service: str) -> None:
     )
 
 
-async def test_concurrent_claims_produce_one_execution_key(session_factory) -> None:
+async def test_generic_claims_never_consume_role_jobs(session_factory) -> None:
     run = Run(
         instance="fixture",
         ticket_id="ticket-1",
@@ -182,6 +182,7 @@ async def test_concurrent_claims_produce_one_execution_key(session_factory) -> N
                 generation=run.generation,
                 execution_key=run.execution_key,
                 due_at=now,
+                status="claimed",
                 payload={"run": run.model_dump(mode="json")},
             )
         )
@@ -196,17 +197,36 @@ async def test_concurrent_claims_produce_one_execution_key(session_factory) -> N
             return [job.execution_key for job in jobs]
 
     claimed = await asyncio.gather(claim("first"), claim("second"))
-    assert sorted(len(keys) for keys in claimed) == [0, 1]
-    assert [key for keys in claimed for key in keys] == [run.execution_key]
-    assert await claim("restart") == []
+    assert claimed == [[], []]
     async with session_factory() as session:
-        assert len((await session.scalars(select(JiraWorkerJob))).all()) == 1
+        row = await session.scalar(select(JiraWorkerJob))
+        assert row is not None and row.status == "claimed" and row.claimed_at is None
+
+
+async def test_pending_role_job_is_rejected(session_factory) -> None:
+    async with session_factory() as session:
+        session.add(
+            JiraWorkerTicket(id="ticket", instance="fixture", issue_key="TEST-1")
+        )
+        await session.flush()
+        session.add(
+            JiraWorkerJob(
+                kind="role_job",
+                ticket_id="ticket",
+                generation=1,
+                execution_key="ticket/1/reproduce/1",
+                status="pending",
+                due_at=datetime.now(UTC),
+            )
+        )
+        with pytest.raises(IntegrityError, match="ck_jira_worker_role_not_pending"):
+            await session.commit()
+        await session.rollback()
 
 
 @pytest.mark.parametrize(
     "status",
     [
-        "pending",
         "claimed",
         "running",
         "waiting_input",
@@ -241,6 +261,7 @@ async def test_only_one_active_execution_per_ticket_generation(
                 ticket_id="ticket",
                 generation=1,
                 execution_key="ticket/1/fix/1",
+                status="claimed",
                 due_at=datetime.now(UTC),
             )
         )
@@ -256,6 +277,7 @@ async def test_only_one_active_execution_per_ticket_generation(
                 ticket_id="ticket",
                 generation=2,
                 execution_key="ticket/2/reproduce/1",
+                status="claimed",
                 due_at=datetime.now(UTC),
             )
         )
@@ -286,6 +308,7 @@ async def test_execution_key_stays_unique_after_completion(session_factory) -> N
                 ticket_id="ticket",
                 generation=1,
                 execution_key="ticket/1/reproduce/1",
+                status="claimed",
                 due_at=datetime.now(UTC),
             )
         )
@@ -306,6 +329,7 @@ async def test_execution_key_stays_unique_after_completion(session_factory) -> N
         ({"execution_key": "ticket/1/fix/0"}, "ck_jira_worker_role_identity"),
         ({"execution_key": "ticket/1/unknown/1"}, "ck_jira_worker_role_identity"),
         ({"status": "unrecognized"}, "ck_jira_worker_role_status"),
+        ({"status": "pending"}, "ck_jira_worker_role_not_pending"),
     ],
 )
 async def test_invalid_role_identity_and_status_fail(
@@ -321,6 +345,7 @@ async def test_invalid_role_identity_and_status_fail(
         "ticket_id": "ticket",
         "generation": 1,
         "execution_key": "ticket/1/fix/1",
+        "status": "claimed",
         "due_at": datetime.now(UTC),
     } | change
     async with session_factory() as session:

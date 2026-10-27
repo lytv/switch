@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import ANY, AsyncMock
 
@@ -90,6 +91,53 @@ class TestJiraWebhookRoute:
         service.record_worker_intake.assert_awaited_once_with(
             instance="acme", event=ANY, webhook_identifier="atlassian-event-1"
         )
+        service.reconcile_worker_room.assert_awaited_once_with(
+            instance="acme", project="PROJ", issue_key="PROJ-42"
+        )
+
+    def test_duplicate_event_is_still_accepted(self) -> None:
+        service = AsyncMock()
+        service.record_worker_intake.return_value = False
+        client = _client({"acme": "s3cret"}, service)
+        response = client.post(
+            "/integrations/jira/acme",
+            json=_payload(),
+            headers={SECRET_HEADER: "s3cret"},
+        )
+        assert response.status_code == 202
+        service.reconcile_worker_room.assert_awaited_once()
+
+    def test_persistence_failure_is_not_acknowledged(self, caplog: Any) -> None:
+        service = AsyncMock()
+        service.record_worker_intake.side_effect = RuntimeError("database unavailable")
+        client = _client({"acme": "s3cret"}, service)
+        with caplog.at_level(logging.ERROR):
+            response = client.post(
+                "/integrations/jira/acme",
+                json=_payload(),
+                headers={SECRET_HEADER: "s3cret"},
+            )
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Jira event was not persisted"
+        service.process_event.assert_not_called()
+        service.reconcile_worker_room.assert_not_called()
+        assert "s3cret" not in caplog.text
+        assert "Ship it" not in caplog.text
+
+    def test_secret_and_payload_never_reach_logs(self, caplog: Any) -> None:
+        service = AsyncMock()
+        payload = _payload()
+        payload["issue"]["fields"]["description"] = "secret-value-123"
+        client = _client({"acme": "s3cret"}, service)
+        with caplog.at_level(logging.DEBUG):
+            response = client.post(
+                "/integrations/jira/acme",
+                json=payload,
+                headers={SECRET_HEADER: "s3cret"},
+            )
+        assert response.status_code == 202
+        assert "s3cret" not in caplog.text
+        assert "secret-value-123" not in caplog.text
 
     def test_malformed_payload_400(self) -> None:
         service = AsyncMock()
@@ -101,3 +149,4 @@ class TestJiraWebhookRoute:
         )
         assert resp.status_code == 400
         service.process_event.assert_not_called()
+        service.record_worker_intake.assert_not_called()
