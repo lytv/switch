@@ -7,6 +7,7 @@ from pathlib import Path
 
 from switch_core.bridges.jira.delivery_contracts import ScopeContract, ScopePolicy
 from switch_core.bridges.jira.live import load_policies, runtime_config
+from switch_core.bridges.jira.model_upstream import model_upstream
 from switch_core.bridges.jira.packs import load_pack
 from switch_core.config import SwitchConfig
 
@@ -55,6 +56,7 @@ def check_readiness(
         checks["pack_pin"] = "The immutable delivery pack failed validation."
         checks["scope_pack"] = "Cannot check the scope against an invalid pack."
         checks["live_pack"] = "No validated live pack is available."
+        checks["model_upstream"] = "Cannot select an upstream without a valid pack."
     else:
         checks["pack_pin"] = None
         checks["scope_pack"] = (
@@ -67,6 +69,14 @@ def check_readiness(
             if pack.snapshot.fixture_only
             else None
         )
+        try:
+            model_upstream(config, pack.snapshot)
+        except ValueError:
+            checks["model_upstream"] = (
+                "The selected pack requires a valid upstream URL and API key."
+            )
+        else:
+            checks["model_upstream"] = None
     try:
         runtime = runtime_config(config)
         policies = load_policies(config, runtime)

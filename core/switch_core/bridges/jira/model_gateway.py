@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from switch_core.bridges.jira.contracts import Job
 from switch_core.bridges.jira.firstmate_jobs import Execution
+from switch_core.bridges.jira.model_upstream import model_upstream
 from switch_core.bridges.jira.publisher import delivery_lock
 from switch_core.bridges.jira.target import delivery_state
 from switch_core.config import SwitchConfig
@@ -53,9 +54,19 @@ def _counts(body: dict[str, Any]) -> tuple[int, int, int, int]:
     prompt, output, total = (
         usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
     )
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens", usage.get("prompt_cache_hit_tokens", 0))
+    cache_counts = [
+        fields[key]
+        for fields, key in (
+            (details, "cached_tokens"),
+            (usage, "prompt_cache_hit_tokens"),
+        )
+        if key in fields
+    ]
     if (
-        any(
+        any(type(value) is not int or value != cached for value in cache_counts)
+        or any(
             type(value) is not int or value < 0
             for value in (prompt, output, total, cached)
         )
@@ -238,17 +249,12 @@ class DeliveryModelGateway:
             )
             await session.commit()
         try:
-            if (
-                not config.jira_worker_llm_base_url
-                or not config.jira_worker_llm_api_key
-            ):
-                raise ValueError("Model upstream is not configured")
+            upstream = model_upstream(config, execution.pack)
             async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
                 response = await client.post(
-                    config.jira_worker_llm_base_url.rstrip("/") + "/chat/completions",
+                    upstream.base_url.rstrip("/") + "/chat/completions",
                     headers={
-                        "Authorization": "Bearer "
-                        + config.jira_worker_llm_api_key.get_secret_value()
+                        "Authorization": "Bearer " + upstream.api_key.get_secret_value()
                     },
                     json=allowed,
                     follow_redirects=False,

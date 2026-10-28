@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from switch_core.bridges.jira.contracts import Repository
+from switch_core.bridges.jira.model_upstream import model_prices
 from switch_core.bridges.jira.outbox import park_ticket
 from switch_core.bridges.jira.packs import load_pack
 from switch_core.bridges.jira.parse import _plain_text, _text
@@ -64,10 +65,21 @@ def initialize_target(
         if supplied_url
         else None
     )
+    pack = load_pack(config)
+    prices = (
+        model_prices(config, pack.snapshot)
+        if not pack.snapshot.fixture_only
+        and (
+            config.jira_worker_delivery_runtime is not None
+            or config.jira_worker_delivery_upstreams
+        )
+        else None
+    )
     state = DeliveryWorkflowState.model_validate_json(
         json.dumps(
             {
-                "pack": load_pack(config).model_dump(mode="json"),
+                "pack": pack.model_dump(mode="json"),
+                "model_prices": prices.model_dump(mode="json") if prices else None,
                 "service": service,
                 "service_field": mapping.service_field,
                 "repository_url_field": mapping.repository_url_field,
@@ -95,6 +107,7 @@ def reset_delivery_scope(
         key: state.model_dump(mode="json")[key]
         for key in (
             "pack",
+            "model_prices",
             "service_field",
             "repository_url_field",
             "statuses",

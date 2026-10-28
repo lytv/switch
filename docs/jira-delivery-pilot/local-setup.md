@@ -95,9 +95,6 @@ JIRA_WORKER_DELIVERY_TICKET_ESTIMATED_USD=5
 JIRA_WORKER_DELIVERY_DAY_ESTIMATED_USD=25
 JIRA_WORKER_CREDENTIALS='{"local":{"base_url":"https://jira.example.invalid","email":"automation@example.invalid","api_token":"REPLACE_FROM_SECRET_MANAGER"}}'
 JIRA_WEBHOOK_SECRETS='{"local":"REPLACE_FROM_SECRET_MANAGER"}'
-JIRA_WORKER_LLM_BASE_URL=https://api.openai.com/v1
-JIRA_WORKER_LLM_API_KEY=REPLACE_FROM_SECRET_MANAGER
-JIRA_WORKER_LLM_MODEL=gpt-4.1-2025-04-14
 JIRA_WORKER_DELIVERY_LANGUAGE_PRICING='{"max_usd_per_token":"0.000008","price_source":"operator-reviewed-flat-ceiling-YYYY-MM-DD"}'
 JIRA_WORKER_DELIVERY_RUNTIME='{"checkout":"/srv/switch-delivery/firstmate","homes":"/srv/switch-delivery/homes","repositories":"/srv/switch-delivery/repositories","executable_path":"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin","model_url":"http://127.0.0.1:8000","forge_api_url":"https://api.github.com","forge_repository_host":"github.com","forge_authorization":"REPLACE_WITH_HTTP_AUTHORIZATION_FROM_SECRET_MANAGER","prices":{"input":"0.000002","output":"0.000008","cache_read":"0.0000005","cache_write":"0.000002","source":"operator-reviewed-flat-ceiling-YYYY-MM-DD"},"policies":{"local":{"AGD":"/srv/switch-delivery/agd-policy.json"}}}'
 ```
@@ -106,11 +103,76 @@ Review current provider prices before using these example rates.
 Prices are USD per token, not per million tokens.
 Configure conservative flat ceilings if provider prices depend on context length or other tiers.
 Do not enable a provider that charges unbounded extra fees or ignores token limits.
-The live pack pins `switch-delivery/gpt-4.1-2025-04-14`.
-`switch-delivery` is the private model provider generated for each task.
-The server sends the pinned model ID to the configured OpenAI-compatible upstream.
+### Choose GPT or DeepSeek
+
+Two immutable live packs remain available:
+
+| `JIRA_WORKER_DELIVERY_PACK` | Private provider | Pinned model | Release digest |
+| --- | --- | --- | --- |
+| `2.0.0` | `switch-delivery` | `gpt-4.1-2025-04-14` | `aa1e6a26ec686cd0097d6fe416258cac5989029511dca798fbb34e94314a07b6` |
+| `2.0.0-deepseek` | `switch-delivery-deepseek` | `deepseek-v4-pro` | `b60133794230b234a3ad67b3db9aff6d195d6ba3a2e58660e28305701c2e9242` |
+
+Configure both delivery upstreams once in the server's private environment.
+Use this JSON shape for `JIRA_WORKER_DELIVERY_UPSTREAMS`:
+
+```json
+{
+  "switch-delivery": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "REPLACE_WITH_GPT_KEY_FROM_SECRET_MANAGER",
+    "prices": {
+      "input": "0.000002",
+      "output": "0.000008",
+      "cache_read": "0.0000005",
+      "cache_write": "0.000002",
+      "source": "operator-reviewed-both-provider-ceilings-YYYY-MM-DD"
+    }
+  },
+  "switch-delivery-deepseek": {
+    "base_url": "https://deepseek.example.invalid/v1",
+    "api_key": "REPLACE_WITH_DEEPSEEK_KEY_FROM_SECRET_MANAGER",
+    "prices": {
+      "input": "0.000002",
+      "output": "0.000008",
+      "cache_read": "0.0000005",
+      "cache_write": "0.000002",
+      "source": "operator-reviewed-both-provider-ceilings-YYYY-MM-DD"
+    }
+  }
+}
+```
+
+Replace the DeepSeek URL with the approved OpenAI-compatible endpoint that serves `deepseek-v4-pro`.
+These example rates are not a DeepSeek price quote.
+Review both providers' rates before configuration.
+For `.env`, encode this object as one JSON line inside single quotes.
+The GPT entry needs its GPT key. The DeepSeek entry needs its DeepSeek key.
+The server keeps these keys as secrets. Workers receive only execution-scoped capabilities.
+A nonempty mapping must contain every provider needed by new or frozen tickets.
+A missing provider refuses access; it never falls back to legacy credentials.
+
+For a one-setting switch, prepare both entries and one trusted policy in advance.
+Use a reviewed price source that covers both tables.
+Use the same source in every policy reservation.
+Each reservation must cover its tokens at the larger maximum price of the two tables.
+Set the language price ceiling to cover the separate intake model.
+Change only `JIRA_WORKER_DELIVERY_PACK` to `2.0.0` or `2.0.0-deepseek`, then restart the existing server.
+Keep execution disabled during preparation. Changing a pack does not enable execution.
+
+Without `JIRA_WORKER_DELIVERY_UPSTREAMS`, delivery retains the previous upstream behavior:
+`JIRA_WORKER_LLM_BASE_URL`, `JIRA_WORKER_LLM_API_KEY`, and `JIRA_WORKER_DELIVERY_RUNTIME.prices` supply model access and rates.
+Those LLM keys remain the legacy KAN/intake configuration.
+`JIRA_WORKER_LLM_MODEL` selects only the legacy/intake model, never the delivery model.
+Do not edit those keys to switch delivery providers.
+With a delivery mapping, its provider entry supplies the upstream and rates instead of the shared keys and runtime rates.
+Retain old provider entries while frozen tickets need them.
+
+The server sends each execution's frozen model ID to its provider's upstream.
 The upstream must support byte-level tokenization, text/function-tool Chat Completions,
-non-streaming responses, `max_tokens`, and complete token usage, including cache reads.
+non-streaming responses, `max_tokens`, and complete prompt, completion, and total usage.
+The gateway accepts OpenAI's `prompt_tokens_details.cached_tokens` or DeepSeek's `prompt_cache_hit_tokens`.
+It counts a cache hit once when both fields agree. Conflicting or invalid cache counts refuse the result.
+If neither cache field exists, it conservatively prices all prompt tokens as uncached.
 The gateway converts the buffered response to the SSE format that pi requests.
 Images and provider-hosted tools are not supported by this pack.
 
@@ -127,6 +189,9 @@ Keep its value only in the server's private configuration.
 
 Prepare the reviewed `ScopeContract` JSON with the verified repository/base pins,
 the selected pack digest, and the same trusted policy.
+Use `load_pack(config).digest`, not a copied release digest, when budgets differ from the release defaults.
+The scope's pack digest must match the selection. Its reservation price sources must match the selected upstream's reviewed source.
+The trusted policy must contain those same reservation sources and sufficient price ceilings.
 The server stages the real ticket's scope later; the preflight uses a placeholder ticket identity.
 Replace the repository values with the triage evidence you reviewed:
 
@@ -166,7 +231,8 @@ A configured live setup can pass every local item.
 `live_prerequisites` still blocks until a human completes P0 evidence separately.
 That intentional refusal is not a request to remove the check.
 The command starts no task and changes no setting.
-It validates the immutable live pack, configured roots and pins, prices, and scope/policy equality.
+It validates the immutable live pack, selected upstream URL and key, roots and pins, prices, and scope/policy equality.
+It makes no provider request, so it cannot prove that an endpoint serves the pinned model.
 It does not prove live permissions, OS confinement, provider limit behavior, channels, or wait windows.
 
 After separate live-run approval, set `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=true` and restart the existing server.
@@ -180,7 +246,12 @@ Smoke uses the observed merged SHA before the exact Done transition.
 No deployment occurs.
 
 Keep the default fixture pack for tests. Existing fixture tickets cannot enter the live supervisor.
-Changing settings does not upgrade a frozen ticket or reprice an existing execution.
+Switching packs does not upgrade a frozen ticket or reprice an existing execution.
+New live tickets freeze their provider's price table with their pack.
+Historical tickets without a price snapshot recover their earlier meter prices when available.
+Conflicting historical prices refuse a new role. With no earlier meter, the first role freezes configured prices.
+The source must match the frozen reservation.
+Later roles retain that ticket snapshot. Existing meters retain their original prices after a restart.
 Unknown model outcomes retain their reservations and reject further calls, including after server restart.
 Cancel revokes model access before native process cancellation.
 Use the existing reconciliation and audited admin-release procedures for uncertain outcomes.

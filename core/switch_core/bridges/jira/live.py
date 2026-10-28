@@ -24,7 +24,6 @@ from switch_core.bridges.jira.contracts import (
     Gate,
     Job,
     Meter,
-    ModelPrices,
     Pack,
     Repository,
     Reservation,
@@ -56,6 +55,7 @@ from switch_core.bridges.jira.firstmate_copy import (
 from switch_core.bridges.jira.firstmate_jobs import Execution, FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
 from switch_core.bridges.jira.model_gateway import model_capability, model_identity
+from switch_core.bridges.jira.model_upstream import model_prices
 from switch_core.bridges.jira.packs import load_pack
 from switch_core.bridges.jira.publisher import (
     DraftPublisher,
@@ -67,10 +67,6 @@ from switch_core.bridges.jira.target import delivery_state, record_repository_tr
 from switch_core.bridges.jira.verification import MergeReceipt
 from switch_core.config import JiraWorkerDeliveryRuntime, SwitchConfig
 from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket
-
-
-def model_prices(runtime: JiraWorkerDeliveryRuntime) -> ModelPrices:
-    return ModelPrices.model_validate_json(runtime.prices.model_dump_json())
 
 
 class AdmissionPolicy(Contract):
@@ -93,13 +89,8 @@ def runtime_config(config: SwitchConfig) -> JiraWorkerDeliveryRuntime:
         raise ValueError(
             "Live execution requires the immutable non-fixture delivery pack"
         )
-    if not config.jira_worker_llm_base_url or not config.jira_worker_llm_api_key:
-        raise ValueError("Live model access requires the configured LLM upstream")
-    for endpoint in (
-        runtime.forge_api_url,
-        config.jira_worker_llm_base_url,
-        runtime.model_url,
-    ):
+    model_prices(config, pack)
+    for endpoint in (runtime.forge_api_url, runtime.model_url):
         url = urlsplit(endpoint)
         if (
             url.scheme not in {"http", "https"}
@@ -175,7 +166,7 @@ def load_policies(
     config: SwitchConfig, runtime: JiraWorkerDeliveryRuntime
 ) -> dict[tuple[str, str], AdmissionPolicy]:
     policies = {}
-    prices = model_prices(runtime)
+    prices = model_prices(config, load_pack(config).snapshot)
     for instance, projects in config.jira_worker_delivery_projects.items():
         for project in projects:
             path = runtime.policies.get(instance, {}).get(project)
@@ -534,9 +525,55 @@ class LiveCopy:
             assert row is not None
             execution = Execution.model_validate_json(json.dumps(row.payload))
             if execution.meter is None:
+                ticket = await session.get(
+                    JiraWorkerTicket, row.ticket_id, with_for_update=True
+                )
+                state = delivery_state(ticket) if ticket is not None else None
+                if (
+                    ticket is None
+                    or state is None
+                    or state.pack.snapshot != execution.pack
+                ):
+                    raise ValueError("Meter requires its frozen ticket pack")
+                prices = state.model_prices
+                if prices is None:
+                    rows = await session.scalars(
+                        select(JiraWorkerJob).where(
+                            JiraWorkerJob.ticket_id == row.ticket_id,
+                            JiraWorkerJob.kind == "role_job",
+                        )
+                    )
+                    previous = {
+                        prior.meter.prices
+                        for item in rows
+                        if (
+                            prior := Execution.model_validate_json(
+                                json.dumps(item.payload)
+                            )
+                        ).meter
+                        is not None
+                        and prior.pack == execution.pack
+                    }
+                    if len(previous) > 1:
+                        raise ValueError(
+                            "Historical ticket has conflicting frozen model prices"
+                        )
+                    prices = (
+                        previous.pop()
+                        if previous
+                        else model_prices(self.config, execution.pack)
+                    )
+                if prices.source != execution.reservation.price_source:
+                    raise ValueError(
+                        "Frozen reservation differs from the model price source"
+                    )
+                if state.model_prices is None:
+                    replace_state(
+                        ticket, state, model_prices=prices.model_dump(mode="json")
+                    )
                 row.payload = execution.model_copy(
                     update={
-                        "meter": Meter(prices=model_prices(self.repositories.runtime)),
+                        "meter": Meter(prices=prices),
                         "model_identity": model_identity(job),
                     }
                 ).model_dump(mode="json")
@@ -888,6 +925,10 @@ def build_delivery_factory(
     ]
     if config.jira_worker_llm_api_key:
         values.append(config.jira_worker_llm_api_key.get_secret_value())
+    values.extend(
+        upstream.api_key.get_secret_value()
+        for upstream in config.jira_worker_delivery_upstreams.values()
+    )
     secrets = SecretGuard(forbidden_values=tuple(value for value in values if value))
     for policy in policies.values():
         secrets.check(policy.model_dump_json())

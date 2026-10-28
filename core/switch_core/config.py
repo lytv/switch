@@ -39,6 +39,13 @@ class JiraWorkerModelPrices(BaseModel):
     source: str = Field(min_length=1, pattern=r"\S")
 
 
+class JiraWorkerDeliveryUpstream(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    base_url: str
+    api_key: SecretStr
+    prices: JiraWorkerModelPrices
+
+
 class JiraWorkerDeliveryRuntime(BaseModel):
     model_config = ConfigDict(extra="forbid")
     checkout: Path
@@ -232,7 +239,10 @@ class SwitchConfig(BaseSettings):
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
     jira_worker_delivery_execution_enabled: bool = False
-    jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0"] = "2.0.0-draft"
+    jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0", "2.0.0-deepseek"] = (
+        "2.0.0-draft"
+    )
+    jira_worker_delivery_upstreams: dict[str, JiraWorkerDeliveryUpstream] = {}
     jira_worker_delivery_runtime: JiraWorkerDeliveryRuntime | None = None
     jira_worker_delivery_language_pricing: JiraWorkerLanguagePricing | None = None
     # Watermark poll period for enabled projects (read-only Jira search).

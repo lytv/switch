@@ -35,6 +35,7 @@ def load_pack(config: SwitchConfig) -> FrozenPack:
     pins = {
         "2.0.0-draft": "965793653f39572b8b0a85134ef1ebeb5c0a77c19cbe81cc689354166d428fbf",
         "2.0.0": "aa1e6a26ec686cd0097d6fe416258cac5989029511dca798fbb34e94314a07b6",
+        "2.0.0-deepseek": "b60133794230b234a3ad67b3db9aff6d195d6ba3a2e58660e28305701c2e9242",
     }
     if digest(pack) != pins[version]:
         raise ValueError(f"Historical immutable delivery@{version} pack changed")
