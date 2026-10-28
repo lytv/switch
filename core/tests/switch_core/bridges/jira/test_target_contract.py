@@ -400,6 +400,7 @@ async def test_new_kan_ticket_uses_legacy_policy(session_factory):
     stored = await ingest(session_factory, key="KAN-1")
     assert stored.workflow_state["policy"] == "legacy_intake"
     assert stored.service_value is None
+    assert stored.agent_generation == 0
 
 
 async def test_flattened_webhook_uses_same_target_and_issue_baseline(session_factory):
@@ -687,6 +688,7 @@ async def test_existing_legacy_policy_is_not_upgraded(session_factory, key):
         stored = await session.scalar(select(JiraWorkerTicket))
         assert stored.workflow_state["policy"] == "legacy_intake"
         assert stored.service_value is None
+        assert stored.agent_generation == 0
 
 
 @pytest.mark.parametrize(

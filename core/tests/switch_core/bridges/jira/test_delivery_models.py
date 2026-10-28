@@ -218,6 +218,29 @@ def test_incomplete_or_invalid_usage_still_refuses(usage):
         _counts({"usage": usage})
 
 
+@pytest.mark.parametrize("generation", [0, 1, 7])
+@pytest.mark.parametrize("parked", [False, True])
+def test_target_initialization_starts_only_zero_generation(
+    settings, generation, parked
+):
+    reason = "Administrator fence" if parked else None
+    ticket = JiraWorkerTicket(
+        instance="acme",
+        project_key="TEST",
+        agent_generation=generation,
+        agent_state="parked" if parked else "wake_requested",
+        worker_parked_reason=reason,
+    )
+    initialize_target(
+        ticket,
+        {"customfield_12345": "Bug", "description": f"Repository URL: {URL}"},
+        settings,
+    )
+    assert ticket.agent_generation == (1 if generation == 0 else generation)
+    assert ticket.worker_parked_reason == reason
+    assert ticket.agent_state == ("parked" if parked else "wake_requested")
+
+
 def test_ticket_freezes_pack_and_prices_across_switch_and_retriage(settings):
     settings.jira_worker_delivery_pack = "2.0.0"
     ticket = JiraWorkerTicket(instance="acme", project_key="TEST", agent_generation=1)
