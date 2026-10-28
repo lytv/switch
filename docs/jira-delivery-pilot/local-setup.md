@@ -245,7 +245,7 @@ It does not prove live permissions, OS confinement, provider limit behavior, cha
 After separate live-run approval, set `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=true` and restart the existing server.
 A new AGD ticket with Service `Bug` and exactly one `Repository URL: https://github.com/example/project` line enters delivery intake.
 The supervisor verifies canonical identity and the default branch SHA through the trusted forge API before checkout.
-It stages the bounded scope only after intake completes.
+It stages the bounded scope only after intake completes and product corroboration passes (automatic match or authorized human repository confirmation).
 The Jira scope gate must succeed before any native role starts.
 Review and QA use separate native tasks at the tested candidate; QA repeats the original failure at the base.
 The candidate gate grants no merge authority. A human merges through the forge.

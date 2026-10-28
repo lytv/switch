@@ -134,8 +134,9 @@ triage, checkout, execution, or publication. The configured live factory supplie
 A verified repository proves the forge holds that repository, not that it
 belongs to the ticket's product. When the admission policy pins
 `product_markers`, trusted admission corroborates them against the ticket
-text and bounded forge facts (repository name, description, topics, and root
-tree names at the pinned base commit). Repository facts are untrusted
+text and bounded forge facts (description, topics, and root
+tree names at the pinned base commit). Repository identities and the
+Repository URL line never corroborate on either side. Repository facts are untrusted
 content: they can only veto automatic admission, never authorize it. No
 repository registration list applies; markers name product language, never
 repository identities. A clear match stages scope as before. A mismatch or
@@ -170,7 +171,8 @@ Direct scheduler callers must still supply their factory explicitly.
 See [local live setup](../../../../docs/jira-delivery-pilot/local-setup.md) for configuration.
 
 Trusted admission calls `delivery.stage_scope` under the ticket row lock after
-repository triage. It supplies the Bug Job, approved commands and expected
+repository triage and product corroboration (automatic match or authorized
+human confirmation). It supplies the Bug Job, approved commands and expected
 outcomes, allowed and forbidden paths, dedicated generation branch, reservations,
 estimates, and the rendered Switch dev profile. Validate and render that profile
 from its exact reviewed skills-library commit. `RoleProfile` records that commit
