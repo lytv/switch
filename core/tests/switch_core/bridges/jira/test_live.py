@@ -769,13 +769,16 @@ async def test_product_mismatch_stops_before_scope(
             assert ticket.intake_state["history"] == confirmed_history
             assert state.scope is None and state.gate is None
             assert state.repository_match.confirmation is not None
-            assert set(
-                await session.scalars(
-                    select(JiraWorkerOutbox.id).where(
-                        JiraWorkerOutbox.issue_key == "AGD-19"
+            assert (
+                set(
+                    await session.scalars(
+                        select(JiraWorkerOutbox.id).where(
+                            JiraWorkerOutbox.issue_key == "AGD-19"
+                        )
                     )
                 )
-            ) == confirmed_commands
+                == confirmed_commands
+            )
         assert len(model.calls) == 1
         # Confirmation resumes normal scope staging; scope approval stays separate.
         await LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})(
@@ -979,11 +982,11 @@ async def test_scope_rejection_requires_fresh_corrected_generation(
         {("acme", "TEST"): policy},
     )
 
-    async def triage(supplied):
+    async def triage_evidence(supplied):
         assert supplied == URL
-        return rejected_scope.job.repository
+        return rejected_scope.job.repository, {}, (), True
 
-    monkeypatch.setattr(admission, "triage", triage)
+    monkeypatch.setattr(admission, "_triage_evidence", triage_evidence)
     await admission("ticket")
     ticket, state = await current(session_factory)
     assert state.scope is None and state.gate is None
