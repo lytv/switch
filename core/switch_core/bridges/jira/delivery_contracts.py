@@ -80,9 +80,7 @@ class VerificationContract(Contract):
     complete_transition_id: Text
 
 
-class ScopeContract(Contract):
-    job: Job
-    branch: Text
+class ScopePolicy(Contract):
     allowed_paths: tuple[Text, ...] = Field(min_length=1)
     forbidden_paths: tuple[Text, ...]
     checks: tuple[ApprovedCheck, ...] = Field(min_length=1)
@@ -102,18 +100,7 @@ class ScopeContract(Contract):
         return data
 
     @model_validator(mode="after")
-    def scope_is_bounded(self) -> Self:
-        run = self.job.run
-        if run.step != "reproduce" or run.attempt != 1:
-            raise ValueError("Scope must start with one reproduction attempt")
-        if (
-            self.branch != f"switch/{run.ticket_id}/{run.generation}"
-            or re.fullmatch(
-                r"switch/[A-Za-z0-9][A-Za-z0-9_-]*/[1-9][0-9]*", self.branch
-            )
-            is None
-        ):
-            raise ValueError("Scope requires the generation's dedicated branch")
+    def policy_is_bounded(self) -> Self:
         if len({check.id for check in self.checks}) != len(self.checks):
             raise ValueError("Approved check IDs must be unique")
         if self.verification is not None:
@@ -129,6 +116,26 @@ class ScopeContract(Contract):
         for path in (*self.allowed_paths, *self.forbidden_paths):
             if path.startswith("/") or ".." in PurePosixPath(path).parts:
                 raise ValueError("Scope paths must stay inside the repository")
+        return self
+
+
+class ScopeContract(ScopePolicy):
+    job: Job
+    branch: Text
+
+    @model_validator(mode="after")
+    def scope_is_bounded(self) -> Self:
+        run = self.job.run
+        if run.step != "reproduce" or run.attempt != 1:
+            raise ValueError("Scope must start with one reproduction attempt")
+        if (
+            self.branch != f"switch/{run.ticket_id}/{run.generation}"
+            or re.fullmatch(
+                r"switch/[A-Za-z0-9][A-Za-z0-9_-]*/[1-9][0-9]*", self.branch
+            )
+            is None
+        ):
+            raise ValueError("Scope requires the generation's dedicated branch")
         return self
 
 

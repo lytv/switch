@@ -45,7 +45,7 @@ class Reservation(Contract):
 
 class Pack(Contract):
     schema_version: Literal[1]
-    fixture_only: Literal[True]
+    fixture_only: bool
     id: Literal["delivery"]
     version: Version
     firstmate_commit: Commit
@@ -252,6 +252,64 @@ class Usage(Contract):
         if (self.estimated_usd is None) != (self.price_source is None):
             raise ValueError("An estimate requires an explicit price source")
         return self
+
+
+class ModelPrices(Contract):
+    input: USD
+    output: USD
+    cache_read: USD
+    cache_write: USD
+    source: Text
+
+    @property
+    def maximum(self) -> Decimal:
+        return max(self.input, self.output, self.cache_read, self.cache_write)
+
+    @model_validator(mode="after")
+    def positive_maximum(self) -> Self:
+        if self.maximum <= 0:
+            raise ValueError("Model prices require a positive token price")
+        return self
+
+
+class Meter(Contract):
+    prices: ModelPrices
+    input_tokens: Count = 0
+    output_tokens: Count = 0
+    cache_read_tokens: Count = 0
+    cache_write_tokens: Count = 0
+    pending: bool = False
+    pending_since: Text | None = None
+    uncertain: bool = False
+    stopped: bool = False
+
+    def usage(self, pack: Pack) -> Usage:
+        counts = (
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+        rates = (
+            self.prices.input,
+            self.prices.output,
+            self.prices.cache_read,
+            self.prices.cache_write,
+        )
+        return Usage(
+            measurement="partial" if self.pending or self.uncertain else "complete",
+            provider=pack.provider,
+            model=pack.model,
+            input_tokens=counts[0],
+            output_tokens=counts[1],
+            cache_read_tokens=counts[2],
+            cache_write_tokens=counts[3],
+            estimated_usd=sum(
+                (count * rate for count, rate in zip(counts, rates)), Decimal("0")
+            ),
+            price_source=self.prices.source,
+            billing="estimate_not_subscription_invoice",
+        )
 
 
 class Result(Contract):

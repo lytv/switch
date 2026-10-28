@@ -22,14 +22,26 @@ Tickets that exceed room or session capacity remain in the worker's To Do queue.
 Admission selects the oldest unclaimed ticket in an enabled project first, including one that has no queue reason yet. The queue does not overwrite
 Jira status or a human decision.
 
+## Local AGD delivery
+
+Select `JIRA_WORKER_DELIVERY_PACK=2.0.0` for live version 2 tickets.
+Map only the intended project in `JIRA_WORKER_DELIVERY_PROJECTS`.
+Configure `JIRA_WORKER_DELIVERY_RUNTIME` with the separate pinned Firstmate copy,
+private roots, trusted policy files, supervisor forge authorization, and token prices.
+Keep `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=false` during preparation.
+The [local setup procedure](../../../../docs/jira-delivery-pilot/local-setup.md)
+contains the complete `.env` example and readiness command.
+Enable execution only after the separate live prerequisites and human authorization pass.
+
 ## Frozen workflow state
 
 Existing tickets retain the `delivery@1` legacy intake policy. New tickets also
 use that policy unless their project has a draft delivery field mapping.
 Draft delivery intake does not start coding jobs or grant approval authority.
 
-`packs.py` loads the immutable `delivery@2.0.0-draft` fixture. It checks the
-historical digest before it creates a snapshot with configured budgets.
+`packs.py` defaults to the immutable `delivery@2.0.0-draft` fixture.
+`JIRA_WORKER_DELIVERY_PACK=2.0.0` selects the separate supported live pack.
+The loader checks each release digest before it creates a snapshot with configured budgets.
 A ticket stores its snapshot and digest together. Later configuration or pack
 file changes do not change that stored snapshot. The draft remains fixture-only.
 Typed state and result contracts validate JSON at the workflow boundary.
@@ -42,7 +54,7 @@ Typed state and result contracts validate JSON at the workflow boundary.
 
 Costs are USD estimates, not subscription invoices. These settings do not change
 the existing intake limit of 50000 tokens. The delivery lifecycle reserves these budgets before a task starts. Delivery
-execution stays off unless an operator supplies the explicit supervisor integration.
+execution stays off unless an operator enables and configures the server integration.
 
 The scheduler claims only explicit job kinds. The intake scheduler claims
 watermark polls, not role jobs or unknown kinds. Execution keys remain unique
@@ -78,7 +90,7 @@ Repository URL: https://forge.example/team/project
 Plain text and Jira document descriptions use the same extraction. An explicitly
 configured custom field contains the URL directly. No repository registration
 list applies. Poll and version reads request labels and all configured target
-fields. Webhook and poll admission freeze the same draft pack, Service, source
+fields. Webhook and poll admission freeze the same selected pack, Service, source
 field names, and unverified repository URL in `workflow_state`.
 
 A ticket URL does not authorize checkout. A trusted triage adapter calls
@@ -89,7 +101,7 @@ the same host and repository path. Credential-bearing HTTPS URLs, queries,
 fragments, and path traversal cannot authorize checkout. Unknown or invalid
 results contain no checkout pins. A verified target stays frozen.
 The intake model cannot verify repositories. Field mapping alone does not provision
-triage, checkout, execution, or publication.
+triage, checkout, execution, or publication. The configured live factory supplies these boundaries.
 
 Bug intake without a verified target records its summary and requests trusted
 triage. It does not queue scope approval until trusted triage verifies the target.
@@ -106,10 +118,11 @@ repository triage and scope approval before another code job can start.
 
 ## Scope approval and Bug execution
 
-`JIRA_WORKER_DELIVERY_EXECUTION_ENABLED` defaults to `false`. Enabling it also
-requires an explicitly supplied `delivery_factory` on `JiraWorkerScheduler`.
-Startup refuses a missing factory. The server entry point does not provision
-that factory. This change enables no live project or paid worker.
+`JIRA_WORKER_DELIVERY_EXECUTION_ENABLED` defaults to `false`.
+The server provisions `delivery_factory` from `JIRA_WORKER_DELIVERY_RUNTIME` when enabled.
+Startup refuses fixture packs, missing policies, mismatched runtime pins, or invalid role prices.
+Direct scheduler callers must still supply their factory explicitly.
+See [local live setup](../../../../docs/jira-delivery-pilot/local-setup.md) for configuration.
 
 Trusted admission calls `delivery.stage_scope` under the ticket row lock after
 repository triage. It supplies the Bug Job, approved commands and expected
@@ -150,8 +163,9 @@ on the dedicated branch, with the verified repository as its origin. Do not shar
 that checkout with human work or another ticket. The native boundary checks these
 identities before it launches the task. Firstmate retains responsibility for
 isolated worktree and process mechanics. OS confinement, approved-command
-permissions, and the external metered model gateway remain prerequisites for
-live enablement; task text does not implement a sandbox.
+permissions remain prerequisites for live enablement; task text does not implement a sandbox.
+The live server supplies execution-scoped model access and trusted metering.
+Worker homes receive only a revocable capability for their own reserved model access, never upstream credentials.
 
 The profile uses a bounded `envelope.json` plus a separate `handoff.json`.
 The adapter supplies paths, pack limits, and `handoff-schema.json`. Write the
@@ -253,7 +267,7 @@ must mount these checkouts read-only and deny publisher credentials and push
 access. These filesystem and network restrictions remain operational
 prerequisites, not a prompt-based sandbox. The adapter checks HEAD and clean
 state before launch and after exit. It rejects edits rather than certifying
-changed code. No checkout or sandbox provisioning occurs here.
+changed code. The live integration provisions separate checkouts; OS sandbox provisioning remains an operator prerequisite.
 
 Bounded dev rework can update only the same open draft through the trusted
 publisher. The sealed object store proves ancestry; the push remains non-forced.
@@ -286,7 +300,7 @@ and archival mechanisms. Delivery records `delivered`; a human close or cancel
 records `closed_by_human`. A head change invalidates review, QA, and acceptance.
 Late rejected results retain their usage accounting. Done means accepted,
 human-merged, and smoke-checked, not deployed. All execution remains opt-in and
-off by default; no default server factory or release pin changes.
+off by default. Existing fixture and legacy tickets retain their frozen policies.
 
 Version 2 Jira writes use `transition_by_id`. The command binds generation, pack
 digest, phase, gate, candidate SHA, source status ID, target status ID, and exact
@@ -358,13 +372,14 @@ alert. At twice the duration estimate, the service queues an admin alert but
 continues within the existing budget. Polls and reminders run independently of
 these short lifecycle calls.
 
-These primitives do not prove an OS sandbox, trusted live metering, or real
-provider process-tree cancellation. A worker can exceed a limit between usage
-observations. Prompts and reservation accounting cannot prevent that spend.
-Before live enablement, deployment must supply isolation, credential-free model
-access, and trusted metering that prevents additional spend at the limit.
-The draft fixture pack is not a production runtime. Tests use real PostgreSQL
-and fake Firstmate processes, never paid agents or standing homes.
+The standalone primitives do not prove an OS sandbox or real provider process-tree cancellation.
+The live integration meters provider responses inside the server and bounds each request before dispatch.
+It freezes the configured price table per execution and refuses another request after cancellation or unknown spend.
+A server crash retains an in-flight hold; recovery never repeats that uncertain model call.
+Native results cannot replace trusted usage with worker-authored counts.
+Deployment must still prove OS isolation, upstream token-limit behavior, and real process-tree cancellation.
+The draft fixture remains unchanged and cannot authorize live execution.
+Tests use real PostgreSQL and fake Firstmate processes, never paid agents or standing homes.
 
 ## Ticket rooms
 
@@ -629,7 +644,7 @@ summary can be queued. That question is the first question of the new cycle's
 five-question budget.
 Any accompanying human field change, unrelated comment, or
 existing human park still stops the worker. The worker never clears that park.
-Role agents, code work, routing, attachments, and linked tickets remain out of scope.
+Legacy intake does not start role agents or code work. Attachments and linked tickets remain outside this intake interface.
 
 ## Hardening and recovery
 

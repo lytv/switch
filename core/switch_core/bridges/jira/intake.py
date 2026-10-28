@@ -430,9 +430,18 @@ class IntakeOrchestrator:
                         elif (
                             target.repository is None
                             or target.repository.outcome != "verified"
+                            or (
+                                not target.pack.snapshot.fixture_only
+                                and target.scope is None
+                            )
                         ):
                             phase = "triage"
-                            reason = "Repository triage required before scope approval or checkout"
+                            reason = (
+                                "Trusted scope admission required before scope approval"
+                                if target.repository is not None
+                                and target.repository.outcome == "verified"
+                                else "Repository triage required before scope approval or checkout"
+                            )
                             content += "\n" + reason
                         else:
                             content += (

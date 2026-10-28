@@ -63,6 +63,8 @@ from switch_core.bridges.collaboration.telegram.adapter import (
 )
 from switch_core.bridges.jira.admin import SwitchAdminBoard
 from switch_core.bridges.jira.identity import ensure_jira_system_agent
+from switch_core.bridges.jira.live import build_delivery_factory
+from switch_core.bridges.jira.model_gateway import DeliveryModelGateway
 from switch_core.bridges.jira.rooms import SwitchCardUpdater, SwitchTicketRooms
 from switch_core.bridges.jira.worker import JiraWorkerScheduler, build_poll_clients
 from switch_core.bridges.resource.service import ResourceService
@@ -429,6 +431,9 @@ async def run(config: SwitchConfig) -> None:
 
     # ── Lifespan: start server-side connectors once HTTP is serving ────────
     worker_scheduler: JiraWorkerScheduler | None = None
+    delivery_factory = build_delivery_factory(
+        session_factory=session_factory, config=config
+    )
     if config.jira_worker_enabled_projects and config.jira_worker_credentials:
         ticket_rooms = SwitchTicketRooms(
             room_service=room_service,
@@ -437,10 +442,15 @@ async def run(config: SwitchConfig) -> None:
             agent_store=agent_store,
             config=config,
         )
+        if delivery_factory is not None:
+            agent_bridge_app.include_router(
+                DeliveryModelGateway(session_factory, config).router
+            )
         worker_scheduler = JiraWorkerScheduler(
             session_factory=session_factory,
             config=config,
             poll_clients=build_poll_clients(config),
+            delivery_factory=delivery_factory,
             ticket_rooms=ticket_rooms,
             card_updater=SwitchCardUpdater(ticket_rooms=ticket_rooms),
             admin_board=SwitchAdminBoard(

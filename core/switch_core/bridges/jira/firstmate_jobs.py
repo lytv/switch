@@ -32,7 +32,9 @@ from switch_core.bridges.jira.contracts import (
     USD,
     Contract,
     Count,
+    Digest,
     Job,
+    Meter,
     Pack,
     Positive,
     Reservation,
@@ -69,6 +71,8 @@ class Execution(Contract):
     envelope: ExecutionEnvelope | None = None
     handoff: Handoff | None = None
     pack: Pack
+    meter: Meter | None = None
+    model_identity: Digest | None = None
     reservation: Reservation
     estimate_seconds: Positive
     started_at: Text
