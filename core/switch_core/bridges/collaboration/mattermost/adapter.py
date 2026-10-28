@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 # stream unbounded data into memory.
 _MAX_BOT_ICON_BYTES = 5 * 1024 * 1024
 
+# Mattermost validates purpose length in Unicode characters, not UTF-8 bytes.
+_MAX_CHANNEL_PURPOSE_CHARS = 250
+
 # Mattermost channel types a bot can be *added* to: open and private channels.
 # Membership of a DM ("D") or group DM ("G") is a property of the conversation
 # existing rather than of anyone joining, so Mattermost raises no `user_added`
@@ -776,6 +779,15 @@ class MattermostAdapter(CollaborationAdapter):
                 f"Cannot create {channel_type} channels — they are initiated from the messaging platform"
             )
 
+        purpose = topic[:_MAX_CHANNEL_PURPOSE_CHARS]
+        if len(topic) > _MAX_CHANNEL_PURPOSE_CHARS:
+            logger.warning(
+                "Truncating Mattermost channel purpose from %d to %d characters; "
+                "the full topic remains in Switch",
+                len(topic),
+                _MAX_CHANNEL_PURPOSE_CHARS,
+            )
+
         mm_type = "P" if channel_type == "channel_private" else "O"
         channel_name = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:64]
         channel_id: str | None = None
@@ -789,7 +801,7 @@ class MattermostAdapter(CollaborationAdapter):
                     "name": channel_name,
                     "display_name": name,
                     "type": mm_type,
-                    "purpose": topic,
+                    "purpose": purpose,
                 },
             )
             channel_id = channel["id"]
@@ -808,7 +820,7 @@ class MattermostAdapter(CollaborationAdapter):
                     "name": unique_name,
                     "display_name": name,
                     "type": mm_type,
-                    "purpose": topic,
+                    "purpose": purpose,
                 },
             )
             channel_id = channel["id"]
