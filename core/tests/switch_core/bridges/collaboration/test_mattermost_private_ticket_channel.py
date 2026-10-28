@@ -46,6 +46,35 @@ async def test_channel_default_member_is_explicit(invite_default_member):
         users.get_user_by_username.assert_not_called()
 
 
+@pytest.mark.parametrize("topic", ["", "Short ticket topic", "a" * 250, "界" * 251])
+@pytest.mark.parametrize("retry", [False, True])
+async def test_channel_purpose_respects_character_limit(topic, retry, caplog):
+    adapter = _adapter()
+    purposes = []
+
+    def create_channel(payload):
+        purpose = payload["purpose"]
+        assert len(purpose) <= 250
+        purposes.append(purpose)
+        if retry and len(purposes) == 1:
+            raise ValueError("Channel name already exists")
+        return {"id": "ticket-channel"}
+
+    channels = SimpleNamespace(create_channel=Mock(side_effect=create_channel))
+    adapter._admin_driver = SimpleNamespace(channels=channels)
+    adapter._main_loop = asyncio.get_running_loop()
+    adapter._team_id = "test-team"
+
+    assert (
+        await adapter.create_channel("Ticket", topic, invite_default_member=False)
+        == "ticket-channel"
+    )
+    assert purposes == [topic[:250]] * (2 if retry else 1)
+    assert ("Truncating Mattermost channel purpose" in caplog.text) == (
+        len(topic) > 250
+    )
+
+
 async def test_claimed_account_invite_does_not_follow_reassigned_username():
     adapter = _adapter()
     channels = SimpleNamespace(add_user=Mock())
