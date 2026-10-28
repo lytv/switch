@@ -1,5 +1,7 @@
 """Unit proof for trusted product corroboration: untrusted facts only veto."""
 
+import pytest
+
 from switch_core.bridges.jira.contracts import Repository
 from switch_core.bridges.jira.delivery_contracts import ApprovalRoute
 from switch_core.bridges.jira.repository_match import (
@@ -49,6 +51,34 @@ def check(**overrides):
 
 def test_match_when_ticket_and_facts_share_markers():
     assert check().outcome == "match"
+
+
+@pytest.mark.parametrize(
+    ("ticket_marker", "facts_marker", "outcome"),
+    [
+        ("booking", "booking", "match"),
+        ("sandbox", "sandbox", "match"),
+        ("booking", "sandbox", "mismatch"),
+        ("sandbox", "booking", "mismatch"),
+    ],
+)
+@pytest.mark.parametrize("fact_template", ["Agent {} service", "{}_utils.py"])
+@pytest.mark.parametrize("structured_ticket", [False, True])
+def test_match_requires_the_same_marker(
+    ticket_marker, facts_marker, outcome, fact_template, structured_ticket
+):
+    text = f"{ticket_marker} preview returns 7"
+    ticket = (
+        {"type": "doc", "content": [{"type": "text", "text": text}]}
+        if structured_ticket
+        else text
+    )
+    match = check(
+        ticket_text=ticket,
+        facts=(fact_template.format(facts_marker.upper()),),
+        markers=("BOOKING", "SANDBOX"),
+    )
+    assert match.outcome == outcome
 
 
 def test_mismatch_when_facts_lack_ticket_markers():

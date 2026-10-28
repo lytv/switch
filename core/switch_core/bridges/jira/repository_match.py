@@ -90,7 +90,7 @@ def evaluate_repository_match(
     haystack = "\n".join(facts).casefold()
     pinned = tuple(marker for marker in map(normalize_marker, markers) if marker)
     ticket_hit = any(marker in ticket for marker in pinned)
-    facts_hit = facts_available and any(marker in haystack for marker in pinned)
+    shared_marker = any(marker in ticket and marker in haystack for marker in pinned)
     outcome: Literal["match", "mismatch", "unclear"]
     if not facts_available:
         outcome = "unclear"
@@ -98,7 +98,7 @@ def evaluate_repository_match(
             "Trusted forge reads did not supply bounded product facts; "
             "an authorized human must confirm the repository before scope."
         )
-    elif ticket_hit and facts_hit:
+    elif shared_marker:
         outcome = "match"
         reason = "Ticket product markers corroborate the verified repository facts."
     elif ticket_hit:

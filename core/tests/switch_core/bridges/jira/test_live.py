@@ -462,9 +462,13 @@ class AgdJira:
 
 
 @pytest.mark.parametrize("live_setup", ["2.0.0-deepseek"], indirect=True)
-@pytest.mark.parametrize("matched", [True, False], ids=["matched", "wrong-product"])
+@pytest.mark.parametrize(
+    ("matched", "split_markers"),
+    [(True, False), (False, False), (False, True)],
+    ids=["matched", "wrong-product", "split-markers"],
+)
 async def test_product_mismatch_stops_before_scope(
-    session_factory, live_setup, monkeypatch, matched
+    session_factory, live_setup, monkeypatch, matched, split_markers
 ):
     settings, _, policy, lab = live_setup
     settings.jira_worker_enabled_projects = {"acme": ["AGD"]}
@@ -488,7 +492,14 @@ async def test_product_mismatch_stops_before_scope(
             ),
         }
     )
-    product = "Disposable booking sandbox"
+    product = "Booking" if split_markers else "Disposable booking sandbox"
+    repository_description = (
+        product
+        if matched
+        else "Agent sandbox for orchestration"
+        if split_markers
+        else "Agent orchestration service"
+    )
     path = "booking-sandbox" if matched else "orchestration-service"
     url = f"https://example.invalid/team/{path}"
     issue = {
@@ -588,9 +599,7 @@ async def test_product_mismatch_stops_before_scope(
                 json={
                     "clone_url": url,
                     "default_branch": "main",
-                    "description": product
-                    if matched
-                    else "Agent orchestration service",
+                    "description": repository_description,
                 },
             )
         if request.url.path == f"/repos/team/{path}/commits/main":
@@ -679,7 +688,7 @@ async def test_product_mismatch_stops_before_scope(
             comments = [row for row in rows if row.command == "comment"]
             assert len(comments) == 2
             assert "Repository confirmation required" in comments[1].payload["data"]
-            assert "Agent orchestration service" in comments[1].payload["data"]
+            assert repository_description in comments[1].payload["data"]
             assert (
                 comments[1].payload.get("repository_digest")
                 == delivery_state(ticket).gate.contract_digest
