@@ -17,6 +17,7 @@ from switch_core.bridges.jira.contracts import (
     Count,
     Gate,
     Job,
+    ModelPrices,
     Question,
     Repository,
     Text,
@@ -46,6 +47,7 @@ class DeliveryWorkflowState(Contract):
     schema_version: Literal[1] = 1
     policy: Literal["delivery"] = "delivery"
     pack: FrozenPack
+    model_prices: ModelPrices | None = None
     service: Literal["Bug", "Feature", "Docs", "Other"]
     repository: Repository | None = None
     service_field: Text | None = None

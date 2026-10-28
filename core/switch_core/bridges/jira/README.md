@@ -24,7 +24,7 @@ Jira status or a human decision.
 
 ## Local AGD delivery
 
-Select `JIRA_WORKER_DELIVERY_PACK=2.0.0` for live version 2 tickets.
+Select `JIRA_WORKER_DELIVERY_PACK=2.0.0` for GPT or `2.0.0-deepseek` for DeepSeek version 2 tickets.
 Map only the intended project in `JIRA_WORKER_DELIVERY_PROJECTS`.
 Configure `JIRA_WORKER_DELIVERY_RUNTIME` with the separate pinned Firstmate copy,
 private roots, trusted policy files, supervisor forge authorization, and token prices.
@@ -40,11 +40,39 @@ use that policy unless their project has a draft delivery field mapping.
 Draft delivery intake does not start coding jobs or grant approval authority.
 
 `packs.py` defaults to the immutable `delivery@2.0.0-draft` fixture.
-`JIRA_WORKER_DELIVERY_PACK=2.0.0` selects the separate supported live pack.
+`JIRA_WORKER_DELIVERY_PACK=2.0.0` selects the unchanged live GPT pack (`switch-delivery/gpt-4.1-2025-04-14`).
+`JIRA_WORKER_DELIVERY_PACK=2.0.0-deepseek` selects the separate immutable DeepSeek pack (`switch-delivery-deepseek/deepseek-v4-pro`).
+Both release digests remain pinned in `packs.py`.
 The loader checks each release digest before it creates a snapshot with configured budgets.
 A ticket stores its snapshot and digest together. Later configuration or pack
 file changes do not change that stored snapshot. The draft remains fixture-only.
 Typed state and result contracts validate JSON at the workflow boundary.
+
+For independent delivery upstreams, configure `JIRA_WORKER_DELIVERY_UPSTREAMS` as a JSON map keyed by the pack's private provider.
+Each entry requires `base_url`, secret `api_key`, and a `prices` table (`input`, `output`, `cache_read`, `cache_write`, `source`).
+Configure `switch-delivery` with the GPT endpoint and key.
+Configure `switch-delivery-deepseek` with the DeepSeek-compatible endpoint and key that serves `deepseek-v4-pro`.
+The gateway routes by the execution's frozen provider, not the current pack selection.
+A nonempty map refuses missing providers. Keep entries for providers that frozen tickets still need.
+With no map, delivery retains `JIRA_WORKER_LLM_BASE_URL`, `JIRA_WORKER_LLM_API_KEY`, and runtime prices.
+The legacy KAN/intake path always retains `JIRA_WORKER_LLM_*`; its model behavior does not change.
+Delivery never uses `JIRA_WORKER_LLM_MODEL` to override a pinned model.
+
+Prepare both entries and the trusted policy once for a one-setting switch.
+Use a reviewed source covering both tables and the same source in all policy reservations.
+Reserve enough USD for the larger maximum token price across both tables.
+Then change only `JIRA_WORKER_DELIVERY_PACK` and restart the server.
+New tickets use the selection. Frozen tickets retain their pack and price snapshot; existing meters retain their prices.
+Historical tickets without a price snapshot recover earlier meter prices; conflicting prices refuse new roles.
+With no earlier meter, the first role freezes configured prices, subject to the reservation's existing source.
+Worker environments receive no upstream key; the server's secret guard includes every configured delivery key.
+
+Readiness checks the selected immutable pack and its upstream URL/key without a provider request.
+The proposed scope's pack digest must equal `load_pack(config).digest`, including configured budgets.
+Its policy reservations must use the selected upstream's price source and cover its maximum token price.
+The [local setup procedure](../../../../docs/jira-delivery-pilot/local-setup.md) contains both upstream examples.
+The gateway accepts OpenAI cache details and DeepSeek `prompt_cache_hit_tokens` without counting tokens twice.
+It refuses conflicting or invalid cache counts. Missing cache fields count all prompt tokens as uncached.
 
 | Environment variable | Default |
 | --- | ---: |

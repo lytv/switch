@@ -99,7 +99,7 @@ async def live_setup(session_factory, request, monkeypatch, tmp_path):
         "switch-firstmate-delivery-v1\n"
     )
     _script(tmp_path / "tools/pi", 'print("1.4.0")\n')
-    settings.jira_worker_delivery_pack = "2.0.0"
+    settings.jira_worker_delivery_pack = getattr(request, "param", "2.0.0")
     values = settings.model_dump(mode="json")
     values.update(
         jira_worker_credentials={
@@ -208,6 +208,7 @@ def test_live_and_fixture_pack_pins_stay_separate():
     assert build_delivery_factory(session_factory=None, config=settings) is None
 
 
+@pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)
 async def test_live_preflight_only_leaves_human_evidence(live_setup, monkeypatch):
     settings, scope, _, _ = live_setup
     settings.jira_worker_delivery_execution_enabled = False
@@ -221,6 +222,36 @@ async def test_live_preflight_only_leaves_human_evidence(live_setup, monkeypatch
         )
     )
     assert check_readiness(settings, scope, "acme", "TEST")["delivery_runtime"]
+
+
+@pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)
+async def test_readiness_uses_selected_delivery_upstream(live_setup, monkeypatch):
+    settings, scope, _, _ = live_setup
+    provider = live.load_pack(settings).snapshot.provider
+    values = settings.model_dump()
+    values["jira_worker_delivery_upstreams"] = {
+        provider: {
+            "base_url": "https://delivery.example.invalid/v1",
+            "api_key": "PLACEHOLDER_DELIVERY_VALUE",
+            "prices": settings.jira_worker_delivery_runtime.prices,
+        }
+    }
+    values["jira_worker_llm_base_url"] = "http://invalid-legacy.example.invalid"
+    values["jira_worker_llm_api_key"] = None
+    settings = type(settings).model_validate(values)
+    settings.jira_worker_delivery_execution_enabled = False
+    monkeypatch.setattr("switch_core.bridges.jira.readiness.load_pack", live.load_pack)
+    checks = check_readiness(settings, scope, "acme", "TEST")
+    assert checks["model_upstream"] is None and checks["delivery_runtime"] is None
+    upstream = settings.jira_worker_delivery_upstreams[provider]
+    settings.jira_worker_delivery_upstreams[provider] = upstream.model_copy(
+        update={"base_url": "http://invalid-delivery.example.invalid"}
+    )
+    checks = check_readiness(settings, scope, "acme", "TEST")
+    assert checks["model_upstream"] and checks["delivery_runtime"]
+    settings.jira_worker_delivery_upstreams = {"another-provider": upstream}
+    checks = check_readiness(settings, scope, "acme", "TEST")
+    assert checks["model_upstream"] and checks["delivery_runtime"]
 
 
 async def test_trusted_triage_stages_scope_without_checkout_or_approval(
@@ -359,10 +390,22 @@ async def test_live_intake_waits_for_trusted_scope_before_approval_request(
     assert staged.step == "approve_scope" and not staged.approvals
 
 
+@pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)
 async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
     session_factory, live_setup, monkeypatch
 ):
     settings, scope, _, lab = live_setup
+    pack = live.load_pack(settings).snapshot
+    values = settings.model_dump()
+    values["jira_worker_delivery_upstreams"] = {
+        provider: {
+            "base_url": f"https://{provider}.example.invalid/v1",
+            "api_key": f"PLACEHOLDER_{provider}_VALUE",
+            "prices": settings.jira_worker_delivery_runtime.prices,
+        }
+        for provider in ("switch-delivery", "switch-delivery-deepseek")
+    }
+    settings = type(settings).model_validate(values)
     forge, jira = ClosingForge(), ClosingJira()
     repositories = LocalRepositories(settings.jira_worker_delivery_runtime)
     trusted_forge = live.LiveForge(session_factory, repositories)
@@ -395,14 +438,22 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
     async def provider(request):
         body = json.loads(request.content)
         upstream_calls.append(body)
-        assert request.headers["authorization"] == "Bearer PLACEHOLDER_MODEL_VALUE"
+        assert (
+            str(request.url)
+            == f"https://{pack.provider}.example.invalid/v1/chat/completions"
+        )
+        assert (
+            request.headers["authorization"]
+            == f"Bearer PLACEHOLDER_{pack.provider}_VALUE"
+        )
+        assert body["model"] == pack.model
         assert body["stream"] is False and body["max_tokens"] <= 16384
         return httpx.Response(
             200,
             json={
                 "id": "completion",
                 "created": 1,
-                "model": "gpt-4.1-2025-04-14",
+                "model": pack.model,
                 "choices": [
                     {
                         "message": {"role": "assistant", "content": "Checked"},
@@ -413,7 +464,11 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
                     "prompt_tokens": 30,
                     "completion_tokens": 10,
                     "total_tokens": 40,
-                    "prompt_tokens_details": {"cached_tokens": 10},
+                    **(
+                        {"prompt_cache_hit_tokens": 10}
+                        if pack.model == "deepseek-v4-pro"
+                        else {"prompt_tokens_details": {"cached_tokens": 10}}
+                    ),
                 },
             },
         )
@@ -442,6 +497,14 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
             pytest.fail("The enabled server supervisor did not launch the native role")
     finally:
         await scheduler.stop()
+    settings.jira_worker_delivery_pack = (
+        "2.0.0" if pack.version == "2.0.0-deepseek" else "2.0.0-deepseek"
+    )
+    settings.jira_worker_delivery_runtime.prices = (
+        settings.jira_worker_delivery_runtime.prices.model_copy(
+            update={"output": Decimal("0.01"), "source": "other-provider-prices"}
+        )
+    )
     candidate = regression = None
     homes = []
     async with original_client(
@@ -475,7 +538,7 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
                     "Authorization": "Bearer " + model_capability(settings, identity)
                 },
                 json={
-                    "model": "gpt-4.1-2025-04-14",
+                    "model": pack.model,
                     "messages": [
                         {
                             "role": "user",
@@ -569,6 +632,23 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
                     "0.000125"
                 )
                 assert execution.exit_confirmed and execution.meter.stopped
+                assert execution.pack == pack
+                if step == "reproduce":
+                    ticket = await session.get(JiraWorkerTicket, "ticket")
+                    state = delivery_state(ticket)
+                    assert state.model_prices == execution.meter.prices
+                    ticket.workflow_state = state.model_copy(
+                        update={"model_prices": None}
+                    ).model_dump(mode="json")
+                    await session.commit()
+                    upstream = settings.jira_worker_delivery_upstreams[pack.provider]
+                    settings.jira_worker_delivery_upstreams[pack.provider] = (
+                        upstream.model_copy(
+                            update={
+                                "prices": settings.jira_worker_delivery_runtime.prices
+                            }
+                        )
+                    )
             assert (
                 await client.post(
                     endpoint,
@@ -577,7 +657,7 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
                         + model_capability(settings, identity)
                     },
                     json={
-                        "model": "gpt-4.1-2025-04-14",
+                        "model": pack.model,
                         "messages": [{"role": "user", "content": "More"}],
                     },
                 )
@@ -614,6 +694,8 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
         environment = json.loads((home / "environment.json").read_text())
         assert "PLACEHOLDER_MODEL_VALUE" not in json.dumps(environment)
         assert "PLACEHOLDER_FORGE_VALUE" not in json.dumps(environment)
+        for upstream in settings.jira_worker_delivery_upstreams.values():
+            assert upstream.api_key.get_secret_value() not in json.dumps(environment)
     assert len(forge.pushes) == len(forge.creates) == 1
 
 
@@ -626,6 +708,8 @@ async def test_server_factory_drives_all_native_roles_to_merged_sha_smoke(
         ("stopped", 403),
         ("pending", 403),
         ("missing-usage", 502),
+        ("invalid-openai-cache", 502),
+        ("invalid-deepseek-cache", 502),
     ],
 )
 async def test_gateway_refuses_unbounded_or_uncertain_spend(
@@ -684,6 +768,26 @@ async def test_gateway_refuses_unbounded_or_uncertain_spend(
 
     async def upstream(request):
         calls.append(request)
+        if fault.startswith("invalid-"):
+            return httpx.Response(
+                200,
+                json={
+                    "model": execution.pack.model,
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "Checked"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 10,
+                        "total_tokens": 40,
+                        **(
+                            {"prompt_cache_hit_tokens": 31}
+                            if fault == "invalid-deepseek-cache"
+                            else {"prompt_tokens_details": {"cached_tokens": 31}}
+                        ),
+                    },
+                },
+            )
         return httpx.Response(200, json={"model": scope.job.pack_digest})
 
     monkeypatch.setattr(
@@ -717,7 +821,7 @@ async def test_gateway_refuses_unbounded_or_uncertain_spend(
         assert (
             await client.post(endpoint, headers=headers, json=body)
         ).status_code == expected
-        if fault == "missing-usage":
+        if expected == 502:
             app = FastAPI()
             app.include_router(DeliveryModelGateway(session_factory, settings).router)
             async with original(
@@ -726,7 +830,7 @@ async def test_gateway_refuses_unbounded_or_uncertain_spend(
                 assert (
                     await restarted.post(endpoint, headers=headers, json=body)
                 ).status_code == 403
-    assert len(calls) == (1 if fault == "missing-usage" else 0)
+    assert len(calls) == (1 if expected == 502 else 0)
     async with session_factory() as session:
         row = await session.scalar(
             select(JiraWorkerJob).where(
@@ -738,4 +842,4 @@ async def test_gateway_refuses_unbounded_or_uncertain_spend(
             saved.held_tokens == execution.held_tokens
             and saved.held_usd == execution.held_usd
         )
-        assert saved.meter.uncertain == (fault == "missing-usage")
+        assert saved.meter.uncertain == (expected == 502)
