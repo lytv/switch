@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from switch_core.bridges.jira.delivery_contracts import ScopeContract, ScopePolicy
+from switch_core.bridges.jira.firstmate_copy import tmux_directory
 from switch_core.bridges.jira.live import load_policies, runtime_config
 from switch_core.bridges.jira.model_upstream import model_upstream
 from switch_core.bridges.jira.packs import load_pack
@@ -77,6 +78,16 @@ def check_readiness(
             )
         else:
             checks["model_upstream"] = None
+    runtime = config.jira_worker_delivery_runtime
+    if runtime is None:
+        checks["delivery_tmux"] = "Configure the live delivery runtime first."
+    else:
+        try:
+            tmux_directory(runtime.homes / ("0" * 64), runtime.tmux_sockets)
+        except ValueError as exc:
+            checks["delivery_tmux"] = str(exc)
+        else:
+            checks["delivery_tmux"] = None
     try:
         runtime = runtime_config(config)
         policies = load_policies(config, runtime)

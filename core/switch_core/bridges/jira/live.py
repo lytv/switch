@@ -51,6 +51,7 @@ from switch_core.bridges.jira.firstmate_copy import (
     _create,
     _directory,
     _read,
+    tmux_directory,
 )
 from switch_core.bridges.jira.firstmate_jobs import Execution, FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
@@ -110,6 +111,7 @@ def runtime_config(config: SwitchConfig) -> JiraWorkerDeliveryRuntime:
     for root in (runtime.checkout, runtime.homes, runtime.repositories):
         if not root.is_absolute() or root.resolve() != root or not root.is_dir():
             raise ValueError("Provision absolute, symlink-free delivery roots")
+    tmux_directory(runtime.homes / ("0" * 64), runtime.tmux_sockets)
     roots = (runtime.checkout, runtime.homes, runtime.repositories)
     if any(
         left == right or left in right.parents or right in left.parents
@@ -356,6 +358,7 @@ class MeteredFirstmateCopy(FirstmateCopy):
         super().__init__(
             checkout=runtime.checkout,
             homes=runtime.homes,
+            tmux_sockets=runtime.tmux_sockets,
             project=repositories.root(job),
             executable_path=runtime.executable_path,
             secrets=secrets,

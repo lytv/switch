@@ -121,6 +121,7 @@ async def live_setup(session_factory, request, monkeypatch, tmp_path):
     values["jira_worker_delivery_runtime"] = {
         "checkout": str(lab.checkout),
         "homes": str(lab.homes),
+        "tmux_sockets": str(lab.copy._tmux_sockets),
         "repositories": str(repositories),
         "executable_path": lab.copy._path,
         "model_url": "http://127.0.0.1:8000",
@@ -228,6 +229,23 @@ async def test_live_preflight_only_leaves_human_evidence(live_setup, monkeypatch
         )
     )
     assert check_readiness(settings, scope, "acme", "TEST")["delivery_runtime"]
+
+
+async def test_readiness_rejects_overlong_tmux_root_before_dispatch(
+    live_setup, monkeypatch, tmp_path
+):
+    settings, scope, _, lab = live_setup
+    settings.jira_worker_delivery_execution_enabled = False
+    monkeypatch.setattr("switch_core.bridges.jira.readiness.load_pack", live.load_pack)
+    settings.jira_worker_delivery_runtime.tmux_sockets = tmp_path / ("x" * 100)
+    with pytest.raises(ValueError, match="Configure a shorter tmux_sockets root"):
+        live.runtime_config(settings)
+    checks = check_readiness(settings, scope, "acme", "TEST")
+    assert "shorter tmux_sockets" in checks["delivery_tmux"]
+    assert checks["delivery_runtime"]
+    assert not list(lab.homes.glob("*/data/*/dispatch"))
+    settings.jira_worker_delivery_runtime.tmux_sockets = lab.copy._tmux_sockets
+    assert check_readiness(settings, scope, "acme", "TEST")["delivery_tmux"] is None
 
 
 @pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)

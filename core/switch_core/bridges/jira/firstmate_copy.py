@@ -7,8 +7,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
@@ -32,6 +34,26 @@ from switch_core.bridges.jira.delivery_contracts import (
 )
 
 MAX_ARTIFACT_BYTES = 65536
+
+
+def tmux_directory(home: Path, root: Path | None) -> Path:
+    if root is None:
+        root = Path("/tmp").resolve() / f"switch-tmux-{os.getuid()}"
+    if not root.is_absolute() or root.resolve() != root:
+        raise ValueError(
+            "Delivery tmux_sockets root must be absolute, without symlinks"
+        )
+    identity = hashlib.sha256(os.fsencode(home)).hexdigest()[:32]
+    directory = root / identity
+    socket = directory / f"tmux-{os.getuid()}/default"
+    limit = 104 if sys.platform == "darwin" else 108
+    required = len(os.fsencode(socket)) + 1  # Include the terminating NUL byte.
+    if required > limit:
+        raise ValueError(
+            f"Delivery tmux socket path needs {required} bytes; platform limit is "
+            f"{limit}. Configure a shorter tmux_sockets root."
+        )
+    return directory
 
 
 class SecretGuard:
@@ -73,8 +95,11 @@ def _directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     if path.resolve() != path.absolute() or not path.is_dir():
         raise ValueError("Task directories must not contain symlinks")
-    if path.stat().st_mode & 0o077:
-        raise ValueError("Task directories must be private")
+    info = path.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(
+            "Task directories must be private and owned by the current user"
+        )
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(parent)
@@ -150,6 +175,7 @@ class FirstmateCopy:
         secrets: SecretGuard,
         projects: Callable[[Job], Path] | None = None,
         base_project: Path | None = None,
+        tmux_sockets: Path | None = None,
     ) -> None:
         for root, marker in (
             (checkout, ".switch-delivery-copy"),
@@ -164,6 +190,8 @@ class FirstmateCopy:
         if not project.is_absolute() or not project.is_dir():
             raise ValueError("A prepared project checkout is required")
         secrets.check(executable_path)
+        tmux_directory(homes / ("0" * 64), tmux_sockets)
+        self._tmux_sockets = tmux_sockets
         self._checkout = checkout
         self._homes = homes
         self._project = project
@@ -221,7 +249,7 @@ class FirstmateCopy:
             "PATH": self._path,
             "SHELL": "/bin/sh",
             "TERM": "xterm-256color",
-            "TMUX_TMPDIR": str(home / "tmp"),
+            "TMUX_TMPDIR": str(tmux_directory(home, self._tmux_sockets)),
             "TMPDIR": str(home / "tmp"),
         }
 
@@ -259,6 +287,13 @@ class FirstmateCopy:
         self._secrets.check(pack.model_dump_json())
         self._secrets.check(reservation.model_dump_json())
         home = self.location(job)
+        sockets = tmux_directory(home, self._tmux_sockets)
+        _directory(sockets.parent)
+        _directory(sockets)
+        if not _create(sockets / "home", os.fsencode(home)) and _read(
+            sockets, "home"
+        ) != os.fsencode(home):
+            raise ValueError("Delivery tmux directory belongs to another execution")
         for name in (
             "",
             "state",
@@ -644,9 +679,18 @@ class FirstmateCopy:
             )
         if f"endpoint_task_id={self.task_id(job)}" not in meta.decode().splitlines():
             raise ValueError("Firstmate task metadata does not match the execution")
+        sockets = tmux_directory(home, self._tmux_sockets)
+        if sockets.exists():
+            _directory(sockets)
+            if _read(sockets, "home") != os.fsencode(home):
+                raise ValueError("Delivery tmux directory belongs to another execution")
         await self._command(
-            self.location(job),
+            home,
             str(self._checkout / "bin/fm-control.sh"),
             self.task_id(job),
             "exit",
         )
+        if sockets.exists():
+            if (sockets / f"tmux-{os.getuid()}/default").exists():
+                await self._command(home, "tmux", "kill-server")
+            await asyncio.to_thread(shutil.rmtree, sockets)
