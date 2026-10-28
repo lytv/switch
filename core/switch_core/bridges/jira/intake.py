@@ -429,8 +429,13 @@ class IntakeOrchestrator:
                             and target.repository_match is not None
                         )
                         repository_confirmed = (
-                            repository_gate_pending
+                            target.service == "Bug"
+                            and target.repository is not None
+                            and target.repository.outcome == "verified"
+                            and target.scope is None
                             and target.repository_match is not None
+                            and target.repository_match.generation == generation
+                            and target.repository_match.repository == target.repository
                             and target.repository_match.confirmation is not None
                         )
                         if target.service != "Bug":

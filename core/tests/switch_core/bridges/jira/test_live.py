@@ -719,6 +719,32 @@ async def test_product_mismatch_stops_before_scope(
             assert state.gate is None and not state.gate_ready
             assert ticket.intake_state["phase"] == "scope_ready"
             assert ticket.status == "In Progress"
+            confirmed_history = ticket.intake_state["history"]
+            confirmed_commands = set(
+                await session.scalars(
+                    select(JiraWorkerOutbox.id).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            )
+            ticket.agent_state = "wake_requested"
+            await session.commit()
+        assert await activity.run_one_turn(intake) == ticket_id
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            state = delivery_state(ticket)
+            assert ticket.intake_state["phase"] == "scope_ready"
+            assert ticket.intake_state["history"] == confirmed_history
+            assert state.scope is None and state.gate is None
+            assert state.repository_match.confirmation is not None
+            assert set(
+                await session.scalars(
+                    select(JiraWorkerOutbox.id).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            ) == confirmed_commands
+        assert len(model.calls) == 1
         # Confirmation resumes normal scope staging; scope approval stays separate.
         await LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})(
             ticket_id
