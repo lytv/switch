@@ -373,6 +373,115 @@ def observe_scope_approval(
     return checked
 
 
+def observe_repository_confirmation(
+    ticket: JiraWorkerTicket, version: dict[str, Any], observation: Observation
+) -> Observation:
+    """An authorized approver confirms the product-mismatched repository.
+
+    The confirmation reuses the policy approval route before any scope is
+    staged. Scope approval stays a separate, later human gate.
+    """
+    state = delivery_state(ticket)
+    if (
+        state is None
+        or state.step != "intake"
+        or state.scope is not None
+        or state.gate is None
+        or state.gate.kind != "repository"
+        or not state.gate_ready
+        or ticket.worker_parked_reason
+    ):
+        return observation
+    match = state.repository_match
+    if (
+        match is None
+        or match.confirmation is not None
+        or match.generation != ticket.agent_generation
+        or match.repository != state.repository
+    ):
+        return observation
+    base = ticket.jira_read_changelog_id
+    if base is None or ticket.jira_seen_comment_ids is None:
+        return observation
+    histories = version["histories"]
+    index = next((i for i, item in enumerate(histories) if str(item["id"]) == base), -1)
+    if base and index < 0:
+        return observation
+    humans = [
+        item
+        for item in histories[index + 1 :]
+        if item.get("author", {}).get("accountId") != ticket.jira_worker_account_id
+    ]
+    if not humans:
+        return observation
+    edge = humans[0]
+    route, gate = match.approval_route, state.gate
+    items = edge.get("items", [])
+    actor = edge.get("author", {}).get("accountId")
+    clean = (
+        len(humans) == 1
+        and actor in gate.approver_account_ids
+        and actor != ticket.jira_worker_account_id
+        and len(items) == 1
+        and items[0].get("field") == "status"
+        and items[0].get("from") == route.source_status_id
+        and items[0].get("to") == route.target_status_id
+        and version["fields"].get("status", {}).get("id") == route.target_status_id
+        and version["fields"].get("status", {}).get("statusCategory", {}).get("key")
+        != "done"
+    )
+    known = set(ticket.jira_seen_comment_ids)
+    current = {str(item["id"]) for item in version["comments"]}
+    dirty_comments = known - current or any(
+        comment_actor(item) != ticket.jira_worker_account_id
+        and (
+            str(item["id"]) not in known
+            or _stamp(item["updated"])
+            > _stamp(ticket.jira_read_updated or ticket.last_event_at.isoformat())
+        )
+        for item in version["comments"]
+    )
+    if not clean or dirty_comments:
+        park_ticket(ticket, "Dirty or unauthorized delivery approval history")
+        return observation
+    allowed = {
+        **version,
+        "histories": [
+            {**item, "author": {"accountId": ticket.jira_worker_account_id}}
+            if item is edge
+            else item
+            for item in histories
+        ],
+    }
+    checked = observe_jira(
+        allowed,
+        seen_ids=known,
+        changelog_id=base,
+        base_stamp=_stamp(ticket.jira_read_updated or ticket.last_event_at.isoformat()),
+        worker_account=ticket.jira_worker_account_id or "",
+        reporter_account=ticket.reporter_account_id,
+    )
+    if checked.park:
+        return observation
+    replace_state(
+        ticket,
+        state,
+        repository_match={
+            **match.model_dump(mode="json"),
+            "confirmation": Approval(
+                gate=gate,
+                actor_account_id=actor,
+                actor_kind="human",
+                history_id=str(edge["id"]),
+            ).model_dump(mode="json"),
+        },
+        gate=None,
+        gate_ready=False,
+    )
+    ticket.intake_state = {**(ticket.intake_state or {}), "phase": "scope_ready"}
+    return checked
+
+
 def fix_job(scope: ScopeContract) -> Job:
     return role_job(scope, "fix", 1)
 

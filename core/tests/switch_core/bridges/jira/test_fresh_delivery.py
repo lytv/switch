@@ -146,7 +146,13 @@ async def test_fresh_delivery_stages_scope_after_intake(
         path = request.url.path
         if request.url.host == "forge.example.invalid":
             assert request.headers["authorization"] == "PLACEHOLDER_FORGE_VALUE"
-            assert path in {"/repos/team/project", "/repos/team/project/commits/main"}
+            assert path in {
+                "/repos/team/project",
+                "/repos/team/project/commits/main",
+                f"/repos/team/project/git/trees/{BASE_SHA}",
+            }
+            if path.endswith(f"/git/trees/{BASE_SHA}"):
+                return httpx.Response(200, json={"tree": [], "truncated": False})
             return httpx.Response(
                 200,
                 json={"sha": BASE_SHA}
@@ -291,5 +297,5 @@ async def test_fresh_delivery_stages_scope_after_intake(
         assert len(model.calls) == 1
         jobs.start.assert_not_called()
         publisher.publish.assert_not_called()
-        assert len([r for r in requests if r.url.host == "forge.example.invalid"]) == 2
+        assert len([r for r in requests if r.url.host == "forge.example.invalid"]) == 3
         assert not list(tmp_path.iterdir())

@@ -57,11 +57,18 @@ from switch_core.bridges.jira.firstmate_jobs import Execution, FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
 from switch_core.bridges.jira.model_gateway import model_capability, model_identity
 from switch_core.bridges.jira.model_upstream import model_prices
+from switch_core.bridges.jira.outbox import park_ticket
 from switch_core.bridges.jira.packs import load_pack
+from switch_core.bridges.jira.parse import _plain_text
 from switch_core.bridges.jira.publisher import (
     DraftPublisher,
     DraftRequest,
     GitCandidateObjects,
+)
+from switch_core.bridges.jira.repository_match import (
+    MAX_FACTS,
+    MAX_TREE_NAMES,
+    evaluate_repository_match,
 )
 from switch_core.bridges.jira.state import WorkflowMapping
 from switch_core.bridges.jira.target import delivery_state, record_repository_triage
@@ -75,6 +82,7 @@ class AdmissionPolicy(Contract):
     statuses: tuple[WorkflowMapping, ...]
     transitions: tuple[WorkflowMapping, ...]
     approver_account_ids: tuple[Text, ...] = Field(min_length=1)
+    product_markers: tuple[Text, ...] = ()
 
 
 def runtime_config(config: SwitchConfig) -> JiraWorkerDeliveryRuntime:
@@ -725,6 +733,26 @@ class LiveForge:
         )
 
 
+def _repository_facts(
+    meta: dict[str, object],
+    names: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Bounded forge facts for product corroboration."""
+    facts: list[str] = []
+    description = meta.get("description")
+    if isinstance(description, str) and description.strip():
+        facts.append(description.strip())
+    topics = meta.get("topics")
+    if isinstance(topics, list):
+        facts.extend(
+            str(topic).strip()
+            for topic in topics[:10]
+            if isinstance(topic, str) and topic.strip()
+        )
+    facts.extend(names)
+    return tuple(fact for fact in facts if fact)[:MAX_FACTS]
+
+
 class LiveAdmission:
     def __init__(
         self,
@@ -735,6 +763,17 @@ class LiveAdmission:
         self.sessions, self.runtime, self.policies = sessions, runtime, policies
 
     async def triage(self, supplied: str) -> Repository:
+        repository, _, _, _ = await self._triage_evidence(supplied)
+        return repository
+
+    async def _triage_evidence(
+        self, supplied: str
+    ) -> tuple[Repository, dict[str, object], tuple[str, ...], bool]:
+        """Verify repository identity and collect bounded product facts.
+
+        Facts are untrusted repository content: metadata plus root tree names
+        at the pinned base commit. They can only veto automatic admission.
+        """
         host, port, path = repository_identity(supplied)
         parts = path.lstrip("/").split("/")
         if (
@@ -778,13 +817,40 @@ class LiveAdmission:
             sha = (await read(api + "/commits/" + quote(branch, safe=""))).get("sha")
             if not isinstance(sha, str):
                 raise ValueError("Trusted forge omitted the base commit")
-        return Repository(
-            supplied_url=supplied,
-            canonical_url=canonical,
-            base_branch=branch,
-            base_sha=sha,
-            outcome="verified",
-            evidence=f"Trusted forge repository and default-branch commit reads: {api}, {branch}, {sha}",
+            try:
+                tree = await client.get(api + "/git/trees/" + quote(sha, safe=""))
+                if tree.is_redirect or 400 <= tree.status_code < 500:
+                    raise ValueError(
+                        f"Trusted forge refused repository tree ({tree.status_code})"
+                    )
+                tree.raise_for_status()
+                entries = tree.json().get("tree")
+                if not isinstance(entries, list):
+                    raise ValueError("Trusted forge returned an invalid tree body")
+                names = tuple(
+                    entry["path"]
+                    for entry in entries[:MAX_TREE_NAMES]
+                    if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+                )
+            except ValueError:
+                # Missing or unreadable tree facts fail closed to human
+                # confirmation instead of parking the ticket.
+                names = ()
+                tree_ok = False
+            else:
+                tree_ok = True
+        return (
+            Repository(
+                supplied_url=supplied,
+                canonical_url=canonical,
+                base_branch=branch,
+                base_sha=sha,
+                outcome="verified",
+                evidence=f"Trusted forge repository and default-branch commit reads: {api}, {branch}, {sha}",
+            ),
+            body,
+            names,
+            tree_ok,
         )
 
     async def __call__(self, ticket_id: str) -> None:
@@ -804,11 +870,12 @@ class LiveAdmission:
             if state.repository is None:
                 raise ValueError("Bug delivery requires exactly one repository URL")
             repository, generation = state.repository, ticket.agent_generation
-        verified = (
-            await self.triage(repository.supplied_url)
-            if repository.outcome != "verified"
-            else None
-        )
+        if repository.outcome != "verified":
+            verified, meta, names, tree_ok = await self._triage_evidence(
+                repository.supplied_url
+            )
+        else:
+            verified, meta, names, tree_ok = None, None, None, False
         # One transaction: intake never observes a verified target without its scope.
         async with self.sessions() as session:
             if verified is not None:
@@ -847,6 +914,119 @@ class LiveAdmission:
                 return
             assert state.repository is not None
             policy = self.policies[ticket.instance, ticket.project_key]
+            markers = tuple(
+                marker.casefold()
+                for marker in policy.product_markers
+                if marker.casefold()
+            )
+            stored = state.repository_match
+            ticket_text = f"{ticket.summary}\n{_plain_text(ticket.description)}"
+            if not markers:
+                if stored is not None or (
+                    state.gate is not None and state.gate.kind == "repository"
+                ):
+                    # The project opted out of product corroboration.
+                    replace_state(
+                        ticket,
+                        state,
+                        repository_match=None,
+                        gate=None,
+                        gate_ready=False,
+                    )
+                    state = delivery_state(ticket)
+                    assert state is not None and state.repository is not None
+                    ticket.intake_state = {**intake, "phase": "scope_ready"}
+            elif (
+                stored is not None
+                and stored.generation == generation
+                and stored.repository == state.repository
+                and tuple(stored.markers) == markers
+            ):
+                if stored.confirmation is not None:
+                    ticket.intake_state = {**intake, "phase": "scope_ready"}
+                else:
+                    current = evaluate_repository_match(
+                        generation=generation,
+                        repository=state.repository,
+                        markers=markers,
+                        approval_route=policy.scope.approval_route,
+                        facts=stored.facts,
+                        facts_available=stored.facts_available,
+                        ticket_text=ticket_text,
+                    )
+                    if current.outcome != stored.outcome:
+                        park_ticket(
+                            ticket,
+                            "Repository product evidence changed during "
+                            "confirmation; release to re-run triage.",
+                        )
+                    await session.commit()
+                    return
+            else:
+                if stored is not None:
+                    park_ticket(
+                        ticket,
+                        "Repository product evidence or markers changed during "
+                        "confirmation; release to re-run triage.",
+                    )
+                    await session.commit()
+                    return
+                if verified is not None:
+                    assert meta is not None and names is not None
+                    facts = _repository_facts(meta, names)
+                    available = tree_ok
+                else:
+                    # Verified without fresh evidence (operator added markers
+                    # mid-flight): fail closed to human confirmation.
+                    facts, available = (), False
+                assert state.repository is not None
+                match = evaluate_repository_match(
+                    generation=generation,
+                    repository=state.repository,
+                    markers=markers,
+                    approval_route=policy.scope.approval_route,
+                    facts=facts,
+                    facts_available=available,
+                    ticket_text=ticket_text,
+                )
+                if match.outcome != "match":
+                    route = policy.scope.approval_route
+                    run = Run(
+                        instance=ticket.instance,
+                        ticket_id=ticket.id,
+                        generation=generation,
+                        step="reproduce",
+                        attempt=1,
+                        execution_key=f"{ticket.id}/{generation}/reproduce/1",
+                    )
+                    replace_state(
+                        ticket,
+                        state,
+                        statuses=[
+                            item.model_dump(mode="json") for item in policy.statuses
+                        ],
+                        transitions=[
+                            item.model_dump(mode="json") for item in policy.transitions
+                        ],
+                        repository_match=match.model_dump(mode="json"),
+                        gate=Gate(
+                            run=run,
+                            id=f"repository:{ticket.id}:{generation}",
+                            kind="repository",
+                            contract_digest=match.contract_digest,
+                            transition_id=route.transition_id,
+                            candidate_sha=None,
+                            approver_account_ids=policy.approver_account_ids,
+                        ).model_dump(mode="json"),
+                        gate_ready=False,
+                    )
+                    await session.commit()
+                    return
+                replace_state(
+                    ticket, state, repository_match=match.model_dump(mode="json")
+                )
+                state = delivery_state(ticket)
+                assert state is not None and state.repository is not None
             run = Run(
                 instance=ticket.instance,
                 ticket_id=ticket.id,
@@ -855,6 +1035,7 @@ class LiveAdmission:
                 attempt=1,
                 execution_key=f"{ticket.id}/{generation}/reproduce/1",
             )
+            assert state.repository is not None
             job = Job(
                 schema_version=1,
                 run=run,

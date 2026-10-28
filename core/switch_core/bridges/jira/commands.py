@@ -32,7 +32,18 @@ async def enqueue_ticket_command(
         )
         target = delivery_state(ticket)
         data: Any = body
-        if command == "transition" and target is not None and target.scope is not None:
+        if (
+            command == "transition"
+            and target is not None
+            and (
+                target.scope is not None
+                or (
+                    target.gate is not None
+                    and target.gate.kind == "repository"
+                    and target.repository_match is not None
+                )
+            )
+        ):
             try:
                 source = next(
                     item.jira_id
@@ -101,6 +112,15 @@ async def enqueue_ticket_command(
         **(
             {"scope_digest": digest(target.scope)}
             if target is not None and target.scope is not None
+            else {}
+        ),
+        **(
+            {"repository_digest": target.gate.contract_digest}
+            if target is not None
+            and target.scope is None
+            and target.gate is not None
+            and target.gate.kind == "repository"
+            and target.repository_match is not None
             else {}
         ),
         "intake_generation": ticket.agent_generation,

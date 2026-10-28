@@ -23,7 +23,10 @@ from switch_core.bridges.jira.accounting import (
     live_sessions,
 )
 from switch_core.bridges.jira.accounting import capacity_lock as capacity_lock
-from switch_core.bridges.jira.delivery import observe_scope_approval
+from switch_core.bridges.jira.delivery import (
+    observe_repository_confirmation,
+    observe_scope_approval,
+)
 from switch_core.bridges.jira.observe import (
     Observation,
     _stamp,
@@ -675,6 +678,7 @@ class TicketActivity:
         )
         observation = self._resume_rejection(ticket, version, observation)
         if self._config.jira_worker_delivery_execution_enabled:
+            observation = observe_repository_confirmation(ticket, version, observation)
             observation = observe_scope_approval(ticket, version, observation)
         if observation.park != "regressed":
             for entry in version["histories"]:

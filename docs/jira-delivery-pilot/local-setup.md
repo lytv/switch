@@ -63,6 +63,13 @@ The policy contains:
 - `transitions`: human approval ID plus worker `source-id->target-id` mappings.
   Include initial scope request, question/wait/resume, candidate request, and completion edges.
 - `approver_account_ids`: the authorized human Jira account IDs, never the worker account.
+- `product_markers`: lowercase product tokens (for example `sandbox`, `booking`)
+  that tie this project to its product language. Trusted admission requires a
+  marker in both the ticket text and the bounded forge facts; otherwise an
+  authorized approver from `approver_account_ids` must confirm the repository
+  through the existing approval route before any scope is staged. Markers name
+  product language, never repository identities: this is not a repository
+  registration allowlist. Omit the field to keep legacy automatic admission.
 
 Render the four role profiles from reviewed, exact skills-library commits.
 Retain their content checksums and dependency-validation evidence.
@@ -238,7 +245,7 @@ It does not prove live permissions, OS confinement, provider limit behavior, cha
 After separate live-run approval, set `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED=true` and restart the existing server.
 A new AGD ticket with Service `Bug` and exactly one `Repository URL: https://github.com/example/project` line enters delivery intake.
 The supervisor verifies canonical identity and the default branch SHA through the trusted forge API before checkout.
-It stages the bounded scope only after intake completes.
+It stages the bounded scope only after intake completes and product corroboration passes (automatic match or authorized human repository confirmation).
 The Jira scope gate must succeed before any native role starts.
 Review and QA use separate native tasks at the tested candidate; QA repeats the original failure at the base.
 The candidate gate grants no merge authority. A human merges through the forge.

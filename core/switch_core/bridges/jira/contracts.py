@@ -182,7 +182,7 @@ class Job(Contract):
 class Gate(Contract):
     run: Run
     id: Text
-    kind: Literal["scope", "acceptance"]
+    kind: Literal["repository", "scope", "acceptance"]
     contract_digest: Digest
     transition_id: Text
     candidate_sha: Commit | None
