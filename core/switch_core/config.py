@@ -50,6 +50,7 @@ class JiraWorkerDeliveryRuntime(BaseModel):
     model_config = ConfigDict(extra="forbid")
     checkout: Path
     homes: Path
+    tmux_sockets: Path | None = None
     repositories: Path
     executable_path: str = Field(min_length=1)
     model_url: str

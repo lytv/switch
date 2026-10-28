@@ -1384,6 +1384,7 @@ async def test_native_verification_uses_only_its_pinned_profile_and_an_isolated_
     copy = FirstmateCopy(
         checkout=lab.checkout,
         homes=lab.homes,
+        tmux_sockets=lab.copy._tmux_sockets,
         project=lab.copy._project,
         executable_path=lab.copy._path,
         secrets=SecretGuard(forbidden_values=("PLACEHOLDER_FORGE_CREDENTIAL",)),
@@ -1404,6 +1405,7 @@ async def test_native_verification_uses_only_its_pinned_profile_and_an_isolated_
             missing_base = FirstmateCopy(
                 checkout=lab.checkout,
                 homes=lab.homes,
+                tmux_sockets=lab.copy._tmux_sockets,
                 project=lab.copy._project,
                 executable_path=lab.copy._path,
                 secrets=SecretGuard(forbidden_values=()),

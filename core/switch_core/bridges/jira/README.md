@@ -361,8 +361,17 @@ accounting across tickets.
 `firstmate_copy.py` calls the delivery checkout's `fm-spawn.sh --scout` and
 `fm-control.sh <task-id> exit`. It uses the native task metadata, brief, status,
 and steering inbox paths. Each execution receives its own Firstmate home,
-operating-system HOME directory, and private tmux server. The operator must
-prepare a separate delivery checkout and a separate worker-homes root. Both
+operating-system HOME directory, and private tmux server. Socket directories
+use a hash of the full execution-home path under `/tmp/switch-tmux-<uid>`
+(with `/tmp` resolved to its physical path). They have owner-only permissions.
+The runtime's optional `tmux_sockets` field selects another absolute,
+symlink-free socket root. The adapter checks the encoded socket path, including
+its terminating NUL, against the platform limit: 104 bytes on macOS or 108 on Linux.
+Readiness reports this check as `delivery_tmux`. An overlong root requires a
+shorter `tmux_sockets` setting before dispatch; worker-home paths never change.
+Cancellation stops the execution's tmux server and removes its socket directory.
+Uncertain launches retain their directories for operator recovery.
+The operator must prepare a separate delivery checkout and a separate worker-homes root. Both
 paths must be absolute and contain no symlinks. To opt these roots in, the
 operator creates these regular marker files with exactly
 `switch-firstmate-delivery-v1` followed by a newline:
@@ -715,10 +724,13 @@ Jira/forge latency or duplication. The pilot gate must prove those live.
 
 ### Isolation checklist
 
-- Each execution receives its own Firstmate home, OS HOME directory, and tmux
-  server under a worker-homes root admitted only by the
-  `.switch-delivery-workers` marker file. No checkout is shared between the
-  dev, review, QA, and smoke contexts.
+- Each execution receives its own Firstmate home and OS HOME directory under a
+  worker-homes root admitted only by the `.switch-delivery-workers` marker file.
+  Each tmux server uses a separate private directory under the socket root.
+  The OS sandbox must allow only that execution's socket directory, not the
+  socket root or another execution's sockets. Owner-only permissions do not
+  isolate workers that share an OS user without a sandbox.
+  No checkout is shared between the dev, review, QA, and smoke contexts.
 - Review and QA checkouts are read-only views at the frozen candidate SHA;
   only the trusted publisher writes, and only the open draft branch.
 - Credentials live in the supervisor process. The adapter injects every

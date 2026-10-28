@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -69,10 +70,11 @@ if (pathlib.Path(__file__).parent.parent / "fail-after").exists():
     sys.exit(17)
 """
 CONTROL = """
-import os, pathlib, signal, sys, time
+import json, os, pathlib, signal, sys, time
 home = pathlib.Path(os.environ["FM_HOME"])
 assert sys.argv[2] == "exit"
 (home / "cancel-reached").write_text(sys.argv[1])
+(home / "cancel-environment.json").write_text(json.dumps(dict(os.environ)))
 pid = int((home / "child.pid").read_text())
 try:
     os.killpg(pid, signal.SIGTERM)
@@ -145,8 +147,10 @@ def lab(tmp_path: Path):
     data = load_pack(_config()).snapshot.model_dump(mode="json")
     data["firstmate_commit"] = firstmate_commit
     pack = Pack.model_validate_json(json.dumps(data))
+    sockets = tempfile.TemporaryDirectory(prefix="sw-", dir=Path("/tmp").resolve())
     copy = FirstmateCopy(
         checkout=checkout,
+        tmux_sockets=Path(sockets.name),
         homes=homes,
         project=project,
         executable_path=f"{tools}:/usr/bin:/bin",
@@ -158,6 +162,7 @@ def lab(tmp_path: Path):
             os.killpg(int(file.read_text()), signal.SIGTERM)
         except ProcessLookupError:
             pass
+    sockets.cleanup()
 
 
 async def _job(
