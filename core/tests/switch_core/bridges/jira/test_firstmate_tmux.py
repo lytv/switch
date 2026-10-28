@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -158,6 +159,56 @@ def test_role_socket_is_private_and_deterministic(native_lab, native_job, step):
         home / "config/launch-env-allowlist"
     ).read_text() == "FM_HOME\nTMUX_TMPDIR\n"
     assert not copy._prepare(job, native_lab.pack, RESERVATION, 60, None)
+
+
+async def test_real_tmux_cancel_cleans_stale_socket(native_lab, native_job):
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is not installed")
+    copy = native_lab.copy
+    await copy.start(native_job, native_lab.pack, RESERVATION, 60)
+    home = copy.location(native_job)
+    sockets = tmux_directory(home, copy._tmux_sockets)
+    endpoint = sockets / f"tmux-{os.getuid()}/default"
+    endpoint.parent.mkdir(mode=0o700)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+        stale.bind(str(endpoint))
+    assert endpoint.is_socket()
+    _script(
+        native_lab.checkout.parent / "tools/tmux",
+        f"import os, sys\nos.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n",
+    )
+
+    await copy.cancel(native_job)
+
+    assert (home / "cancel-reached").read_text() == copy.task_id(native_job)
+    assert not sockets.exists()
+
+
+@pytest.mark.parametrize("failure", ["live", "unknown", "control"])
+async def test_cancel_keeps_socket_directory_when_shutdown_is_unproven(
+    native_lab, native_job, failure
+):
+    copy = native_lab.copy
+    await copy.start(native_job, native_lab.pack, RESERVATION, 60)
+    home = copy.location(native_job)
+    sockets = tmux_directory(home, copy._tmux_sockets)
+    endpoint = sockets / f"tmux-{os.getuid()}/default"
+    endpoint.parent.mkdir(mode=0o700)
+    _script(native_lab.checkout.parent / "tools/tmux", "raise SystemExit(1)\n")
+    if failure == "control":
+        _script(native_lab.checkout / "bin/fm-control.sh", "raise SystemExit(1)\n")
+    kind = socket.SOCK_DGRAM if failure == "unknown" else socket.SOCK_STREAM
+    with socket.socket(socket.AF_UNIX, kind) as server:
+        server.bind(str(endpoint))
+        if kind == socket.SOCK_STREAM:
+            server.listen()
+        command = "fm-control.sh" if failure == "control" else "tmux"
+        with pytest.raises(RuntimeError, match=f"Delivery command {command} failed"):
+            await copy.cancel(native_job)
+        assert endpoint.is_socket()
+        assert (sockets / "home").read_bytes() == os.fsencode(home)
+        assert (home / "cancel-reached").exists() == (failure != "control")
 
 
 async def test_real_tmux_dispatch_get_cancel_keep_execution_isolation(

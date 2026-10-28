@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import stat
 import sys
 from collections.abc import Callable
@@ -691,6 +693,16 @@ class FirstmateCopy:
             "exit",
         )
         if sockets.exists():
-            if (sockets / f"tmux-{os.getuid()}/default").exists():
-                await self._command(home, "tmux", "kill-server")
+            endpoint = sockets / f"tmux-{os.getuid()}/default"
+            if endpoint.exists():
+                try:
+                    await self._command(home, "tmux", "kill-server")
+                except RuntimeError:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                        probe.setblocking(False)
+                        if probe.connect_ex(str(endpoint)) not in {
+                            errno.ENOENT,
+                            errno.ECONNREFUSED,
+                        }:
+                            raise
             await asyncio.to_thread(shutil.rmtree, sockets)
