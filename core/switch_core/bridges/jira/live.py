@@ -869,6 +869,11 @@ class LiveAdmission:
                 raise ValueError("A fixture ticket cannot enter the live supervisor")
             if state.repository is None:
                 raise ValueError("Bug delivery requires exactly one repository URL")
+            intake = ticket.intake_state or {}
+            if intake.get("phase") not in {"triage", "scope_ready"} or not any(
+                item.get("complete") for item in intake.get("history", [])
+            ):
+                return
             repository, generation = state.repository, ticket.agent_generation
         if repository.outcome != "verified":
             verified, meta, names, tree_ok = await self._triage_evidence(
@@ -876,7 +881,6 @@ class LiveAdmission:
             )
         else:
             verified, meta, names, tree_ok = None, None, None, False
-        # One transaction: intake never observes a verified target without its scope.
         async with self.sessions() as session:
             if verified is not None:
                 await record_repository_triage(
@@ -960,8 +964,8 @@ class LiveAdmission:
                             "Repository product evidence changed during "
                             "confirmation; release to re-run triage.",
                         )
-                    await session.commit()
-                    return
+                        await session.commit()
+                        return
             else:
                 if stored is not None:
                     park_ticket(
@@ -1020,13 +1024,34 @@ class LiveAdmission:
                         ).model_dump(mode="json"),
                         gate_ready=False,
                     )
-                    await session.commit()
-                    return
-                replace_state(
-                    ticket, state, repository_match=match.model_dump(mode="json")
-                )
-                state = delivery_state(ticket)
-                assert state is not None and state.repository is not None
+                else:
+                    replace_state(
+                        ticket, state, repository_match=match.model_dump(mode="json")
+                    )
+            state = delivery_state(ticket)
+            assert state is not None and state.repository is not None
+            if (
+                state.repository_match is not None
+                and state.repository_match.outcome != "match"
+                and state.repository_match.confirmation is None
+            ):
+                if intake.get("phase") == "triage":
+                    ticket.intake_state = {**intake, "phase": "scope_ready"}
+                    if ticket.agent_state != "live":
+                        ticket.agent_state = "wake_requested"
+                    session.add(
+                        JiraWorkerEvent(
+                            instance=ticket.instance,
+                            issue_key=ticket.issue_key,
+                            project_key=ticket.project_key,
+                            idempotency_key=f"live-repository:{ticket.id}:{generation}",
+                            event_kind="explicit_input",
+                            webhook_event="worker:repository_confirmation",
+                            payload={"reporter_input": True},
+                        )
+                    )
+                await session.commit()
+                return
             run = Run(
                 instance=ticket.instance,
                 ticket_id=ticket.id,
