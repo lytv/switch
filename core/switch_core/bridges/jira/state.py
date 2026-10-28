@@ -28,6 +28,7 @@ from switch_core.bridges.jira.delivery_contracts import (
     ScopeContract,
 )
 from switch_core.bridges.jira.packs import FrozenPack
+from switch_core.bridges.jira.repository_match import RepositoryMatch
 from switch_core.bridges.jira.verification import MergeReceipt
 
 
@@ -50,6 +51,7 @@ class DeliveryWorkflowState(Contract):
     model_prices: ModelPrices | None = None
     service: Literal["Bug", "Feature", "Docs", "Other"]
     repository: Repository | None = None
+    repository_match: RepositoryMatch | None = None
     service_field: Text | None = None
     repository_url_field: Text = "description"
     step: Text = "intake"

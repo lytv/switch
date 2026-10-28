@@ -131,6 +131,23 @@ results contain no checkout pins. A verified target stays frozen.
 The intake model cannot verify repositories. Field mapping alone does not provision
 triage, checkout, execution, or publication. The configured live factory supplies these boundaries.
 
+A verified repository proves the forge holds that repository, not that it
+belongs to the ticket's product. When the admission policy pins
+`product_markers`, trusted admission corroborates them against the ticket
+text and bounded forge facts (repository name, description, topics, and root
+tree names at the pinned base commit). Repository facts are untrusted
+content: they can only veto automatic admission, never authorize it. No
+repository registration list applies; markers name product language, never
+repository identities. A clear match stages scope as before. A mismatch or
+an unclear result stages a repository gate instead of scope: intake requests
+confirmation through the existing approval route, and an authorized approver
+confirms through the same Approve edge that later grants scope. The
+confirmation binds ticket generation, canonical repository, and base SHA;
+chat text and ticket prose never count as confirmation. After confirmation
+admission stages scope normally, and scope approval stays a separate final
+human gate. Changing the product evidence or markers mid-wait parks the
+ticket for release and fresh triage.
+
 Bug intake without a verified target records its summary and requests trusted
 triage. It does not queue scope approval until trusted triage verifies the target.
 Verification resumes completed intake once, without another model decision, and

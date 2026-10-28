@@ -63,6 +63,13 @@ The policy contains:
 - `transitions`: human approval ID plus worker `source-id->target-id` mappings.
   Include initial scope request, question/wait/resume, candidate request, and completion edges.
 - `approver_account_ids`: the authorized human Jira account IDs, never the worker account.
+- `product_markers`: lowercase product tokens (for example `sandbox`, `booking`)
+  that tie this project to its product language. Trusted admission requires a
+  marker in both the ticket text and the bounded forge facts; otherwise an
+  authorized approver from `approver_account_ids` must confirm the repository
+  through the existing approval route before any scope is staged. Markers name
+  product language, never repository identities: this is not a repository
+  registration allowlist. Omit the field to keep legacy automatic admission.
 
 Render the four role profiles from reviewed, exact skills-library commits.
 Retain their content checksums and dependency-validation evidence.

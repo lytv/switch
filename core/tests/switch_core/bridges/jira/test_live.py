@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -344,6 +344,123 @@ async def test_trusted_triage_stages_scope_without_checkout_or_approval(
     assert {"repository-verified:ticket:1", "live-scope:ticket:1"} <= set(events)
 
 
+class AgdJira:
+    """Stateful AGD fake: issue reads plus worker comment/transition sends."""
+
+    def __init__(self, issue):
+        self.fields = dict(issue["fields"])
+        self.status = "To Do"
+        self.updated = NOW.isoformat()
+        self.histories = []
+        self.comments = []
+        self._ticks = 0
+
+    def _tick(self):
+        self._ticks += 1
+        self.updated = (NOW + timedelta(seconds=self._ticks)).isoformat()
+        return self.updated
+
+    def _status_id(self):
+        return {
+            "To Do": "todo",
+            "Waiting for approval": "approval",
+            "In Progress": "progress",
+        }.get(self.status, "progress")
+
+    def approve(self, actor="approver"):
+        before = self.status
+        self.status = "In Progress"
+        self.histories.append(
+            {
+                "id": str(len(self.histories) + 1),
+                "author": {"accountId": actor},
+                "created": self._tick(),
+                "items": [
+                    {
+                        "field": "status",
+                        "from": "approval",
+                        "to": "progress",
+                        "fromString": before,
+                        "toString": "In Progress",
+                    }
+                ],
+            }
+        )
+
+    async def handle(self, request):
+        path = request.url.path
+        if request.method == "GET":
+            if path.endswith("/myself"):
+                return httpx.Response(200, json={"accountId": "worker-account"})
+            if path.endswith("/transitions"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "transitions": [
+                            {
+                                "id": "request-approval",
+                                "to": {
+                                    "id": "approval",
+                                    "name": "Waiting for approval",
+                                },
+                            }
+                        ]
+                    },
+                )
+            if path.endswith("/changelog") or path.endswith("/comment"):
+                key = "values" if path.endswith("/changelog") else "comments"
+                entries = self.histories if key == "values" else self.comments
+                start = int(request.url.params.get("startAt", "0"))
+                return httpx.Response(
+                    200, json={key: entries[start:], "total": len(entries)}
+                )
+            if "/issue/" in path:
+                fields = dict(self.fields)
+                fields["status"] = {
+                    "name": self.status,
+                    "id": self._status_id(),
+                    "statusCategory": {"key": "new"},
+                }
+                fields["updated"] = self.updated
+                return httpx.Response(200, json={"fields": fields})
+        else:
+            if path.endswith("/comment"):
+                body = json.loads(request.content)
+                self.comments.append(
+                    {
+                        "id": str(len(self.comments) + 1),
+                        "author": {"accountId": "worker-account"},
+                        "updateAuthor": {"accountId": "worker-account"},
+                        "created": self._tick(),
+                        "updated": self.updated,
+                        "body": body,
+                    }
+                )
+                return httpx.Response(201, json={})
+            if path.endswith("/transitions"):
+                assert json.loads(request.content) == {
+                    "transition": {"id": "request-approval"}
+                }
+                before = self.status
+                self.status = "Waiting for approval"
+                self.histories.append(
+                    {
+                        "id": str(len(self.histories) + 1),
+                        "author": {"accountId": "worker-account"},
+                        "created": self._tick(),
+                        "items": [
+                            {
+                                "field": "status",
+                                "fromString": before,
+                                "toString": self.status,
+                            }
+                        ],
+                    }
+                )
+                return httpx.Response(204)
+        raise AssertionError(f"unexpected Jira request: {request.method} {path}")
+
+
 @pytest.mark.parametrize("live_setup", ["2.0.0-deepseek"], indirect=True)
 @pytest.mark.parametrize("matched", [True, False], ids=["matched", "wrong-product"])
 async def test_product_mismatch_stops_before_scope(
@@ -355,6 +472,22 @@ async def test_product_mismatch_stops_before_scope(
         "acme": {"AGD": settings.jira_worker_delivery_projects["acme"]["TEST"]}
     }
     runtime = settings.jira_worker_delivery_runtime
+    policy = policy.model_copy(
+        update={
+            "product_markers": ("booking", "sandbox"),
+            "statuses": (
+                *policy.statuses,
+                WorkflowMapping(name="To Do", jira_id="todo"),
+            ),
+            "transitions": (
+                *policy.transitions,
+                WorkflowMapping(
+                    name="todo->approval",
+                    jira_id="request-approval",
+                ),
+            ),
+        }
+    )
     product = "Disposable booking sandbox"
     path = "booking-sandbox" if matched else "orchestration-service"
     url = f"https://example.invalid/team/{path}"
@@ -406,32 +539,38 @@ async def test_product_mismatch_stops_before_scope(
         clock=lambda: NOW,
     )
 
-    async def jira_read(request):
-        if request.url.path.endswith("/myself"):
-            return httpx.Response(200, json={"accountId": "worker"})
-        if request.url.path.endswith("/changelog"):
-            return httpx.Response(200, json={"values": [], "total": 0})
-        if request.url.path.endswith("/comment"):
-            return httpx.Response(200, json={"comments": [], "total": 0})
-        return httpx.Response(200, json=issue)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(jira_read)) as http:
-        activity = TicketActivity(
-            session_factory=session_factory,
-            config=settings,
-            clients={
-                "acme": JiraPollClient(
-                    base_url="https://jira.example.invalid",
-                    email="worker@example.invalid",
-                    api_token="PLACEHOLDER_JIRA_VALUE",
-                    client=http,
-                    extra_fields=("customfield_12345",),
-                )
-            },
-            rooms=None,
-            clock=lambda: NOW,
-        )
-        assert await activity.run_one_turn(intake) == ticket_id
+    jira = AgdJira(issue)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(jira.handle))
+    send_http = httpx.AsyncClient(transport=httpx.MockTransport(jira.handle))
+    activity = TicketActivity(
+        session_factory=session_factory,
+        config=settings,
+        clients={
+            "acme": JiraPollClient(
+                base_url="https://jira.example.invalid",
+                email="worker@example.invalid",
+                api_token="PLACEHOLDER_JIRA_VALUE",
+                client=http,
+                extra_fields=("customfield_12345",),
+            )
+        },
+        rooms=None,
+        clock=lambda: NOW,
+    )
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=settings,
+        clients={
+            "acme": JiraPollClient(
+                base_url="https://jira.example.invalid",
+                email="worker@example.invalid",
+                api_token="PLACEHOLDER_JIRA_VALUE",
+                client=send_http,
+            )
+        },
+        clock=lambda: NOW,
+    )
+    assert await activity.run_one_turn(intake) == ticket_id
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, ticket_id)
         assert ticket.intake_state["phase"] == "triage"
@@ -454,8 +593,18 @@ async def test_product_mismatch_stops_before_scope(
                     else "Agent orchestration service",
                 },
             )
-        assert request.url.path == f"/repos/team/{path}/commits/main"
-        return httpx.Response(200, json={"sha": lab.base_sha})
+        if request.url.path == f"/repos/team/{path}/commits/main":
+            return httpx.Response(200, json={"sha": lab.base_sha})
+        assert request.url.path == f"/repos/team/{path}/git/trees/{lab.base_sha}"
+        names = (
+            ["booking.py", "scenario.json", "tests"]
+            if matched
+            else ["service.py", "rooms.py", "gateway"]
+        )
+        return httpx.Response(
+            200,
+            json={"tree": [{"path": name} for name in names], "truncated": False},
+        )
 
     original = httpx.AsyncClient
     monkeypatch.setattr(
@@ -475,17 +624,113 @@ async def test_product_mismatch_stops_before_scope(
         assert not any(row.command.startswith("transition") for row in commands)
         assert not list(runtime.repositories.glob("*/objects.git"))
         assert not list(lab.homes.glob("*/data"))
-        assert reads == [f"/repos/team/{path}", f"/repos/team/{path}/commits/main"]
+        assert reads == [
+            f"/repos/team/{path}",
+            f"/repos/team/{path}/commits/main",
+            f"/repos/team/{path}/git/trees/{lab.base_sha}",
+        ]
         if matched:
             assert state.repository.outcome == "verified"
+            assert state.repository_match is not None
+            assert state.repository_match.outcome == "match"
             assert state.scope is not None
             assert state.step == "approve_scope"
-        else:
-            assert state.scope is None, (
-                "P19: trusted admission staged scope for a reachable repository "
-                f"that belongs to a different product: {state.repository.evidence}"
+            return
+        assert state.scope is None, (
+            "P19: trusted admission staged scope for a reachable repository "
+            f"that belongs to a different product: {state.repository.evidence}"
+        )
+        assert state.repository.outcome == "verified"
+        assert state.gate is not None and state.gate.kind == "repository"
+        assert not state.gate_ready
+        assert state.repository_match is not None
+        assert state.repository_match.outcome == "mismatch"
+        assert state.repository_match.confirmation is None
+        assert ticket.intake_state["phase"] == "scope_ready"
+        async with session_factory() as session:
+            for row in (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            ).all():
+                row.status = "done"
+            await session.commit()
+        # The reporter-visible confirmation request goes through intake.
+        assert await activity.run_one_turn(intake) == ticket_id
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            rows = (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            ).all()
+            assert ticket.intake_state["phase"] == "approval"
+            rows = (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            ).all()
+            comments = [row for row in rows if row.command == "comment"]
+            assert len(comments) == 2
+            assert "Repository confirmation required" in comments[1].payload["data"]
+            assert "Agent orchestration service" in comments[1].payload["data"]
+            assert (
+                comments[1].payload.get("repository_digest")
+                == delivery_state(ticket).gate.contract_digest
             )
-            assert state.repository.outcome != "verified"
+            transitions = [row for row in rows if row.command == "transition_by_id"]
+            assert len(transitions) == 1
+            assert transitions[0].payload["data"]["step"] == "intake"
+        # Both writes succeed before the gate becomes active.
+        await sender.run_once()
+        await sender.run_once()
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            assert delivery_state(ticket).gate_ready
+            assert ticket.status == "Waiting for approval"
+        # A read without the approver edge changes nothing.
+        assert await activity.read_ticket(ticket_id, force_jira=True)
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            assert delivery_state(ticket).repository_match.confirmation is None
+        # An authorized approver confirms the repository through the same edge.
+        jira.approve("approver")
+        assert await activity.read_ticket(ticket_id, force_jira=True)
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            state = delivery_state(ticket)
+            assert state.repository_match.confirmation is not None
+            assert state.repository_match.confirmation.actor_account_id == "approver"
+            assert state.gate is None and not state.gate_ready
+            assert ticket.intake_state["phase"] == "scope_ready"
+            assert ticket.status == "In Progress"
+        # Confirmation resumes normal scope staging; scope approval stays separate.
+        await LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})(
+            ticket_id
+        )
+        async with session_factory() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            state = delivery_state(ticket)
+            assert state.scope is not None
+            assert state.gate is not None and state.gate.kind == "scope"
+            assert state.step == "approve_scope"
+        assert await activity.run_one_turn(intake) == ticket_id
+        async with session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    )
+                )
+            ).all()
+            comments = [row for row in rows if row.command == "comment"]
+            assert "Scope digest" in comments[-1].payload["data"]
 
 
 async def test_live_intake_waits_for_trusted_scope_before_approval_request(

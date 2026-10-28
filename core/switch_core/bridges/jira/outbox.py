@@ -510,6 +510,21 @@ class JiraOutboxSender:
                 row.error = "Frozen delivery scope changed"
                 await session.commit()
                 return
+        if row.status != "sending" and "repository_digest" in payload:
+            state = workflow_state_adapter.validate_json(
+                json.dumps(ticket.workflow_state)
+            )
+            if (
+                not isinstance(state, DeliveryWorkflowState)
+                or state.repository_match is None
+                or state.gate is None
+                or state.gate.kind != "repository"
+                or state.gate.contract_digest != payload["repository_digest"]
+            ):
+                row.status = "cancelled"
+                row.error = "Frozen repository confirmation changed"
+                await session.commit()
+                return
         if row.status != "sending" and "intake_generation" in payload:
             if (
                 ticket.worker_parked_reason
@@ -777,6 +792,24 @@ class JiraOutboxSender:
                         if state.gate.kind == "acceptance"
                         else "scope_digest"
                     )
+                    == state.gate.contract_digest
+                ):
+                    ticket.workflow_state = {
+                        **state.model_dump(mode="json"),
+                        "gate_ready": True,
+                    }
+                if (
+                    isinstance(state, DeliveryWorkflowState)
+                    and state.scope is None
+                    and state.gate is not None
+                    and state.gate.kind == "repository"
+                    and state.repository_match is not None
+                    and payload["data"]["target_status_id"]
+                    == state.repository_match.approval_route.source_status_id
+                    and predecessor is not None
+                    and predecessor.status == "done"
+                    and predecessor.command == "comment"
+                    and (predecessor.payload or {}).get("repository_digest")
                     == state.gate.contract_digest
                 ):
                     ticket.workflow_state = {

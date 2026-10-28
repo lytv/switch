@@ -50,7 +50,7 @@ A failed prerequisite blocks admission; it does not authorize a repair.
 | P0.4 Chat | Neither scope nor candidate approval comes from chat; only current Jira history grants authority |
 | P0.5 Uniqueness | Old delivery automation stays disabled; no competing trigger; durable webhook acknowledgment and webhook/poll deduplication |
 | P0.6 Fields | Service and Jira issue type checked separately; webhook, poll, send-time mapping agreement; non-Bug routing |
-| P0.7 Pins | Approved pack, runtime, skills, model, prices, base, commands, paths; repository triage before checkout; no registration allowlist |
+| P0.7 Pins | Approved pack, runtime, skills, model, prices, base, commands, paths; repository triage plus product corroboration before checkout; no registration allowlist |
 | P0.8 Isolation | Distinct worker locations; no host home/socket, production/metadata network, Jira or Switch credentials; publisher-only branch access; safe artifacts |
 | P0.9 Accounting | Input/output/cache/retry/cancelled usage; unknown reservations retained; ticket/day limits, UTC rollover, trusted spend enforcement |
 | P0.10 Disablement | No fresh start, retry, or checkpoint resume; cancellation and late-output fences; capacity retained until exit/quarantine |

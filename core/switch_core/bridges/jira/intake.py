@@ -29,6 +29,7 @@ from switch_core.bridges.jira.outbox import (
 )
 from switch_core.bridges.jira.parse import _plain_text
 from switch_core.bridges.jira.questions import relay_question
+from switch_core.bridges.jira.repository_match import confirmation_request_body
 from switch_core.bridges.jira.state import DeliveryWorkflowState
 from switch_core.bridges.jira.target import delivery_state
 from switch_core.config import SwitchConfig
@@ -416,7 +417,22 @@ class IntakeOrchestrator:
                     target = delivery_state(ticket)
                     phase = "approval"
                     content = decision.content
+                    repository_hold = False
                     if target is not None:
+                        repository_gate_pending = (
+                            target.service == "Bug"
+                            and target.repository is not None
+                            and target.repository.outcome == "verified"
+                            and target.scope is None
+                            and target.gate is not None
+                            and target.gate.kind == "repository"
+                            and target.repository_match is not None
+                        )
+                        repository_confirmed = (
+                            repository_gate_pending
+                            and target.repository_match is not None
+                            and target.repository_match.confirmation is not None
+                        )
                         if target.service != "Bug":
                             phase = "manual_handoff"
                             content += "\nManual handling required. No development job will start."
@@ -435,14 +451,24 @@ class IntakeOrchestrator:
                                 and target.scope is None
                             )
                         ):
-                            phase = "triage"
-                            reason = (
-                                "Trusted scope admission required before scope approval"
-                                if target.repository is not None
-                                and target.repository.outcome == "verified"
-                                else "Repository triage required before scope approval or checkout"
-                            )
-                            content += "\n" + reason
+                            if repository_gate_pending and not repository_confirmed:
+                                assert target.repository_match is not None
+                                content += "\n" + confirmation_request_body(
+                                    target.repository_match
+                                )
+                            elif repository_confirmed:
+                                # Confirmation landed; scope staging follows.
+                                phase = "scope_ready"
+                                repository_hold = True
+                            else:
+                                phase = "triage"
+                                reason = (
+                                    "Trusted scope admission required before scope approval"
+                                    if target.repository is not None
+                                    and target.repository.outcome == "verified"
+                                    else "Repository triage required before scope approval or checkout"
+                                )
+                                content += "\n" + reason
                         else:
                             content += (
                                 f"\nVerified repository: {target.repository.canonical_url}"
@@ -470,27 +496,38 @@ class IntakeOrchestrator:
                                     )
                     if not resuming_scope:
                         history.append({"complete": decision.content})
-                    summary = await self._queue(
-                        session,
-                        ticket,
-                        f"{cycle}:verified-summary"
-                        if resuming_scope
-                        else f"{cycle}:summary",
-                        "jira",
-                        "comment",
-                        f"Intake summary (not approval):\n{content}",
-                        None,
-                    )
-                    if phase == "approval":
-                        await self._queue(
+                    if not repository_hold:
+                        repository_round = (
+                            phase == "approval"
+                            and target is not None
+                            and target.gate is not None
+                            and target.gate.kind == "repository"
+                        )
+                        summary = await self._queue(
                             session,
                             ticket,
-                            f"{cycle}:approval",
+                            f"{cycle}:repository-summary"
+                            if repository_round
+                            else f"{cycle}:verified-summary"
+                            if resuming_scope
+                            else f"{cycle}:summary",
                             "jira",
-                            "transition",
-                            self._config.jira_worker_statuses.waiting_for_approval,
-                            summary,
+                            "comment",
+                            f"Intake summary (not approval):\n{content}",
+                            None,
                         )
+                        if phase == "approval":
+                            await self._queue(
+                                session,
+                                ticket,
+                                f"{cycle}:repository-approval"
+                                if repository_round
+                                else f"{cycle}:approval",
+                                "jira",
+                                "transition",
+                                self._config.jira_worker_statuses.waiting_for_approval,
+                                summary,
+                            )
                 else:
                     raise ValueError("Intake model returned an invalid action")
                 ticket.intake_state = {
