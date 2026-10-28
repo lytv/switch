@@ -151,9 +151,15 @@ ticket for release and fresh triage.
 
 Bug intake without a verified target records its summary and requests trusted
 triage. It does not queue scope approval until trusted triage verifies the target.
-Verification resumes completed intake once, without another model decision, and
-queues a summary with the verified repository before requesting scope approval.
-Repeated triage results do not queue another approval. Missing or ambiguous URLs
+Live admission waits for the intake summary before reading forge evidence, so
+verification and product facts commit together. Verification resumes completed
+intake once, without another model decision, and queues a summary with the verified
+repository before requesting scope approval. A pending repository gate also resumes
+completed intake. Reconciliation recovers a ticket stuck in triage with that gate
+on the next cycle, without database edits or another model decision. It retains the
+frozen match and requires human confirmation. Unreadable tree facts or a previously
+verified target without saved product facts need human confirmation, even for a
+public repository. Repeated triage results do not queue another approval. Missing or ambiguous URLs
 cannot form a checkout job. A changed Service or Bug repository URL parks the ticket and
 preserves its original target. Target edits do not clear a park automatically.
 Feature, Docs, and Other finish with a summary and an explicit manual handoff.

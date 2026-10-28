@@ -8,6 +8,7 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from switch_core.bridges.jira.contracts import (
     digest,
 )
 from switch_core.bridges.jira.delivery import (
+    DeliverySupervisor,
     ScopeApproved,
     apply_event,
     role_job,
@@ -486,6 +488,7 @@ class AgdJira:
 
 
 @pytest.mark.parametrize("live_setup", ["2.0.0-deepseek"], indirect=True)
+@pytest.mark.parametrize("admission_before_intake", [False, True])
 @pytest.mark.parametrize(
     ("product", "repository_description", "path", "outcome"),
     [
@@ -510,6 +513,7 @@ class AgdJira:
         ("", "Agent orchestration service", "booking-service", "unclear"),
         ("Booking", "Agent orchestration service", "booking-service", "mismatch"),
         ("", "Disposable booking sandbox", "booking-service", "unclear"),
+        ("Booking", "Disposable booking sandbox", "unreadable-tree", "unclear"),
     ],
     ids=[
         "matched",
@@ -518,12 +522,14 @@ class AgdJira:
         "identity-only",
         "repository-identity-only",
         "ticket-identity-only",
+        "unreadable-tree",
     ],
 )
 async def test_product_mismatch_stops_before_scope(
     session_factory,
     live_setup,
     monkeypatch,
+    admission_before_intake,
     product,
     repository_description,
     path,
@@ -631,13 +637,6 @@ async def test_product_mismatch_stops_before_scope(
         },
         clock=lambda: NOW,
     )
-    assert await activity.run_one_turn(intake) == ticket_id
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, ticket_id)
-        assert ticket.intake_state["phase"] == "triage"
-        assert delivery_state(ticket).scope is None
-    assert model.calls[0][0]["description"] == issue["fields"]["description"]
-
     reads = []
 
     async def handle(request):
@@ -655,6 +654,8 @@ async def test_product_mismatch_stops_before_scope(
         if request.url.path == f"/repos/team/{path}/commits/main":
             return httpx.Response(200, json={"sha": lab.base_sha})
         assert request.url.path == f"/repos/team/{path}/git/trees/{lab.base_sha}"
+        if path == "unreadable-tree":
+            return httpx.Response(403)
         names = (
             ["booking.py", "scenario.json", "tests"]
             if outcome == "match"
@@ -671,10 +672,40 @@ async def test_product_mismatch_stops_before_scope(
         "AsyncClient",
         lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs),
     )
-    await LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})(ticket_id)
+    admission = LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})
+    jobs, publisher = AsyncMock(), AsyncMock()
+    supervisor = DeliverySupervisor(
+        session_factory=session_factory,
+        config=settings,
+        activity=activity,
+        jobs=jobs,
+        publisher=publisher,
+        clock=lambda: NOW,
+        admission=admission,
+    )
+    if admission_before_intake:
+        await supervisor.reconcile(ticket_id)
+        assert reads == []
+    assert await activity.run_one_turn(intake) == ticket_id
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        assert ticket.intake_state["phase"] == "triage"
+        assert delivery_state(ticket).scope is None
+    assert model.calls[0][0]["description"] == issue["fields"]["description"]
+    await sender.run_once()
+    assert jira.status == "To Do"
+    assert len(jira.comments) == 1
+    assert "Trusted scope admission required" in json.dumps(jira.comments[0]) or (
+        "Repository triage required" in json.dumps(jira.comments[0])
+    )
+    await supervisor.reconcile(ticket_id)
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, ticket_id)
         state = delivery_state(ticket)
+        assert state.repository_match.facts_available == (path != "unreadable-tree")
+        assert repository_description in state.repository_match.facts
+        jobs.start.assert_not_called()
+        publisher.publish.assert_not_called()
         commands = (
             await session.scalars(
                 select(JiraWorkerOutbox).where(JiraWorkerOutbox.issue_key == "AGD-19")
@@ -706,16 +737,47 @@ async def test_product_mismatch_stops_before_scope(
         assert state.repository_match.outcome == outcome
         assert state.repository_match.confirmation is None
         assert ticket.intake_state["phase"] == "scope_ready"
-        async with session_factory() as session:
-            for row in (
+        if path == "unreadable-tree" and admission_before_intake:
+            # Persist the legacy stall: verified pins, no facts, and no intake wake.
+            match = live.evaluate_repository_match(
+                generation=ticket.agent_generation,
+                repository=state.repository,
+                markers=policy.product_markers,
+                approval_route=policy.scope.approval_route,
+                facts=(),
+                facts_available=False,
+                ticket_text=ticket.summary,
+            )
+            gate = state.gate.model_copy(
+                update={"contract_digest": match.contract_digest}
+            )
+            ticket.workflow_state = state.model_copy(
+                update={"repository_match": match, "gate": gate}
+            ).model_dump(mode="json")
+            ticket.intake_state = {**ticket.intake_state, "phase": "triage"}
+            ticket.agent_state = "waiting"
+            for event in await session.scalars(
+                select(JiraWorkerEvent).where(JiraWorkerEvent.issue_key == "AGD-19")
+            ):
+                event.consumed = True
+            await session.commit()
+            for _ in range(2):
+                await supervisor.reconcile(ticket_id)
+            await session.refresh(ticket)
+            recovered = delivery_state(ticket)
+            assert recovered.repository_match == match and recovered.gate == gate
+            assert ticket.intake_state["phase"] == "scope_ready"
+            assert ticket.agent_state == "wake_requested"
+            events = list(
                 await session.scalars(
-                    select(JiraWorkerOutbox).where(
-                        JiraWorkerOutbox.issue_key == "AGD-19"
+                    select(JiraWorkerEvent).where(
+                        JiraWorkerEvent.idempotency_key
+                        == f"live-repository:{ticket_id}:1"
                     )
                 )
-            ).all():
-                row.status = "done"
-            await session.commit()
+            )
+            assert len(events) == 1 and not events[0].consumed
+            assert len(reads) == 3
         # The reporter-visible confirmation request goes through intake.
         assert await activity.run_one_turn(intake) == ticket_id
         async with session_factory() as session:
@@ -728,17 +790,11 @@ async def test_product_mismatch_stops_before_scope(
                 )
             ).all()
             assert ticket.intake_state["phase"] == "approval"
-            rows = (
-                await session.scalars(
-                    select(JiraWorkerOutbox).where(
-                        JiraWorkerOutbox.issue_key == "AGD-19"
-                    )
-                )
-            ).all()
             comments = [row for row in rows if row.command == "comment"]
             assert len(comments) == 2
             assert "Repository confirmation required" in comments[1].payload["data"]
-            assert repository_description in comments[1].payload["data"]
+            if path != "unreadable-tree" or not admission_before_intake:
+                assert repository_description in comments[1].payload["data"]
             assert (
                 comments[1].payload.get("repository_digest")
                 == delivery_state(ticket).gate.contract_digest
@@ -753,6 +809,10 @@ async def test_product_mismatch_stops_before_scope(
             ticket = await session.get(JiraWorkerTicket, ticket_id)
             assert delivery_state(ticket).gate_ready
             assert ticket.status == "Waiting for approval"
+        await supervisor.reconcile(ticket_id)
+        await sender.run_once()
+        assert await activity.run_one_turn(intake) is None
+        assert len(jira.comments) == 2 and len(jira.histories) == 1
         # A read without the approver edge changes nothing.
         assert await activity.read_ticket(ticket_id, force_jira=True)
         async with session_factory() as session:
