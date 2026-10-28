@@ -524,6 +524,31 @@ async def test_dirty_or_unauthorized_gate_parks_without_job(session_factory, dir
     assert process.starts == [] and state.approvals == ()
 
 
+async def test_admission_error_logs_traceback_and_keeps_park_fence(
+    session_factory, caplog
+):
+    await seed(session_factory)
+    _, supervisor, process, _, _ = services(session_factory, DeliveryJira())
+
+    async def refuse(ticket_id):
+        raise ValueError("Trusted admission refused the target")
+
+    supervisor._admission = refuse
+    await supervisor.reconcile("ticket")
+    ticket, state = await current(session_factory)
+    assert ticket.worker_parked_reason == "Trusted admission refused the target"
+    assert ticket.agent_generation == 2 and ticket.agent_state == "parked"
+    assert state.gate is None and not state.gate_ready
+    assert process.starts == []
+    [record] = [
+        record
+        for record in caplog.records
+        if record.name == "switch_core.bridges.jira.delivery"
+    ]
+    assert record.getMessage() == "Delivery evidence failed for ticket"
+    assert record.exc_info and isinstance(record.exc_info[1], ValueError)
+
+
 async def test_jira_chat_approval_does_not_start_work(session_factory):
     await seed(session_factory)
     jira = DeliveryJira()

@@ -91,6 +91,8 @@ def initialize_target(
             }
         )
     )
+    if ticket.agent_generation == 0:
+        ticket.agent_generation = 1
     ticket.service_value = service
     ticket.workflow_state = state.model_dump(mode="json")
 

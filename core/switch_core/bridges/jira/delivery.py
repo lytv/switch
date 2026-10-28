@@ -456,6 +456,7 @@ class DeliverySupervisor:
                 except CapacityUnavailable:
                     return
                 except ValueError as exc:
+                    logger.exception("Delivery evidence failed for %s", ticket_id)
                     async with self._sessions() as session:
                         ticket = await session.get(
                             JiraWorkerTicket, ticket_id, with_for_update=True
