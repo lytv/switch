@@ -23,7 +23,12 @@ from switch_core.bridges.jira.contracts import (
     Result,
     digest,
 )
-from switch_core.bridges.jira.delivery import ScopeApproved, apply_event, role_job
+from switch_core.bridges.jira.delivery import (
+    ScopeApproved,
+    apply_event,
+    role_job,
+    stage_scope,
+)
 from switch_core.bridges.jira.delivery_contracts import (
     CheckEvidence,
     Handoff,
@@ -33,7 +38,7 @@ from switch_core.bridges.jira.delivery_contracts import (
     VerificationRole,
 )
 from switch_core.bridges.jira.firstmate_jobs import Execution
-from switch_core.bridges.jira.intake import IntakeOrchestrator
+from switch_core.bridges.jira.intake import IntakeDecision, IntakeOrchestrator
 from switch_core.bridges.jira.live import (
     AdmissionPolicy,
     LiveAdmission,
@@ -45,6 +50,7 @@ from switch_core.bridges.jira.model_gateway import (
     model_capability,
     model_identity,
 )
+from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.jira.packs import FrozenPack, load_pack
 from switch_core.bridges.jira.readiness import check_readiness
 from switch_core.bridges.jira.state import WorkflowMapping
@@ -388,6 +394,181 @@ async def test_live_intake_waits_for_trusted_scope_before_approval_request(
     _, staged = await current(session_factory)
     assert f"Scope digest: {digest(staged.scope)}" in commands[1][1]
     assert staged.step == "approve_scope" and not staged.approvals
+
+
+@pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)
+async def test_scope_rejection_requires_fresh_corrected_generation(
+    session_factory, live_setup, monkeypatch
+):
+    settings, rejected_scope, policy, _ = live_setup
+    policy = policy.model_copy(
+        update={
+            "statuses": (
+                *policy.statuses,
+                WorkflowMapping(name="Waiting for input", jira_id="input"),
+            ),
+            "transitions": (
+                *policy.transitions,
+                WorkflowMapping(name="input->approval", jira_id="request-approval"),
+                WorkflowMapping(name="Reject", jira_id="7"),
+            ),
+        }
+    )
+    jira = DeliveryJira()
+    jira.status = "In Progress"
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        ticket.status = jira.status
+        ticket.intake_state = {"phase": "intake", "questions": 5}
+        ticket.wait_channel = "jira_comments"
+        ticket.room_claimed = True
+        ticket.card_event_id = "fixture-card"
+        ticket.agent_state = "wake_requested"
+        ticket.tokens_used = 23
+        ticket.workflow_state = {
+            **ticket.workflow_state,
+            "gate_ready": False,
+            "statuses": [item.model_dump(mode="json") for item in policy.statuses],
+            "transitions": [
+                item.model_dump(mode="json") for item in policy.transitions
+            ],
+            "reserved_tokens": 100,
+            "reserved_estimated_usd": "0.01",
+            "known_estimated_usd": "0.25",
+        }
+        await session.commit()
+    activity, supervisor, process, forge, _ = services(session_factory, jira)
+
+    class ScopeModel(ModelMock):
+        async def decide(self, data, token_budget):
+            decision = await super().decide(data, token_budget)
+            summary = (
+                data["replies"][-1]
+                if data["replies"]
+                else rejected_scope.job.acceptance[0]
+            )
+            return IntakeDecision("complete", summary, decision.tokens_used)
+
+    model = ScopeModel("complete")
+    intake = IntakeOrchestrator(
+        session_factory=session_factory,
+        config=_worker_config(jira_worker_enabled_projects={"acme": ["TEST"]}),
+        model=model,
+        board=FakeAdminBoard(),
+        clock=lambda: NOW,
+    )
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=settings,
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+    )
+    assert await activity.run_one_turn(intake) == "ticket"
+    await sender.run_once()
+    await activity.read_ticket("ticket", force_jira=True)
+    ticket, rejected = await current(session_factory)
+    assert rejected.gate_ready and ticket.intake_state["phase"] == "approval"
+    assert ticket.worker_parked_reason is None
+    rejected_approval = ScopeApproved(
+        approval=Approval(
+            gate=rejected.gate,
+            actor_account_id="approver",
+            actor_kind="human",
+            history_id="stale-approval",
+        )
+    )
+    tokens_before = ticket.tokens_used
+
+    # Jira changelogs expose status endpoints, not the Reject transition id (7).
+    jira.reject()
+    await activity.read_ticket("ticket", force_jira=True)
+    ticket, reset = await current(session_factory)
+    assert ticket.worker_parked_reason is None
+    assert ticket.status == "Waiting for input" and ticket.agent_generation == 2
+    assert ticket.intake_state["cycle"] == 1 and ticket.intake_state["questions"] == 0
+    assert any("jira_rejection" in item for item in ticket.intake_state["history"])
+    assert reset.step == "intake"
+    assert reset.scope is reset.gate is None and not reset.gate_ready
+    assert reset.approvals == () and reset.checkpoints == ()
+    assert reset.repository.outcome == "unknown"
+    for field in (
+        "pack",
+        "model_prices",
+        "statuses",
+        "transitions",
+        "known_estimated_usd",
+        "reserved_tokens",
+        "reserved_estimated_usd",
+        "unknown_spend",
+        "budget",
+    ):
+        assert getattr(reset, field) == getattr(rejected, field)
+    assert ticket.tokens_used == tokens_before
+    await activity.read_ticket("ticket", force_jira=True)
+    ticket, repeated = await current(session_factory)
+    assert ticket.agent_generation == 2 and repeated == reset
+    with pytest.raises(ValueError, match="active frozen scope"):
+        apply_event(ticket, rejected_approval)
+
+    admission = LiveAdmission(
+        session_factory,
+        settings.jira_worker_delivery_runtime,
+        {("acme", "TEST"): policy},
+    )
+
+    async def triage(supplied):
+        assert supplied == URL
+        return rejected_scope.job.repository
+
+    monkeypatch.setattr(admission, "triage", triage)
+    await admission("ticket")
+    ticket, state = await current(session_factory)
+    assert state.scope is None and state.gate is None
+    with pytest.raises(ValueError, match="current verified Bug intake"):
+        stage_scope(ticket, rejected_scope, rejected.gate)
+    assert await activity.run_one_turn(intake) == "ticket"
+    await sender.run_once()
+    ticket, _ = await current(session_factory)
+    assert ticket.intake_state["phase"] == "question"
+    assert ticket.intake_state["questions"] == 1 and len(model.calls) == 1
+    correction = (
+        "Correct the export to preserve every column, not only the first column."
+    )
+    jira.change("reporter-account", comment=True)
+    jira.comments[-1]["body"] = correction
+    await activity.read_ticket("ticket", force_jira=True)
+    assert await activity.run_one_turn(intake) == "ticket"
+    await sender.run_once()
+    ticket, state = await current(session_factory)
+    assert model.calls[-1][0]["replies"] == [correction]
+    assert ticket.intake_state["phase"] == "triage" and state.scope is None
+    await admission("ticket")
+    ticket, staged = await current(session_factory)
+    assert staged.scope.job.acceptance == (correction,)
+    assert staged.scope.job.run.generation == staged.gate.run.generation == 2
+    assert staged.scope.branch == "switch/ticket/2"
+    assert staged.gate.contract_digest == digest(staged.scope) != digest(rejected_scope)
+    assert not staged.gate_ready and staged.approvals == ()
+    with pytest.raises(ValueError, match="active tested gate"):
+        apply_event(ticket, rejected_approval)
+    assert await activity.run_one_turn(intake) == "ticket"
+    await sender.run_once()
+    ticket, state = await current(session_factory)
+    assert (
+        state.scope == staged.scope and state.gate == staged.gate and state.gate_ready
+    )
+    assert state.approvals == () and ticket.intake_state["cycle"] == 1
+    displayed = json.dumps(jira.comments[-1]["body"])
+    assert correction in displayed and digest(staged.scope) in displayed
+    assert digest(rejected_scope) not in displayed
+    with pytest.raises(ValueError, match="active tested gate"):
+        apply_event(ticket, rejected_approval)
+    assert not process.starts and not forge.pushes
+    jira.approve()
+    await supervisor.reconcile("ticket")
+    _, approved = await current(session_factory)
+    assert approved.approvals[0].gate == staged.gate != rejected.gate
+    assert process.starts == ["ticket/2/reproduce/1"]
 
 
 @pytest.mark.parametrize("live_setup", ["2.0.0", "2.0.0-deepseek"], indirect=True)

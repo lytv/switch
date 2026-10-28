@@ -114,6 +114,19 @@ class DeliveryJira(JiraMock):
             }
         ]
 
+    def reject(self):
+        self.change("approver")
+        self.status = "Waiting for input"
+        self.histories[-1]["items"] = [
+            {
+                "field": "status",
+                "from": "approval",
+                "to": "input",
+                "fromString": "Waiting for approval",
+                "toString": self.status,
+            }
+        ]
+
     async def handle(self, request):
         if request.method == "GET" and request.url.path.endswith("/transitions"):
             return httpx.Response(
@@ -152,9 +165,10 @@ class DeliveryJira(JiraMock):
         ):
             body = response.json()
             if "fields" in body:
-                body["fields"]["status"]["id"] = (
-                    "approval" if self.status == "Waiting for approval" else "progress"
-                )
+                body["fields"]["status"]["id"] = {
+                    "Waiting for approval": "approval",
+                    "Waiting for input": "input",
+                }.get(self.status, "progress")
                 response = httpx.Response(200, json=body)
         return response
 
@@ -574,6 +588,55 @@ async def test_summary_and_exact_request_must_finish_before_gate_approval(
     jira.approve()
     await supervisor.reconcile("ticket")
     assert process.starts == [scope.job.run.execution_key]
+
+
+@pytest.mark.parametrize(
+    "dirty",
+    [
+        "extra-history",
+        "same-entry",
+        "actor",
+        "endpoint",
+        "missing-mapping",
+        "not-ready",
+        "acceptance",
+    ],
+)
+async def test_scope_rejection_does_not_bypass_other_fences(session_factory, dirty):
+    await seed(session_factory, ready=dirty != "not-ready")
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        ticket.workflow_state = {
+            **ticket.workflow_state,
+            "statuses": [
+                *ticket.workflow_state["statuses"],
+                *(
+                    []
+                    if dirty == "missing-mapping"
+                    else [{"name": "Waiting for input", "jira_id": "input"}]
+                ),
+            ],
+            "step": "accept" if dirty == "acceptance" else "approve_scope",
+        }
+        await session.commit()
+    jira = DeliveryJira()
+    jira.reject()
+    if dirty == "extra-history":
+        jira.change("approver")
+        jira.histories[-1]["items"] = [{"field": "summary"}]
+    elif dirty == "same-entry":
+        jira.histories[-1]["items"].append({"field": "summary"})
+    elif dirty == "actor":
+        jira.histories[-1]["author"] = {"accountId": "stranger"}
+    elif dirty == "endpoint":
+        jira.histories[-1]["items"][0]["to"] = "other"
+    activity, _, process, forge, _ = services(session_factory, jira)
+    await activity.read_ticket("ticket", force_jira=True)
+    ticket, state = await current(session_factory)
+    assert ticket.worker_parked_reason
+    assert state.scope is not None and state.approvals == ()
+    assert ticket.intake_state == {"phase": "approval"}
+    assert not process.starts and not forge.pushes
 
 
 @pytest.mark.parametrize("action", ["question", "complete"])
