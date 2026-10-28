@@ -316,16 +316,22 @@ async def test_trusted_triage_stages_scope_without_checkout_or_approval(
         "AsyncClient",
         lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs),
     )
-    await admission("ticket")
+    assert policy.product_markers == ()
     await admission("ticket")
     ticket, state = await current(session_factory)
     assert state.repository.outcome == "verified" and state.scope is not None
+    assert state.repository_match is None
+    assert state.gate is not None and state.gate.kind == "scope"
     assert (
         state.step == "approve_scope" and not state.gate_ready and not state.approvals
     )
     assert ticket.intake_state["phase"] == "scope_ready"
     assert not list(runtime.repositories.glob("*/objects.git"))
     assert not list(lab.homes.glob("*/data"))
+    await admission("ticket")
+    repeated_ticket, repeated_state = await current(session_factory)
+    assert repeated_state == state
+    assert repeated_ticket.intake_state == ticket.intake_state
     with pytest.raises(ValueError, match="configured GitHub"):
         await admission.triage("https://other.example.invalid/team/project")
     with pytest.raises(ValueError, match="refused repository triage"):
