@@ -55,6 +55,20 @@ SPAWN = """
 import json, os, pathlib, subprocess, sys, time
 home = pathlib.Path(os.environ["FM_HOME"])
 task = sys.argv[1]
+brief = (home / "data" / task / "brief.md").read_text()
+lines = brief.splitlines()
+body = []
+in_task = False
+for line in lines:
+    if line.startswith("# "):
+        if in_task:
+            break
+        in_task = line == "# Task"
+    elif in_task:
+        body.append(line)
+if not "".join(body).strip():
+    print("error: brief must contain nonempty ## Captain's intent and ## Firstmate spec subsections (or a nonempty legacy # Task body) before spawn", file=sys.stderr)
+    sys.exit(1)
 count = home / "starts"
 count.write_text(str(int(count.read_text()) + 1) if count.exists() else "1")
 (home / "environment.json").write_text(json.dumps(dict(os.environ)))
