@@ -41,7 +41,11 @@ from switch_core.bridges.jira.outbox import (
     park_ticket,
     read_jira_version,
 )
-from switch_core.bridges.jira.target import check_target_fields, delivery_state
+from switch_core.bridges.jira.target import (
+    check_target_fields,
+    delivery_state,
+    reset_delivery_scope,
+)
 from switch_core.config import JiraWorkerLimits, SwitchConfig
 from switch_core.db.models import (
     JiraWorkerEvent,
@@ -669,10 +673,9 @@ class TicketActivity:
             worker_account=account,
             reporter_account=ticket.reporter_account_id,
         )
+        observation = self._resume_rejection(ticket, version, observation)
         if self._config.jira_worker_delivery_execution_enabled:
             observation = observe_scope_approval(ticket, version, observation)
-        if delivery_state(ticket) is None:
-            observation = self._resume_rejection(ticket, version, observation)
         if observation.park != "regressed":
             for entry in version["histories"]:
                 for item in entry.get("items", []):
@@ -727,6 +730,14 @@ class TicketActivity:
         state = dict(ticket.intake_state or {})
         if state.get("phase") != "approval" or ticket.worker_parked_reason:
             return observation
+        target = delivery_state(ticket)
+        if target is not None and (
+            target.step != "approve_scope"
+            or target.scope is None
+            or target.gate is None
+            or not target.gate_ready
+        ):
+            return observation
         base_id = ticket.jira_read_changelog_id
         if base_id is None:
             return observation
@@ -754,6 +765,25 @@ class TicketActivity:
             != self._config.jira_worker_statuses.waiting_for_input
         ):
             return observation
+        if target is not None:
+            statuses = {item.name: item.jira_id for item in target.statuses}
+            source = statuses.get(
+                self._config.jira_worker_statuses.waiting_for_approval
+            )
+            destination = statuses.get(
+                self._config.jira_worker_statuses.waiting_for_input
+            )
+            assert target.gate is not None
+            if (
+                source is None
+                or destination is None
+                or items[0].get("from") != source
+                or items[0].get("to") != destination
+                or version["fields"].get("status", {}).get("id") != destination
+                or humans[0]["author"]["accountId"]
+                not in target.gate.approver_account_ids
+            ):
+                return observation
         allowed = {
             **version,
             "histories": [
@@ -775,17 +805,31 @@ class TicketActivity:
         )
         if checked.park:
             return observation
+        if target is not None:
+            reset_delivery_scope(
+                ticket,
+                target,
+                service=target.service,
+                supplied_url=target.repository.supplied_url
+                if target.repository
+                else "",
+            )
+            state = ticket.intake_state or {}
+        else:
+            ticket.agent_generation += 1
+            state = {
+                **state,
+                "phase": "intake",
+                "cycle": state.get("cycle", 0) + 1,
+                "questions": 0,
+            }
         ticket.intake_state = {
             **state,
-            "phase": "intake",
-            "cycle": state.get("cycle", 0) + 1,
-            "questions": 0,
             "history": [
                 *state.get("history", []),
                 {"jira_rejection": "The approver rejected the intake summary."},
             ],
         }
-        ticket.agent_generation += 1
         ticket.wait_anchor = None
         ticket.wait_fired = None
         request_wake(ticket)

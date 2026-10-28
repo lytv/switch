@@ -178,6 +178,11 @@ in the approval entry, an unauthorized actor, or a concurrent human comment
 parks the ticket. Chat and room text never authorize work. Later acceptance
 belongs to a separate phase and does not start reproduction.
 
+A clean Reject from an authorized scope approver starts a new intake generation.
+The worker clears the rejected scope and gate, but retains frozen policy and cumulative accounting.
+The next scope requires corrected reporter input, fresh repository triage, and a new approval binding.
+Rejection does not reset the later candidate-acceptance gate.
+
 `delivery.py` validates typed scope and job events against the current generation.
 A fix needs a successful reproduction handoff with an approved failing check at
 the frozen base SHA. It starts a separate Firstmate task and home, without the
