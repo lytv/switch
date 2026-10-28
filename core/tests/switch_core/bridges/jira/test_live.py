@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from sqlalchemy import select
 
 from switch_core.bridges.jira import live
+from switch_core.bridges.jira.activity import TicketActivity
 from switch_core.bridges.jira.contracts import (
     Approval,
     Meter,
@@ -53,10 +54,15 @@ from switch_core.bridges.jira.model_gateway import (
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.jira.packs import FrozenPack, load_pack
 from switch_core.bridges.jira.readiness import check_readiness
+from switch_core.bridges.jira.rooms import reconcile_ticket_room
 from switch_core.bridges.jira.state import WorkflowMapping
 from switch_core.bridges.jira.target import delivery_state
 from switch_core.bridges.jira.verification import MergeReceipt
-from switch_core.bridges.jira.worker import JiraWorkerScheduler
+from switch_core.bridges.jira.worker import (
+    JiraPollClient,
+    JiraWorkerScheduler,
+    record_polled_issue,
+)
 from switch_core.db.models import (
     JiraWorkerEvent,
     JiraWorkerJob,
@@ -80,6 +86,7 @@ from tests.switch_core.bridges.jira.test_firstmate_jobs import (
 )
 from tests.switch_core.bridges.jira.test_intake import ModelMock
 from tests.switch_core.bridges.jira.test_outbox import client_for
+from tests.switch_core.bridges.jira.test_rooms import FakeRooms
 
 
 def git(path, *args):
@@ -335,6 +342,150 @@ async def test_trusted_triage_stages_scope_without_checkout_or_approval(
             )
         ).all()
     assert {"repository-verified:ticket:1", "live-scope:ticket:1"} <= set(events)
+
+
+@pytest.mark.parametrize("live_setup", ["2.0.0-deepseek"], indirect=True)
+@pytest.mark.parametrize("matched", [True, False], ids=["matched", "wrong-product"])
+async def test_product_mismatch_stops_before_scope(
+    session_factory, live_setup, monkeypatch, matched
+):
+    settings, _, policy, lab = live_setup
+    settings.jira_worker_enabled_projects = {"acme": ["AGD"]}
+    settings.jira_worker_delivery_projects = {
+        "acme": {"AGD": settings.jira_worker_delivery_projects["acme"]["TEST"]}
+    }
+    runtime = settings.jira_worker_delivery_runtime
+    product = "Disposable booking sandbox"
+    path = "booking-sandbox" if matched else "orchestration-service"
+    url = f"https://example.invalid/team/{path}"
+    issue = {
+        "key": "AGD-19",
+        "fields": {
+            "summary": f"{product}: preview input 7 must return 14",
+            "description": (
+                f"Repository URL: {url}\n\n"
+                f"Intended product: {product}.\n"
+                "The booking preview returns 7 for input 7. It must return 14."
+            ),
+            "status": {"name": "To Do"},
+            "project": {"key": "AGD"},
+            "reporter": {"accountId": "reporter"},
+            "updated": NOW.isoformat(),
+            "customfield_12345": {"value": "Bug"},
+        },
+    }
+    async with session_factory() as session:
+        assert await record_polled_issue(
+            session, issue, instance="acme", config=settings
+        )
+        await session.commit()
+        ticket = await session.scalar(
+            select(JiraWorkerTicket).where(JiraWorkerTicket.issue_key == "AGD-19")
+        )
+        ticket_id = ticket.id
+        assert delivery_state(ticket).repository.outcome == "unknown"
+        assert await reconcile_ticket_room(
+            session,
+            instance="acme",
+            issue_key="AGD-19",
+            rooms=FakeRooms(),
+            jira_agent_name="jira",
+            limits=settings.jira_worker_limits,
+            now=NOW,
+            enabled_projects=settings.jira_worker_enabled_projects,
+        )
+        # Isolate product matching from the separately tracked generation-zero defect.
+        ticket.agent_generation = 1
+        await session.commit()
+    model = ModelMock("complete")
+    intake = IntakeOrchestrator(
+        session_factory=session_factory,
+        config=settings,
+        model=model,
+        board=FakeAdminBoard(),
+        clock=lambda: NOW,
+    )
+
+    async def jira_read(request):
+        if request.url.path.endswith("/myself"):
+            return httpx.Response(200, json={"accountId": "worker"})
+        if request.url.path.endswith("/changelog"):
+            return httpx.Response(200, json={"values": [], "total": 0})
+        if request.url.path.endswith("/comment"):
+            return httpx.Response(200, json={"comments": [], "total": 0})
+        return httpx.Response(200, json=issue)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jira_read)) as http:
+        activity = TicketActivity(
+            session_factory=session_factory,
+            config=settings,
+            clients={
+                "acme": JiraPollClient(
+                    base_url="https://jira.example.invalid",
+                    email="worker@example.invalid",
+                    api_token="PLACEHOLDER_JIRA_VALUE",
+                    client=http,
+                    extra_fields=("customfield_12345",),
+                )
+            },
+            rooms=None,
+            clock=lambda: NOW,
+        )
+        assert await activity.run_one_turn(intake) == ticket_id
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        assert ticket.intake_state["phase"] == "triage"
+        assert delivery_state(ticket).scope is None
+    assert model.calls[0][0]["description"] == issue["fields"]["description"]
+
+    reads = []
+
+    async def handle(request):
+        assert request.headers["authorization"] == "PLACEHOLDER_FORGE_VALUE"
+        reads.append(request.url.path)
+        if request.url.path == f"/repos/team/{path}":
+            return httpx.Response(
+                200,
+                json={
+                    "clone_url": url,
+                    "default_branch": "main",
+                    "description": product
+                    if matched
+                    else "Agent orchestration service",
+                },
+            )
+        assert request.url.path == f"/repos/team/{path}/commits/main"
+        return httpx.Response(200, json={"sha": lab.base_sha})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(
+        live.httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    await LiveAdmission(session_factory, runtime, {("acme", "AGD"): policy})(ticket_id)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, ticket_id)
+        state = delivery_state(ticket)
+        commands = (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(JiraWorkerOutbox.issue_key == "AGD-19")
+            )
+        ).all()
+        assert not any(row.command.startswith("transition") for row in commands)
+        assert not list(runtime.repositories.glob("*/objects.git"))
+        assert not list(lab.homes.glob("*/data"))
+        assert reads == [f"/repos/team/{path}", f"/repos/team/{path}/commits/main"]
+        if matched:
+            assert state.repository.outcome == "verified"
+            assert state.scope is not None
+            assert state.step == "approve_scope"
+        else:
+            assert state.scope is None, (
+                "P19: trusted admission staged scope for a reachable repository "
+                f"that belongs to a different product: {state.repository.evidence}"
+            )
+            assert state.repository.outcome != "verified"
 
 
 async def test_live_intake_waits_for_trusted_scope_before_approval_request(
