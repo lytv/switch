@@ -32,7 +32,7 @@ TICKET = (
     "The booking preview returns 7 for input 7."
 )
 
-FACTS = ("team/booking-sandbox", "Disposable booking sandbox", "booking.py")
+FACTS = ("Disposable booking sandbox", "booking.py")
 
 
 def check(**overrides):
@@ -85,6 +85,45 @@ def test_mismatch_when_facts_lack_ticket_markers():
     match = check(facts=("team/orchestration-service", "Agent orchestration service"))
     assert match.outcome == "mismatch"
     assert "sandbox" in match.reason or "marker" in match.reason
+
+
+@pytest.mark.parametrize(
+    ("prose", "facts", "outcome"),
+    [
+        ("Fix crash", ("team/booking-sandbox", "Agent service"), "unclear"),
+        (
+            "Booking preview fails",
+            ("team/booking-sandbox", "Agent service"),
+            "mismatch",
+        ),
+        ("Fix crash", ("Disposable booking sandbox", "booking.py"), "unclear"),
+        (
+            "Booking preview fails",
+            ("Disposable booking sandbox", "booking.py"),
+            "match",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "identity_text",
+    [
+        f"rEpOsItOrY URL: {REPOSITORY.supplied_url}",
+        f"Affected repository: {REPOSITORY.supplied_url}.git",
+        "Affected repository: team/booking-sandbox",
+    ],
+)
+@pytest.mark.parametrize("structured_ticket", [False, True])
+def test_repository_identity_cannot_corroborate_product(
+    prose, facts, outcome, identity_text, structured_ticket
+):
+    text = f"{identity_text}\n{prose}"
+    ticket = (
+        {"type": "doc", "content": [{"type": "text", "text": text}]}
+        if structured_ticket
+        else text
+    )
+    match = check(ticket_text=ticket, facts=facts)
+    assert match.outcome == outcome
 
 
 def test_unclear_when_ticket_asserts_no_marker():

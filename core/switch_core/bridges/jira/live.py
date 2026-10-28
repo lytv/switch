@@ -731,17 +731,11 @@ class LiveForge:
 
 
 def _repository_facts(
-    canonical_url: str | None,
     meta: dict[str, object],
     names: tuple[str, ...],
 ) -> tuple[str, ...]:
     """Bounded forge facts for product corroboration."""
     facts: list[str] = []
-    if canonical_url is not None:
-        _, _, path = repository_identity(canonical_url)
-        full_name = path.lstrip("/").removesuffix(".git")
-        if full_name:
-            facts.append(full_name)
     description = meta.get("description")
     if isinstance(description, str) and description.strip():
         facts.append(description.strip())
@@ -976,7 +970,7 @@ class LiveAdmission:
                     return
                 if verified is not None:
                     assert meta is not None and names is not None
-                    facts = _repository_facts(verified.canonical_url, meta, names)
+                    facts = _repository_facts(meta, names)
                     available = tree_ok
                 else:
                     # Verified without fresh evidence (operator added markers

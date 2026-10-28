@@ -469,12 +469,47 @@ class AgdJira:
 
 @pytest.mark.parametrize("live_setup", ["2.0.0-deepseek"], indirect=True)
 @pytest.mark.parametrize(
-    ("matched", "split_markers"),
-    [(True, False), (False, False), (False, True)],
-    ids=["matched", "wrong-product", "split-markers"],
+    ("product", "repository_description", "path", "outcome"),
+    [
+        (
+            "Disposable booking sandbox",
+            "Disposable booking sandbox",
+            "booking-sandbox",
+            "match",
+        ),
+        (
+            "Disposable booking sandbox",
+            "Agent orchestration service",
+            "orchestration-service",
+            "mismatch",
+        ),
+        (
+            "Booking",
+            "Agent sandbox for orchestration",
+            "orchestration-service",
+            "mismatch",
+        ),
+        ("", "Agent orchestration service", "booking-service", "unclear"),
+        ("Booking", "Agent orchestration service", "booking-service", "mismatch"),
+        ("", "Disposable booking sandbox", "booking-service", "unclear"),
+    ],
+    ids=[
+        "matched",
+        "wrong-product",
+        "split-markers",
+        "identity-only",
+        "repository-identity-only",
+        "ticket-identity-only",
+    ],
 )
 async def test_product_mismatch_stops_before_scope(
-    session_factory, live_setup, monkeypatch, matched, split_markers
+    session_factory,
+    live_setup,
+    monkeypatch,
+    product,
+    repository_description,
+    path,
+    outcome,
 ):
     settings, _, policy, lab = live_setup
     settings.jira_worker_enabled_projects = {"acme": ["AGD"]}
@@ -498,15 +533,6 @@ async def test_product_mismatch_stops_before_scope(
             ),
         }
     )
-    product = "Booking" if split_markers else "Disposable booking sandbox"
-    repository_description = (
-        product
-        if matched
-        else "Agent sandbox for orchestration"
-        if split_markers
-        else "Agent orchestration service"
-    )
-    path = "booking-sandbox" if matched else "orchestration-service"
     url = f"https://example.invalid/team/{path}"
     issue = {
         "key": "AGD-19",
@@ -515,7 +541,7 @@ async def test_product_mismatch_stops_before_scope(
             "description": (
                 f"Repository URL: {url}\n\n"
                 f"Intended product: {product}.\n"
-                "The booking preview returns 7 for input 7. It must return 14."
+                "The preview returns 7 for input 7. It must return 14."
             ),
             "status": {"name": "To Do"},
             "project": {"key": "AGD"},
@@ -613,7 +639,7 @@ async def test_product_mismatch_stops_before_scope(
         assert request.url.path == f"/repos/team/{path}/git/trees/{lab.base_sha}"
         names = (
             ["booking.py", "scenario.json", "tests"]
-            if matched
+            if outcome == "match"
             else ["service.py", "rooms.py", "gateway"]
         )
         return httpx.Response(
@@ -644,7 +670,7 @@ async def test_product_mismatch_stops_before_scope(
             f"/repos/team/{path}/commits/main",
             f"/repos/team/{path}/git/trees/{lab.base_sha}",
         ]
-        if matched:
+        if outcome == "match":
             assert state.repository.outcome == "verified"
             assert state.repository_match is not None
             assert state.repository_match.outcome == "match"
@@ -659,7 +685,7 @@ async def test_product_mismatch_stops_before_scope(
         assert state.gate is not None and state.gate.kind == "repository"
         assert not state.gate_ready
         assert state.repository_match is not None
-        assert state.repository_match.outcome == "mismatch"
+        assert state.repository_match.outcome == outcome
         assert state.repository_match.confirmation is None
         assert ticket.intake_state["phase"] == "scope_ready"
         async with session_factory() as session:

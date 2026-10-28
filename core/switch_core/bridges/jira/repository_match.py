@@ -11,6 +11,7 @@ gate for an authorized human confirmation; it never stages scope.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import Field
@@ -22,6 +23,7 @@ from switch_core.bridges.jira.contracts import (
     Repository,
     Text,
     digest,
+    repository_identity,
 )
 from switch_core.bridges.jira.delivery_contracts import ApprovalRoute
 from switch_core.bridges.jira.parse import _plain_text
@@ -86,8 +88,18 @@ def evaluate_repository_match(
 ) -> RepositoryMatch:
     """Corroborate the ticket's product against bounded repository facts."""
     text = _plain_text(ticket_text)
-    ticket = text.casefold()
+    ticket = re.sub(
+        r"^\s*Repository URL:[^\n]*$", "", text, flags=re.IGNORECASE | re.MULTILINE
+    ).casefold()
     haystack = "\n".join(facts).casefold()
+    canonical = repository.canonical_url or repository.supplied_url
+    for identity in (
+        repository.supplied_url,
+        canonical,
+        repository_identity(canonical)[2].lstrip("/"),
+    ):
+        ticket = ticket.replace(identity.casefold(), " ")
+        haystack = haystack.replace(identity.casefold(), " ")
     pinned = tuple(marker for marker in map(normalize_marker, markers) if marker)
     ticket_hit = any(marker in ticket for marker in pinned)
     shared_marker = any(marker in ticket and marker in haystack for marker in pinned)
