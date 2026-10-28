@@ -379,7 +379,12 @@ accounting across tickets.
 
 `firstmate_copy.py` calls the delivery checkout's `fm-spawn.sh --scout` and
 `fm-control.sh <task-id> exit`. It uses the native task metadata, brief, status,
-and steering inbox paths. Each execution receives its own Firstmate home,
+and steering inbox paths. The generated brief contains the native nonempty
+`# Task` section. Existing dispatched briefs keep their original heading and
+never trigger another spawn. Failed commands report fixed diagnostic categories
+from at most 8192 stderr bytes; they never include raw stderr, paths, or URLs.
+Unrecognized output stays withheld, and oversized output reports truncation.
+Each execution receives its own Firstmate home,
 operating-system HOME directory, and private tmux server. Socket directories
 use a hash of the full execution-home path under `/tmp/switch-tmux-<uid>`
 (with `/tmp` resolved to its physical path). They have owner-only permissions.
@@ -441,6 +446,11 @@ Native results cannot replace trusted usage with worker-authored counts.
 Deployment must still prove OS isolation, upstream token-limit behavior, and real process-tree cancellation.
 The draft fixture remains unchanged and cannot authorize live execution.
 Tests use real PostgreSQL and fake Firstmate processes, never paid agents or standing homes.
+For the optional offline native brief-gate test, set
+`SWITCH_TEST_FIRSTMATE_CHECKOUT` to a checkout at the frozen delivery pack's
+Firstmate commit and run `pytest tests/switch_core/bridges/jira/test_firstmate_launch.py`
+from `core/`. The test copies native scripts into a disposable fixture and
+stops at a fake tmux window boundary. It does not allocate worktrees or call providers.
 
 ## Ticket rooms
 
