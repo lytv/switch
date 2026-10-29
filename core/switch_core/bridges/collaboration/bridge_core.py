@@ -18,6 +18,8 @@ from switch_core.bridges.collaboration.adapter import (
     CollaborationAdapter,
 )
 from switch_core.bridges.collaboration.models import (
+    CHANNEL_GONE_METADATA_KEY,
+    BridgeChannelGone,
     ChannelType,
     InboundAgentJoin,
     InboundAppJoin,
@@ -1763,7 +1765,38 @@ class BridgeCore:
                 await session.commit()
         else:
             translated = self._adapter.translate_outbound(new_content)
-            await self._adapter.update_message(channel_id, message_ref, translated)
+            try:
+                await self._adapter.update_message(channel_id, message_ref, translated)
+            except BridgeChannelGone:
+                await self._detach_gone_channel(channel_id)
+
+    async def _detach_gone_channel(self, channel_id: str) -> None:
+        """Unlink a room whose external channel no longer exists.
+
+        Every later attempt to reach the channel fails the same way, so the
+        mapping is what has to change. Leaving the room internal-only keeps its
+        history. The one warning is the loud part; after it the retries stop.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get_by_external_channel(
+                session, self._bridge_id, channel_id
+            )
+            if room is None:
+                return
+            metadata = dict(room.metadata_ or {})
+            metadata[CHANNEL_GONE_METADATA_KEY] = True
+            room.metadata_ = metadata
+            await self._room_store.clear_bridge(session, room.id)
+            await session.commit()
+        self.remove_room_mapping(room.id, room.matrix_room_id)
+        logger.warning(
+            "[BRIDGE-OUT] %s channel %s no longer exists; detached room %s "
+            "from bridge %s",
+            self._bridge_type,
+            channel_id,
+            room.id,
+            self._bridge_id,
+        )
 
     # ── Runtime-indicator positioning ─────────────────────────────────────────
 

@@ -23,6 +23,7 @@ from sqlalchemy import and_, case, func, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from switch_core.bridges.collaboration.models import CHANNEL_GONE_METADATA_KEY
 from switch_core.bridges.jira.activity import (
     TicketActivity,
     is_terminal_ticket_status,
@@ -1172,6 +1173,7 @@ class JiraWorkerScheduler:
                         and_(
                             Room.id.is_not(None),
                             Room.external_channel_id.is_(None),
+                            Room.metadata_[CHANNEL_GONE_METADATA_KEY].astext.is_(None),
                             JiraWorkerTicket.admin_reasons[
                                 "reporter_access"
                             ].astext.is_(None),

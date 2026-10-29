@@ -5,6 +5,7 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from mattermostdriver.exceptions import InvalidOrMissingParameters
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from test_postgres_transport import _make_room, _transport
@@ -14,6 +15,10 @@ from switch_core.bridges.collaboration.bridge_core import BridgeCore
 from switch_core.bridges.collaboration.mattermost.adapter import (
     MattermostAdapter,
     MattermostConnectionConfig,
+)
+from switch_core.bridges.collaboration.models import (
+    CHANNEL_GONE_METADATA_KEY,
+    BridgeChannelGone,
 )
 from switch_core.bridges.jira.rooms import (
     SwitchCardUpdater,
@@ -361,3 +366,94 @@ async def test_stopped_other_bridge_does_not_fail_the_edit(bridge_type):
     service, client = _protocol(None, stored_type=bridge_type)
     await service.edit_message("agent", "room", "evt-card", "Done card")
     client.edit_message.assert_awaited_once()
+
+
+def _mattermost_adapter(patch):
+    adapter = MattermostAdapter(
+        config=MattermostConnectionConfig(
+            url="https://mattermost.example.invalid",
+            admin_user="admin",
+            admin_password="<unused>",
+            team_name="test",
+        )
+    )
+    adapter._main_loop = asyncio.get_running_loop()
+    adapter._admin_driver = SimpleNamespace(
+        posts=SimpleNamespace(patch_post=patch),
+    )
+    return adapter
+
+
+async def test_mattermost_deleted_channel_is_reported_as_gone():
+    def patch(post_id, payload):
+        raise InvalidOrMissingParameters("Can not update a post in a deleted channel.")
+
+    with pytest.raises(BridgeChannelGone):
+        await _mattermost_adapter(patch).update_message(
+            "channel-gone", "post-0", "updated card"
+        )
+
+
+async def test_other_bad_requests_are_not_mistaken_for_a_gone_channel():
+    def patch(post_id, payload):
+        raise InvalidOrMissingParameters("Invalid post patch: message is empty")
+
+    with pytest.raises(InvalidOrMissingParameters):
+        await _mattermost_adapter(patch).update_message(
+            "channel-live", "post-0", "updated card"
+        )
+
+
+async def test_gone_channel_detaches_the_room_and_stops_editing(
+    session_factory, caplog
+):
+    async with session_factory() as session:
+        room_id, matrix_room_id, client_id, _ = await _make_room(session)
+        session.add(
+            CollaborationBridge(
+                id="mm",
+                type="mattermost",
+                display_name="test",
+                client_id=client_id,
+                status="active",
+            )
+        )
+        await session.flush()
+        room = await session.get(Room, room_id)
+        room.bridge_id, room.external_channel_id = "mm", "channel-gone"
+        room.channel_type = "channel_private"
+        await session.commit()
+
+    bridge = object.__new__(BridgeCore)
+    bridge._session_factory = session_factory
+    bridge._bridge_id = "mm"
+    bridge._bridge_type = "mattermost"
+    bridge._room_store = RoomStore()
+    bridge._bridge_message_map_store = _MapStore(
+        SimpleNamespace(external_channel_id="channel-gone", external_post_id="post-0")
+    )
+    bridge._adapter = SimpleNamespace(
+        translate_outbound=lambda text: text,
+        update_message=AsyncMock(
+            side_effect=BridgeChannelGone("Can not update a post in a deleted channel")
+        ),
+    )
+    bridge._channel_to_room = {}
+    bridge._room_to_channel = {}
+    bridge.add_room_mapping(room_id, matrix_room_id, "channel-gone")
+
+    with caplog.at_level(
+        "WARNING", logger="switch_core.bridges.collaboration.bridge_core"
+    ):
+        await bridge.handle_message_edit("evt-card", "Done card")
+
+    assert bridge._channel_to_room == {}
+    assert "no longer exists" in caplog.text
+    assert "detached room" in caplog.text
+    async with session_factory() as session:
+        detached = await session.get(Room, room_id)
+        assert detached is not None
+        assert detached.bridge_id is None
+        assert detached.external_channel_id is None
+        assert detached.channel_type is None
+        assert (detached.metadata_ or {}).get(CHANNEL_GONE_METADATA_KEY) is True

@@ -16,7 +16,10 @@ from typing import Any, ClassVar
 import httpx
 import requests as sync_requests
 from mattermostdriver import Driver
-from mattermostdriver.exceptions import NoAccessTokenProvided
+from mattermostdriver.exceptions import (
+    InvalidOrMissingParameters,
+    NoAccessTokenProvided,
+)
 
 from switch_core.agent_icon import default_icon_url
 from switch_core.bridges.collaboration.adapter import (
@@ -27,6 +30,7 @@ from switch_core.bridges.collaboration.adapter import (
 from switch_core.bridges.collaboration.models import (
     Attachment,
     AttachmentFailure,
+    BridgeChannelGone,
     BridgeConnectionConfig,
     ChannelType,
     DirectoryUser,
@@ -444,12 +448,20 @@ class MattermostAdapter(CollaborationAdapter):
         if not self._admin_driver or not self._main_loop:
             raise RuntimeError("Cannot update message: Mattermost client not connected")
 
-        await self._main_loop.run_in_executor(
-            None,
-            self._admin_driver.posts.patch_post,
-            message_ref,
-            {"message": new_content},
-        )
+        try:
+            await self._main_loop.run_in_executor(
+                None,
+                self._admin_driver.posts.patch_post,
+                message_ref,
+                {"message": new_content},
+            )
+        except InvalidOrMissingParameters as exc:
+            # Mattermost reports a deleted channel as a 400 on the post, not a
+            # 404 on the channel, so the wording is the only signal that the
+            # mapping itself is dead rather than the request being malformed.
+            if "deleted channel" in str(exc).lower():
+                raise BridgeChannelGone(str(exc)) from exc
+            raise
 
     async def delete_message(self, channel_id: str, message_ref: str) -> None:
         if not self._admin_driver or not self._main_loop:

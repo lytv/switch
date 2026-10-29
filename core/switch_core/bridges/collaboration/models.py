@@ -4,6 +4,10 @@ from pydantic import BaseModel
 
 ChannelType = Literal["lobby", "channel_public", "channel_private", "group", "direct"]
 
+# Room metadata flag: the external channel was deleted under a bridged room and
+# the bridge detached it. Automatic repair must not create a fresh channel.
+CHANNEL_GONE_METADATA_KEY = "bridge_channel_gone"
+
 
 class ChannelCreationUnsupported(ValueError):
     """Raised when a bridge will not create a channel for a new room.
@@ -180,4 +184,13 @@ class BridgeOperationError(RuntimeError):
 
     A ``RuntimeError`` so that callers already distinguishing "the request was
     wrong" (``ValueError``) from "the attempt failed" keep working unchanged.
+    """
+
+
+class BridgeChannelGone(BridgeOperationError):
+    """The platform reports that a mapped channel no longer exists.
+
+    Separate from the general operation error because the mapping, not the
+    operation, is what is wrong: retrying against the same channel can never
+    succeed. The bridge detaches the room instead of retrying forever.
     """
