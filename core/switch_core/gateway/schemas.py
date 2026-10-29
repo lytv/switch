@@ -1130,6 +1130,7 @@ class JiraWorkerReleaseRequest(BaseModel):
     request_id: UUID
     reason: str | None = Field(default=None, min_length=1, pattern=r"\S")
     previous_generation: int | None = Field(default=None, gt=0)
+    execution_key: str | None = Field(default=None, min_length=1, pattern=r"\S")
 
 
 class JiraWorkerReleaseResponse(BaseModel):

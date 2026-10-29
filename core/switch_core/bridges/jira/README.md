@@ -432,9 +432,49 @@ usage, but they never accept a previously unaccepted result.
 
 A durable dispatch marker precedes native spawn. If a crash leaves that marker
 without native task metadata, the execution becomes `uncertain`. It retains its
-reservation and never repeats the ambiguous spawn. Recovery needs evidence from
-the operator; this adapter deliberately provides no automatic marker reset.
-A crash before that handoff can reuse the durable database reservation.
+reservation and never repeats the ambiguous spawn. An admin can request a
+never-started release through the existing release endpoint:
+
+```bash
+curl --fail-with-body -X POST \
+  "$SWITCH_GATEWAY_URL/jira-triggers/worker/tickets/$ISSUE_KEY/release?instance=$INSTANCE" \
+  -H "Authorization: Bearer $ADMIN_ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data "{\"request_id\":\"$REQUEST_UUID\",\"reason\":\"Release failed native launch\",\"previous_generation\":$CURRENT_GENERATION,\"execution_key\":\"$EXECUTION_KEY\"}"
+```
+
+Use the ticket's current generation for `previous_generation`, even if a human
+parked or closed the ticket after this execution's generation. Generate one
+request UUID per operation. Reuse that UUID and the same input for retries.
+The `execution_key` selects never-started recovery instead of normal ticket release.
+A missing reason or a stale ticket generation fails the request.
+
+Switch checks the evidence itself under the execution and accounting locks:
+
+- The uncertain execution has a dispatch marker that matches its frozen input.
+- Native task metadata, usage, results, progress and other task artifacts are absent.
+- No native launch process remains for the task. Switch checks this with `pgrep`; a missing or failed probe refuses recovery.
+- No native task window exists on the execution's tmux socket. Only the initial bootstrap shell may remain.
+- Recorded execution spend is zero. The trusted meter has no pending or uncertain call.
+- No candidate or publication exists. The forge confirms repository access and the absence of the approved branch.
+- The prepared checkout remains clean at the frozen launch commit.
+
+Any failed or unavailable check retains the reservation and capacity slot.
+Successful recovery records an `admin_release_unstarted` receipt in the worker
+event history. The receipt binds the admin, reason, request UUID, execution key,
+current ticket generation, execution generation and evidence. It records the
+released tokens and estimated USD. Repeated input returns that receipt without
+another release. A reused UUID with different input fails.
+
+The execution becomes `cancelled`, with confirmed zero usage and exit. Its
+capacity slot and remaining reservation become available to waiting tickets.
+The ticket stays parked for a human decision. Existing park reasons and Jira
+status remain unchanged, including a human close. Recovery preserves scope,
+approvals, attempts and generation. It sends no Jira command and starts no task.
+A later restart requires a separate, explicit ticket-release decision and fresh
+intake; this recovery never restarts the released execution or resets its marker.
+Closed tickets also require the normal reopening process.
+A crash before the dispatch handoff can reuse the durable database reservation.
 
 Reservations include cached tokens and estimated USD. Partial or unknown usage
 retains the unaccounted reservation, including across UTC day boundaries.

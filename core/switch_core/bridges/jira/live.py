@@ -599,6 +599,34 @@ class LiveCopy:
     async def cancel(self, job: Job) -> None:
         await self.copy(job).cancel(job)
 
+    async def verify_unstarted(
+        self, job: Job, envelope: ExecutionEnvelope | None
+    ) -> None:
+        if envelope is None:
+            raise ValueError("Live recovery requires the frozen execution envelope")
+        envelope.validate_job(job)
+        copy = self.copy(job)
+        await copy.verify_unstarted(job, envelope)
+        repository = job.repository.canonical_url
+        if repository is None:
+            raise ValueError("Recovery requires a verified repository")
+        await LiveForge(self.sessions, self.repositories).verify_branch_absent(
+            repository, envelope.scope.branch
+        )
+        await copy._check_revision(
+            copy.location(job),
+            copy.project(job),
+            envelope.target_sha or job.repository.base_sha or "",
+        )
+        if await copy._git_value(
+            copy.location(job),
+            copy.project(job),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ):
+            raise ValueError("Role checkout contains unreconciled work")
+
 
 class LiveForge:
     def __init__(
@@ -649,6 +677,13 @@ class LiveForge:
                 authorization=runtime.forge_authorization.get_secret_value(),
             )
             return await operation(forge)
+
+    async def verify_branch_absent(self, repository_url: str, branch: str) -> None:
+        await self.call(
+            repository_url,
+            branch,
+            lambda forge: forge.verify_branch_absent(repository_url, branch),
+        )
 
     async def branch_head(self, repository_url: str, branch: str) -> str | None:
         return await self.call(
@@ -1123,32 +1158,9 @@ def build_delivery_factory(
         raise ValueError(
             "Live execution requires an enabled delivery project with Jira credentials"
         )
-    values = [
-        config.db_password,
-        config.jwt_secret_key,
-        config.agent_registration_token,
-        config.gateway_admin_password,
-        runtime.forge_authorization.get_secret_value(),
-        *config.jira_webhook_secrets.values(),
-        *(item.api_token for item in config.jira_worker_credentials.values()),
-    ]
-    if config.jira_worker_llm_api_key:
-        values.append(config.jira_worker_llm_api_key.get_secret_value())
-    values.extend(
-        upstream.api_key.get_secret_value()
-        for upstream in config.jira_worker_delivery_upstreams.values()
-    )
-    secrets = SecretGuard(forbidden_values=tuple(value for value in values if value))
-    for policy in policies.values():
-        secrets.check(policy.model_dump_json())
-    repositories = LocalRepositories(runtime)
-    jobs = FirstmateJobs(
-        session_factory=session_factory,
-        delivery_copy=LiveCopy(session_factory, config, repositories, secrets),
-        secrets=secrets,
-        clock=lambda: datetime.now(UTC),
-    )
+    jobs = build_delivery_jobs(session_factory=session_factory, config=config)
     admission = LiveAdmission(session_factory, runtime, policies)
+    repositories = LocalRepositories(runtime)
 
     def factory(activity: TicketActivity) -> DeliverySupervisor:
         async def authorize(ticket_id: str) -> bool:
@@ -1182,3 +1194,35 @@ def build_delivery_factory(
         )
 
     return factory
+
+
+def build_delivery_jobs(
+    *, session_factory: async_sessionmaker[AsyncSession], config: SwitchConfig
+) -> FirstmateJobs:
+    runtime = runtime_config(config)
+    policies = load_policies(config, runtime)
+    values = [
+        config.db_password,
+        config.jwt_secret_key,
+        config.agent_registration_token,
+        config.gateway_admin_password,
+        runtime.forge_authorization.get_secret_value(),
+        *config.jira_webhook_secrets.values(),
+        *(item.api_token for item in config.jira_worker_credentials.values()),
+    ]
+    if config.jira_worker_llm_api_key:
+        values.append(config.jira_worker_llm_api_key.get_secret_value())
+    values.extend(
+        upstream.api_key.get_secret_value()
+        for upstream in config.jira_worker_delivery_upstreams.values()
+    )
+    secrets = SecretGuard(forbidden_values=tuple(value for value in values if value))
+    for policy in policies.values():
+        secrets.check(policy.model_dump_json())
+    repositories = LocalRepositories(runtime)
+    return FirstmateJobs(
+        session_factory=session_factory,
+        delivery_copy=LiveCopy(session_factory, config, repositories, secrets),
+        secrets=secrets,
+        clock=lambda: datetime.now(UTC),
+    )
