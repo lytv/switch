@@ -27,7 +27,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.agent.protocol.service import ProtocolService
-from switch_core.bridges.collaboration.models import ChannelCreationUnsupported
+from switch_core.bridges.collaboration.models import (
+    CHANNEL_GONE_METADATA_KEY,
+    ChannelCreationUnsupported,
+)
 from switch_core.bridges.jira.activity import (
     admit_room,
     capacity_lock,
@@ -815,6 +818,10 @@ class SwitchTicketRooms:
             if room is None:
                 raise ValueError(f"Room not found: {room_id}")
             archived = room.archived_at is not None
+            if room.bridge_id is None and (room.metadata_ or {}).get(
+                CHANNEL_GONE_METADATA_KEY
+            ):
+                return
             if archived and room.external_channel_id is None:
                 return
             bridge_id = room.bridge_id

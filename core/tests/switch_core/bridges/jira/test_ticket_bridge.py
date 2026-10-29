@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from switch_core.bridges.collaboration.models import CHANNEL_GONE_METADATA_KEY
 from switch_core.bridges.jira.admin import reconcile_admin_cards
 from switch_core.bridges.jira.rooms import (
     CHANNEL_CLOSE_REASON,
@@ -365,6 +366,32 @@ async def test_existing_room_repair_is_restart_and_double_claim_safe(
     rooms._protocol.edit_message.assert_awaited_once_with(
         "jira", room_id, "$card", "Updated ticket"
     )
+
+
+async def test_deleted_channel_room_stays_internal(session_factory, ticket_bridge):
+    rooms, _, adapter, _ = ticket_bridge
+    room_id = await sync(session_factory, rooms)
+    async with session_factory() as session:
+        await RoomStore().clear_bridge(session, room_id)
+        room = await session.get(Room, room_id)
+        room.metadata_ = {CHANNEL_GONE_METADATA_KEY: True}
+        await session.commit()
+    adapter.create_channel.reset_mock()
+    adapter.add_users_to_channel.reset_mock()
+
+    assert await sync(session_factory, rooms) == room_id
+
+    adapter.create_channel.assert_not_awaited()
+    async with session_factory() as session:
+        detached = await session.get(Room, room_id)
+        assert detached.bridge_id is None
+        assert detached.external_channel_id is None
+    scheduler = JiraWorkerScheduler(
+        session_factory=session_factory,
+        config=_switch_config(jira_worker_enabled_projects={"acme": ["KAN"]}),
+        ticket_rooms=rooms,
+    )
+    assert await scheduler.sweep_ticket_rooms() == 0
 
 
 async def test_no_default_keeps_ticket_internal(session_factory, ticket_bridge, caplog):
