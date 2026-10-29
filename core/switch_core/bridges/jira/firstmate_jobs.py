@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from pydantic import Field
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from switch_core.bridges.jira.accounting import (
     LIVE_ROLES,
@@ -27,6 +28,7 @@ from switch_core.bridges.jira.accounting import (
     live_role_sessions,
     live_sessions,
 )
+from switch_core.bridges.jira.activity import ticket_turn_lock
 from switch_core.bridges.jira.admin import _record_reason_alerts
 from switch_core.bridges.jira.contracts import (
     USD,
@@ -45,7 +47,8 @@ from switch_core.bridges.jira.contracts import (
 from switch_core.bridges.jira.delivery_contracts import ExecutionEnvelope, Handoff
 from switch_core.bridges.jira.firstmate_copy import SecretGuard, TaskObservation
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
-from switch_core.db.models import JiraWorkerJob, JiraWorkerTicket
+from switch_core.config import SwitchConfig
+from switch_core.db.models import JiraWorkerEvent, JiraWorkerJob, JiraWorkerTicket, User
 
 _TERMINAL = {"done", "cancelled", "waiting_input", "error"}
 
@@ -64,6 +67,10 @@ class DeliveryCopy(Protocol):
     async def get(self, job: Job) -> TaskObservation: ...
 
     async def cancel(self, job: Job) -> None: ...
+
+    async def verify_unstarted(
+        self, job: Job, envelope: ExecutionEnvelope | None
+    ) -> None: ...
 
 
 class Execution(Contract):
@@ -434,6 +441,197 @@ class FirstmateJobs:
             await session.commit()
         async with self._execution_lock(execution_key):
             return await self._reconcile(execution_key)
+
+    async def release_unstarted(
+        self,
+        *,
+        config: SwitchConfig,
+        ticket_id: str,
+        execution_key: str,
+        request_id: str,
+        admin_user_id: str,
+        reason: str,
+        generation: int,
+    ) -> JiraWorkerEvent:
+        request_id = str(uuid.UUID(request_id))
+        if not reason.strip():
+            raise ValueError("Never-started release requires a reason")
+        now = self._clock()
+        if now.tzinfo is None:
+            raise ValueError("Release time requires a timezone")
+        engine = cast(AsyncEngine, self._sessions.kw["bind"])
+        async with ticket_turn_lock(engine, ticket_id) as locked:
+            if not locked:
+                raise BlockingIOError("Ticket turn is active; retry release later")
+            async with self._execution_lock(execution_key), self._sessions() as session:
+                await self._budget_lock(session)
+                admin = await session.get(User, admin_user_id)
+                if admin is None or admin.role != "admin":
+                    raise PermissionError(
+                        "Only an admin may release a delivery execution"
+                    )
+                row = await self._row(session, execution_key)
+                if row.ticket_id != ticket_id:
+                    raise ValueError("Execution does not belong to this ticket")
+                ticket = await self._ticket(session, row)
+                if ticket.project_key not in config.jira_worker_enabled_projects.get(
+                    ticket.instance, []
+                ):
+                    raise ValueError("Project is not enabled")
+                key = f"admin-release:{ticket.id}:{request_id}"
+                inputs = {
+                    "released_by": admin_user_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                    "previous_generation": generation,
+                    "execution_key": execution_key,
+                }
+                receipt = await session.scalar(
+                    select(JiraWorkerEvent).where(
+                        JiraWorkerEvent.instance == ticket.instance,
+                        JiraWorkerEvent.idempotency_key == key,
+                    )
+                )
+                if receipt is not None:
+                    if receipt.event_kind != "admin_release_unstarted" or any(
+                        (receipt.payload or {}).get(name) != value
+                        for name, value in inputs.items()
+                    ):
+                        raise ValueError(
+                            "Release request UUID was reused with different input"
+                        )
+                    return receipt
+                state, execution = _state(ticket), _execution(row)
+                if (
+                    generation != ticket.agent_generation
+                    or row.generation is None
+                    or row.generation > generation
+                ):
+                    raise ValueError(
+                        "Release requires the current execution generation"
+                    )
+                meter = execution.meter
+                if (
+                    row.status != "uncertain"
+                    or row.result is not None
+                    or execution.contract.run.execution_key != execution_key
+                    or execution.contract.run.ticket_id != ticket_id
+                    or execution.contract.run.generation != row.generation
+                    or execution.known_tokens
+                    or execution.known_usd
+                    or any(execution.cost_by_day.values())
+                    or execution.handoff is not None
+                    or execution.progress is not None
+                    or execution.progress_signatures
+                    or execution.exit_confirmed
+                    or state.candidate is not None
+                    or state.candidate_job is not None
+                    or state.candidate_head is not None
+                    or state.accepted_head is not None
+                    or state.review_head is not None
+                    or state.qa_head is not None
+                    or state.publication is not None
+                    or state.merge_receipt is not None
+                    or state.merge_sha is not None
+                    or (
+                        meter is not None
+                        and (
+                            meter.pending
+                            or meter.pending_since is not None
+                            or meter.uncertain
+                            or meter.input_tokens
+                            or meter.output_tokens
+                            or meter.cache_read_tokens
+                            or meter.cache_write_tokens
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "Delivery usage and task exit require reconciliation before release"
+                    )
+                await self._copy.verify_unstarted(
+                    execution.contract, execution.envelope
+                )
+                previous = set(ticket.admin_reasons or {})
+                row.payload = _replace(
+                    execution,
+                    held_tokens=0,
+                    held_usd=Decimal("0"),
+                    usage_unknown=False,
+                    exit_confirmed=True,
+                    rejection="cancelled",
+                    meter=_replace(meter, stopped=True).model_dump(mode="json")
+                    if meter
+                    else None,
+                ).model_dump(mode="json")
+                row.status = "cancelled"
+                row.cancel_requested_at = now
+                row.completed_at = now  # type: ignore[assignment]
+                await session.flush()
+                unknown = await session.scalar(
+                    select(func.count()).where(
+                        JiraWorkerJob.ticket_id == ticket.id,
+                        JiraWorkerJob.kind.in_(("role_job", "orchestrator_turn")),
+                        JiraWorkerJob.payload["usage_unknown"].astext == "true",
+                    )
+                )
+                ticket.workflow_state = _replace(
+                    state,
+                    reserved_tokens=state.reserved_tokens - execution.held_tokens,
+                    reserved_estimated_usd=state.reserved_estimated_usd
+                    - execution.held_usd,
+                    unknown_spend=bool(unknown),
+                ).model_dump(mode="json")
+                if not unknown:
+                    reasons = dict(ticket.admin_reasons or {})
+                    reasons.pop("delivery_uncertain", None)
+                    reasons.pop("delivery_usage_unknown", None)
+                    ticket.admin_reasons = reasons or None
+                previous_reason = ticket.worker_parked_reason
+                ticket.worker_parked_reason = (
+                    previous_reason or "delivery_launch_released"
+                )
+                ticket.agent_state = "parked"
+                ticket.wake_at = None
+                ticket.queue_reason = None
+                _reason(
+                    ticket,
+                    "delivery_launch_released",
+                    "Never-started execution released; human decision required before fresh delivery",
+                )
+                await _record_reason_alerts(session, ticket, previous)
+                receipt = JiraWorkerEvent(
+                    instance=ticket.instance,
+                    issue_key=ticket.issue_key,
+                    project_key=ticket.project_key,
+                    idempotency_key=key,
+                    event_kind="admin_release_unstarted",
+                    webhook_event="worker:admin_release_unstarted",
+                    consumed=True,
+                    payload=inputs
+                    | {
+                        "released_at": now.isoformat(),
+                        "input_digest": digest(execution.contract),
+                        "evidence": {
+                            "dispatch_digest": digest(execution.contract),
+                            "native_artifacts": "absent",
+                            "native_task_session": "absent",
+                            "native_launcher": "absent",
+                            "recorded_tokens": 0,
+                            "recorded_estimated_usd": "0",
+                            "candidate": "absent",
+                            "remote_branch": "absent",
+                        },
+                        "released_tokens": execution.held_tokens,
+                        "released_estimated_usd": str(execution.held_usd),
+                        "previous_reason": previous_reason,
+                        "execution_generation": row.generation,
+                        "ticket_disposition": "parked for human decision",
+                    },
+                )
+                session.add(receipt)
+                await session.commit()
+                return receipt
 
     async def _reconcile(self, key: str) -> ExecutionView:
         current, pack = await self._snapshot(key)

@@ -564,6 +564,122 @@ class FirstmateCopy:
             progress=progress,
         )
 
+    def _unstarted_artifacts(self, job: Job) -> None:
+        home, task_id = self.location(job), self.task_id(job)
+        if self._observe(job).status != "uncertain":
+            raise ValueError(
+                "Never-started recovery requires a matching dispatch without metadata"
+            )
+        task = home / "data" / task_id
+        allowed = {
+            "job.json",
+            "pack.json",
+            "reservation.json",
+            "brief.md",
+            "dispatch",
+            "result-schema.json",
+            "envelope.json",
+            "handoff-schema.json",
+        }
+        if any(path.name not in allowed for path in task.iterdir()):
+            raise ValueError(
+                "Native task artifacts require reconciliation before release"
+            )
+        state = home / "state"
+        inbox = state / f"{task_id}.inbox"
+        if (
+            state.resolve() != state
+            or inbox.resolve() != inbox
+            or any(path != inbox for path in state.iterdir())
+            or any(inbox.iterdir())
+        ):
+            raise ValueError("Native task state requires reconciliation before release")
+        for name in allowed:
+            _read(home, f"data/{task_id}/{name}")
+
+    async def verify_unstarted(
+        self, job: Job, envelope: ExecutionEnvelope | None
+    ) -> None:
+        await asyncio.to_thread(self._unstarted_artifacts, job)
+        home = self.location(job)
+        launcher = await asyncio.create_subprocess_exec(
+            "pgrep",
+            "-f",
+            "--",
+            rf"{re.escape(str(self._checkout / 'bin/fm-spawn.sh'))}[[:space:]]+{self.task_id(job)}([[:space:]]|$)",
+            env=self._environment(home),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            async with asyncio.timeout(10):
+                code = await launcher.wait()
+            if code != 1:
+                raise ValueError("Native launcher is active or cannot be verified")
+        finally:
+            if launcher.returncode is None:
+                launcher.kill()
+                await launcher.wait()
+        sockets = tmux_directory(home, self._tmux_sockets)
+        if sockets.exists() and _read(sockets, "home") != os.fsencode(home):
+            raise ValueError("Delivery tmux directory belongs to another execution")
+        endpoint = sockets / f"tmux-{os.getuid()}/default"
+        try:
+            info = endpoint.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if endpoint.resolve() != endpoint or not stat.S_ISSOCK(info.st_mode):
+                raise ValueError("Native task socket cannot be verified")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.setblocking(False)
+                code = probe.connect_ex(str(endpoint))
+            if code not in {errno.ENOENT, errno.ECONNREFUSED}:
+                if code != 0:
+                    raise ValueError("Native task session cannot be verified")
+                process = await asyncio.create_subprocess_exec(
+                    "tmux",
+                    "-S",
+                    str(endpoint),
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{window_index}:#{window_panes}:#{window_name}:#{pane_current_command}",
+                    env=self._environment(home),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    async with asyncio.timeout(10):
+                        assert process.stdout is not None
+                        try:
+                            output = await process.stdout.readexactly(4097)
+                        except asyncio.IncompleteReadError as exc:
+                            output = exc.partial
+                        if len(output) > 4096:
+                            raise ValueError(
+                                "Native task session listing exceeds its limit"
+                            )
+                        code = await process.wait()
+                    # Native tasks use a separate window; only the initial shell may remain.
+                    pane = output.decode().strip().split(":")
+                    if (
+                        code
+                        or len(pane) != 5
+                        or pane[:3] != ["firstmate", "0", "1"]
+                        or any(value not in {"sh", "bash", "zsh"} for value in pane[3:])
+                    ):
+                        raise ValueError(
+                            "Live or ambiguous native task session requires reconciliation"
+                        )
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+        await asyncio.to_thread(self._unstarted_artifacts, job)
+
     async def get(self, job: Job) -> TaskObservation:
         observed = await asyncio.to_thread(self._observe, job)
         if (

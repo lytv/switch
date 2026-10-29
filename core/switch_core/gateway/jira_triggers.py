@@ -17,6 +17,7 @@ from switch_core.bridges.jira.admin import (
     release_parked_ticket,
 )
 from switch_core.bridges.jira.budget import BudgetRequest, extend_budget
+from switch_core.bridges.jira.live import build_delivery_jobs
 from switch_core.bridges.jira.matching import explain_match
 from switch_core.bridges.jira.outbox import HumanChange
 from switch_core.bridges.jira.parse import (
@@ -694,28 +695,58 @@ async def release_worker_ticket(
         raise HTTPException(status_code=404, detail="ticket not found")
     clients = build_poll_clients(config)
     try:
-        client = clients.get(ticket.instance)
-        if client is None:
-            raise HTTPException(status_code=503, detail="Jira read credentials missing")
-        receipt = await release_parked_ticket(
-            session_factory,
-            config=config,
-            client=client,
-            ticket_id=ticket.id,
-            request_id=str(req.request_id),
-            admin_user_id=admin.id,
-            now=datetime.now(UTC),
-            release_reason=req.reason,
-            previous_generation=req.previous_generation,
-        )
+        if req.execution_key is not None:
+            if req.reason is None or req.previous_generation is None:
+                raise ValueError(
+                    "Never-started release requires a reason and the current previous generation"
+                )
+            jobs = build_delivery_jobs(session_factory=session_factory, config=config)
+            receipt = await jobs.release_unstarted(
+                config=config,
+                ticket_id=ticket.id,
+                execution_key=req.execution_key,
+                request_id=str(req.request_id),
+                admin_user_id=admin.id,
+                reason=req.reason,
+                generation=req.previous_generation,
+            )
+        else:
+            client = clients.get(ticket.instance)
+            if client is None:
+                raise HTTPException(
+                    status_code=503, detail="Jira read credentials missing"
+                )
+            receipt = await release_parked_ticket(
+                session_factory,
+                config=config,
+                client=client,
+                ticket_id=ticket.id,
+                request_id=str(req.request_id),
+                admin_user_id=admin.id,
+                now=datetime.now(UTC),
+                release_reason=req.reason,
+                previous_generation=req.previous_generation,
+            )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (BlockingIOError, HumanChange) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        if req.execution_key is None:
+            raise
+        raise HTTPException(
+            status_code=409,
+            detail="Native execution evidence cannot be verified; reservation retained",
+        ) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Jira release read failed") from exc
+        detail = (
+            "Delivery recovery evidence read failed"
+            if req.execution_key
+            else "Jira release read failed"
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
     finally:
         for client in clients.values():
             await client.aclose()

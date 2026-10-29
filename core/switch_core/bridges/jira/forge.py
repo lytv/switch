@@ -74,6 +74,15 @@ class GitHubDraftForge:
             raise ValueError("Forge returned an invalid branch head")
         return head
 
+    async def verify_branch_absent(self, repository_url: str, branch: str) -> None:
+        self._check(repository_url, branch)
+        repository = await self._request("GET", "")
+        repository.raise_for_status()
+        if repository.status_code != 200:
+            raise ValueError("Repository read did not confirm forge access")
+        if await self.branch_head(repository_url, branch) is not None:
+            raise ValueError("Remote branch exists; recovery requires reconciliation")
+
     async def push_new_branch(
         self, repository_url: str, branch: str, head: str
     ) -> None:
