@@ -20,6 +20,38 @@ from tests.switch_core.bridges.jira.test_firstmate_jobs import (
 )
 
 
+def _real_tmux_script(path: Path, tmux: str) -> None:
+    _script(
+        path,
+        f"""import os, pathlib, subprocess, sys
+sockets = pathlib.Path(os.environ['TMUX_TMPDIR'])
+assert sockets.is_dir() and sockets.resolve() == sockets
+assert sockets.stat().st_uid == os.getuid() and sockets.stat().st_mode & 0o077 == 0
+assert (sockets / 'home').read_bytes() == os.fsencode(os.environ['FM_HOME'])
+endpoint = sockets / f'tmux-{{os.getuid()}}/default'
+endpoint.parent.mkdir(mode=0o700, exist_ok=True)
+assert endpoint.parent.resolve() == endpoint.parent
+assert endpoint.parent.stat().st_uid == os.getuid() and endpoint.parent.stat().st_mode & 0o077 == 0
+created = sockets / 'test-server-pid'
+args = sys.argv[1:]
+if args[:1] == ['-S']:
+    assert args[1] == str(endpoint)
+    args = args[2:]
+assert args[:1] != ['-L']
+real = [{tmux!r}, '-S', str(endpoint)]
+if 'new-session' in args and not created.exists():
+    assert not endpoint.exists(), 'refusing to adopt an unowned server'
+if 'kill-server' in args:
+    assert created.exists() and endpoint.is_relative_to(sockets), 'cleanup has no creation proof'
+    assert subprocess.check_output(real + ['display-message', '-p', '#{{pid}}']) == created.read_bytes()
+code = subprocess.run(real + args).returncode
+if 'new-session' in args and code == 0 and not created.exists():
+    created.write_bytes(subprocess.check_output(real + ['display-message', '-p', '#{{pid}}']))
+sys.exit(code)
+""",
+    )
+
+
 @pytest.fixture
 def native_lab(request):
     return request.getfixturevalue("lab")
@@ -174,10 +206,7 @@ async def test_real_tmux_cancel_cleans_stale_socket(native_lab, native_job):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
         stale.bind(str(endpoint))
     assert endpoint.is_socket()
-    _script(
-        native_lab.checkout.parent / "tools/tmux",
-        f"import os, sys\nos.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n",
-    )
+    _real_tmux_script(native_lab.checkout.parent / "tools/tmux", tmux)
 
     await copy.cancel(native_job)
 
@@ -218,10 +247,7 @@ async def test_real_tmux_dispatch_get_cancel_keep_execution_isolation(
     if tmux is None:
         pytest.skip("tmux is not installed")
     copy = native_lab.copy
-    _script(
-        native_lab.checkout.parent / "tools/tmux",
-        f"import os, sys\nos.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n",
-    )
+    _real_tmux_script(native_lab.checkout.parent / "tools/tmux", tmux)
     other = native_job.model_copy(
         update={
             "run": native_job.run.model_copy(
@@ -243,7 +269,7 @@ async def test_real_tmux_dispatch_get_cancel_keep_execution_isolation(
             assert socket.is_socket()
             assert len(os.fsencode(socket)) < (104 if sys.platform == "darwin" else 108)
             actual = subprocess.check_output(
-                [tmux, "display-message", "-p", "#{socket_path}"],
+                [tmux, "-S", str(socket), "display-message", "-p", "#{socket_path}"],
                 env=environment,
                 text=True,
             ).strip()
@@ -266,4 +292,13 @@ async def test_real_tmux_dispatch_get_cancel_keep_execution_isolation(
         for environment in environments:
             socket = Path(environment["TMUX_TMPDIR"]) / f"tmux-{os.getuid()}/default"
             if socket.exists():
-                subprocess.run([tmux, "kill-server"], env=environment, check=True)
+                subprocess.run(
+                    [
+                        str(native_lab.checkout.parent / "tools/tmux"),
+                        "-S",
+                        str(socket),
+                        "kill-server",
+                    ],
+                    env=environment,
+                    check=True,
+                )

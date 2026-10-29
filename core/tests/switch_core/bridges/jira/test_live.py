@@ -55,6 +55,7 @@ from switch_core.bridges.jira.model_gateway import (
 )
 from switch_core.bridges.jira.outbox import JiraOutboxSender
 from switch_core.bridges.jira.packs import FrozenPack, load_pack
+from switch_core.bridges.jira.publisher import GitCandidateObjects
 from switch_core.bridges.jira.readiness import check_readiness
 from switch_core.bridges.jira.rooms import reconcile_ticket_room
 from switch_core.bridges.jira.state import WorkflowMapping
@@ -205,6 +206,48 @@ async def live_setup(session_factory, request, monkeypatch, tmp_path):
         ).model_dump(mode="json")
         await session.commit()
     return settings, scope, policy, lab
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_repository_preparation_keeps_native_reads_local_and_frozen(
+    live_setup, monkeypatch, legacy
+):
+    settings, scope, _, lab = live_setup
+    local = LocalRepositories(settings.jira_worker_delivery_runtime)
+    job = scope.job
+    envelope = live.ExecutionEnvelope(scope=scope, reproduction=None)
+    original = GitCandidateObjects._git
+
+    async def fetch(objects, *args, authorization=None):
+        assert args[0] == "fetch" and args[3] == URL + ".git"
+        assert authorization == "PLACEHOLDER_FORGE_VALUE"
+        return await original(objects, *args[:3], str(lab.copy._project), *args[4:])
+
+    monkeypatch.setattr(GitCandidateObjects, "_git", fetch)
+    await local.prepare(job, envelope)
+    project = local.project(job)
+    source = project.parent / "native.git"
+    if legacy:
+        git(project, "config", "--unset-all", f"url.{source}.insteadOf")
+    before = git(project, "rev-parse", "HEAD")
+    for _ in range(2):
+        await local.prepare(job, envelope)
+        assert git(project, "rev-parse", "HEAD") == before == lab.base_sha
+        assert git(project, "config", "--get", "remote.origin.url") == URL
+        assert git(project, "remote", "get-url", "origin") == str(source)
+        assert git(source, "rev-parse", "HEAD") == lab.base_sha
+        assert git(source, "symbolic-ref", "HEAD") == "refs/heads/source"
+        assert git(source, "rev-parse", "--is-bare-repository") == "true"
+        assert not git(source, "remote")
+        assert not (source / "objects/info/alternates").exists()
+    git(source, "symbolic-ref", "HEAD", "refs/heads/pin-" + lab.base_sha)
+    with pytest.raises(ValueError, match="differs from the frozen commit"):
+        await local.prepare(job, envelope)
+    stored = project.parent / "retained-native.git"
+    source.rename(stored)
+    source.symlink_to(stored, target_is_directory=True)
+    with pytest.raises(ValueError, match="source contains a symlink"):
+        await local.prepare(job, envelope)
 
 
 def test_live_and_fixture_pack_pins_stay_separate():
