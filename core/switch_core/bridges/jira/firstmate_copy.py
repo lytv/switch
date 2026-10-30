@@ -46,6 +46,10 @@ def _command_diagnostic(output: bytes) -> str:
             b"must contain nonempty ## Captain's intent and ## Firstmate spec subsections (or a nonempty legacy # Task body) before spawn",
             "Firstmate requires a nonempty # Task brief section",
         ),
+        (
+            b"treehouse get did not enter an isolated worktree within 60s",
+            "Firstmate could not allocate an isolated task checkout",
+        ),
         (b"executable not found on PATH", "required executable is missing from PATH"),
         (
             b"refusing to race",
@@ -576,6 +580,7 @@ class FirstmateCopy:
             "pack.json",
             "reservation.json",
             "brief.md",
+            "launch-brief.md",
             "dispatch",
             "result-schema.json",
             "envelope.json",

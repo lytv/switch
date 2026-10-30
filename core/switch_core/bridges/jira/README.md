@@ -410,6 +410,14 @@ operator creates these regular marker files with exactly
 - `<worker-homes>/.switch-delivery-workers`
 
 The caller supplies a prepared project checkout and an explicit executable PATH.
+The live integration also provisions a per-execution bare `native.git` source
+from the sealed objects, without hardlinks or an upstream remote. Its default
+branch stays at the role's frozen target. Repository-local Git URL rewriting
+routes native allocation and base-refresh reads to that source. The configured
+`remote.origin.url` keeps the canonical forge identity for ownership checks.
+Native allocation never needs the supervisor's forge credentials and never
+refreshes from a moving forge default branch. Existing dispatched executions
+remain unchanged; this preparation does not retry an uncertain launch.
 The adapter checks the frozen Firstmate and repository commits. It does not
 clone a ticket URL, discover a standing home, or configure provider credentials.
 Its subprocess environment contains only explicit operational values. Inject
@@ -453,6 +461,9 @@ Switch checks the evidence itself under the execution and accounting locks:
 
 - The uncertain execution has a dispatch marker that matches its frozen input.
 - Native task metadata, usage, results, progress and other task artifacts are absent.
+  The pinned launcher can write `launch-brief.md` before task allocation. Recovery
+  permits that instruction artifact under the usual bounded, single-link file
+  checks. It preserves the file and still refuses any live task window.
 - No native launch process remains for the task. Switch checks this with `pgrep`; a missing or failed probe refuses recovery.
 - No native task window exists on the execution's tmux socket. Only the initial bootstrap shell may remain.
 - Recorded execution spend is zero. The trusted meter has no pending or uncertain call.
@@ -497,6 +508,12 @@ For the optional offline native brief-gate test, set
 Firstmate commit and run `pytest tests/switch_core/bridges/jira/test_firstmate_launch.py`
 from `core/`. The test copies native scripts into a disposable fixture and
 stops at a fake tmux window boundary. It does not allocate worktrees or call providers.
+`test_firstmate_native.py` uses the same opt-in variable for a deeper offline test.
+It runs the pinned launcher, real tmux windows, Treehouse allocation, ownership
+checks, base refresh and metadata publication. Only the final Pi invocation is
+inert. Trusted fetches use disposable local repositories. The test checks all
+roles, frozen sources, repeated starts and native isolation refusal. It uses
+explicit private socket paths and proves server ownership before cleanup.
 
 ## Ticket rooms
 

@@ -283,6 +283,37 @@ class LocalRepositories:
                 authorization=self.runtime.forge_authorization.get_secret_value(),
             )
         _directory(self.project(job).parent)
+        # Native allocation fetches without forge credentials or authority to advance the frozen target.
+        source = self.project(job).parent / "native.git"
+        if source.resolve() != source:
+            raise ValueError("Native repository source contains a symlink")
+        if not source.exists():
+            await self._git(
+                "clone",
+                "--bare",
+                "--no-local",
+                "--no-hardlinks",
+                "--",
+                str(objects._path),
+                str(source),
+            )
+            await self._git(
+                "--git-dir", str(source), "update-ref", "refs/heads/source", target
+            )
+            await self._git(
+                "--git-dir", str(source), "symbolic-ref", "HEAD", "refs/heads/source"
+            )
+            await self._git("--git-dir", str(source), "remote", "remove", "origin")
+        if (
+            await self._git("--git-dir", str(source), "rev-parse", "HEAD") != target
+            or await self._git("--git-dir", str(source), "symbolic-ref", "HEAD")
+            != "refs/heads/source"
+            or await self._git(
+                "--git-dir", str(source), "rev-parse", "--is-bare-repository"
+            )
+            != "true"
+        ):
+            raise ValueError("Native repository source differs from the frozen commit")
         for project, sha in (
             (self.project(job), target),
             *(
@@ -291,44 +322,60 @@ class LocalRepositories:
                 else []
             ),
         ):
-            if project.exists():
-                if project.resolve() != project:
-                    raise ValueError("A prepared role checkout contains a symlink")
-                continue
-            await self._git(
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                "--no-checkout",
-                "--",
-                str(objects._path),
-                str(project),
-            )
-            await self._git(
-                "-C",
-                str(project),
-                "remote",
-                "set-url",
-                "origin",
-                job.repository.canonical_url,
-            )
-            await self._git(
-                "-C", str(project), "config", "user.name", "Switch delivery"
-            )
-            await self._git(
-                "-C", str(project), "config", "user.email", "delivery@example.invalid"
-            )
-            if project == self.base(job) or job.run.step in {"review", "qa", "smoke"}:
-                await self._git("-C", str(project), "checkout", "--detach", sha or "")
-            else:
+            if project.resolve() != project:
+                raise ValueError("A prepared role checkout contains a symlink")
+            if not project.exists():
+                await self._git(
+                    "clone",
+                    "--no-local",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--",
+                    str(source),
+                    str(project),
+                )
                 await self._git(
                     "-C",
                     str(project),
-                    "checkout",
-                    "-b",
-                    envelope.scope.branch,
-                    sha or "",
+                    "remote",
+                    "set-url",
+                    "origin",
+                    job.repository.canonical_url,
                 )
+                await self._git(
+                    "-C", str(project), "config", "user.name", "Switch delivery"
+                )
+                await self._git(
+                    "-C",
+                    str(project),
+                    "config",
+                    "user.email",
+                    "delivery@example.invalid",
+                )
+                if project == self.base(job) or job.run.step in {
+                    "review",
+                    "qa",
+                    "smoke",
+                }:
+                    await self._git(
+                        "-C", str(project), "checkout", "--detach", sha or ""
+                    )
+                else:
+                    await self._git(
+                        "-C",
+                        str(project),
+                        "checkout",
+                        "-b",
+                        envelope.scope.branch,
+                        sha or "",
+                    )
+            await self._git(
+                "-C",
+                str(project),
+                "config",
+                f"url.{source}.insteadOf",
+                job.repository.canonical_url,
+            )
 
     async def import_candidate(
         self, scope: ScopeContract, handoff: Handoff, job: Job

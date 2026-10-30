@@ -126,6 +126,10 @@ async def test_rejected_brief_retains_uncertain_dispatch(native_lab, native_job,
         ),
         ("pi executable not found on PATH", "required executable is missing from PATH"),
         ("refusing to race", "Firstmate refused concurrent project allocation"),
+        (
+            "treehouse get did not enter an isolated worktree within 60s",
+            "Firstmate could not allocate an isolated task checkout",
+        ),
     ],
 )
 @pytest.mark.parametrize("oversized", [False, True])
