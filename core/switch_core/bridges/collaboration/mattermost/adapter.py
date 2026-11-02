@@ -329,6 +329,10 @@ class MattermostAdapter(CollaborationAdapter):
             "message": self.translate_outbound(caption) if caption else "",
             "file_ids": file_ids,
         }
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
@@ -411,6 +415,10 @@ class MattermostAdapter(CollaborationAdapter):
             "message": self.translate_outbound(caption) if caption else "",
             "file_ids": file_ids,
         }
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
@@ -426,6 +434,9 @@ class MattermostAdapter(CollaborationAdapter):
                 e,
             )
             return None
+
+    def _posting_as_admin(self, driver: Driver) -> bool:
+        return driver is self._admin_driver
 
     def _remember_own_post(self, post_id: str) -> None:
         if not post_id:
@@ -447,6 +458,10 @@ class MattermostAdapter(CollaborationAdapter):
             logger.error("Cannot send message: event loop not initialized")
             return None
         post: dict[str, str] = {"channel_id": channel_id, "message": content}
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
@@ -1483,7 +1498,12 @@ class MattermostAdapter(CollaborationAdapter):
         if post.get("user_id", "") in self._bridge_bot_ids:
             return True
         post_id = post.get("id", "")
-        return bool(post_id and post_id in self._own_post_ids)
+        pending_post_id = post.get("pending_post_id", "")
+        with self._seen_lock:
+            return bool(
+                (post_id and post_id in self._own_post_ids)
+                or (pending_post_id and pending_post_id in self._own_post_ids)
+            )
 
     async def _ws_handler(self, event_data: str, agent_name: str) -> None:
         try:

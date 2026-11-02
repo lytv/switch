@@ -131,3 +131,76 @@ async def test_create_post_records_own_post() -> None:
 
     assert ref == "post-1"
     assert "post-1" in adapter._own_post_ids
+
+
+async def test_bridge_pending_admin_post_is_ignored() -> None:
+    adapter = _adapter()
+    received: list[InboundMessage] = []
+    _wire(adapter, received)
+    adapter._remember_own_post("pending-1")
+
+    await adapter._ws_handler(
+        _posted_event(
+            {
+                "id": "server-post",
+                "pending_post_id": "pending-1",
+                "user_id": "admin-user",
+                "channel_id": "chan-1",
+                "message": "posted by the bridge",
+            }
+        ),
+        "orchestrator",
+    )
+    await asyncio.sleep(0.05)
+
+    assert received == []
+
+
+async def test_attachment_post_carries_pending_id() -> None:
+    adapter = _adapter()
+    adapter._main_loop = asyncio.get_running_loop()
+    seen: dict[str, object] = {}
+
+    def create_post(post: dict[str, object]) -> dict[str, str]:
+        seen["own"] = adapter._is_own_post(
+            {"id": "server-post", "pending_post_id": post["pending_post_id"]}
+        )
+        return {"id": "server-post"}
+
+    adapter._admin_driver = SimpleNamespace(
+        files=SimpleNamespace(
+            upload_file=lambda *_a, **_k: {"file_infos": [{"id": "file-1"}]}
+        ),
+        posts=SimpleNamespace(create_post=create_post),
+    )
+
+    ref = await adapter.send_attachment("chan-1", "agent", "a.txt", "text/plain", b"hi")
+
+    assert ref == "server-post"
+    assert seen["own"] is True
+
+
+async def test_pending_id_marks_own_before_http_response() -> None:
+    """The posted event can arrive before create_post returns, so the marker
+    must be live while the HTTP call is still in flight."""
+    adapter = _adapter()
+    adapter._main_loop = asyncio.get_running_loop()
+    seen: dict[str, object] = {}
+
+    def create_post(post: dict[str, str]) -> dict[str, str]:
+        seen["own"] = adapter._is_own_post(
+            {
+                "id": "server-post",
+                "pending_post_id": post["pending_post_id"],
+                "user_id": "admin-user",
+            }
+        )
+        return {"id": "server-post"}
+
+    adapter._admin_driver = SimpleNamespace(
+        posts=SimpleNamespace(create_post=create_post)
+    )
+
+    await adapter._create_post(adapter._admin_driver, "chan-1", "hello", None)  # type: ignore[arg-type]
+
+    assert seen["own"] is True
