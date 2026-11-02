@@ -117,6 +117,11 @@ class MattermostAdapter(CollaborationAdapter):
 
         self._seen_post_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_post_ids_max = 1000
+        # Posts this bridge created. The admin user is also a human account, so
+        # it cannot be skipped by identity; skip only what the bridge itself
+        # posted.
+        self._own_post_ids: OrderedDict[str, None] = OrderedDict()
+        self._own_post_ids_max = 1000
         self._seen_lock = threading.Lock()
 
         # (channel_id, thread root post id) -> the post that actually asked.
@@ -324,11 +329,16 @@ class MattermostAdapter(CollaborationAdapter):
             "message": self.translate_outbound(caption) if caption else "",
             "file_ids": file_ids,
         }
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
             result = await loop.run_in_executor(None, driver.posts.create_post, post)
             post_id: str = result.get("id", "")
+            self._remember_own_post(post_id)
             return post_id or None
         except Exception as e:
             logger.error(
@@ -405,11 +415,16 @@ class MattermostAdapter(CollaborationAdapter):
             "message": self.translate_outbound(caption) if caption else "",
             "file_ids": file_ids,
         }
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
             result = await loop.run_in_executor(None, driver.posts.create_post, post)
             post_id: str = result.get("id", "")
+            self._remember_own_post(post_id)
             return post_id or None
         except Exception as e:
             logger.error(
@@ -419,6 +434,17 @@ class MattermostAdapter(CollaborationAdapter):
                 e,
             )
             return None
+
+    def _posting_as_admin(self, driver: Driver) -> bool:
+        return driver is self._admin_driver
+
+    def _remember_own_post(self, post_id: str) -> None:
+        if not post_id:
+            return
+        with self._seen_lock:
+            self._own_post_ids[post_id] = None
+            if len(self._own_post_ids) > self._own_post_ids_max:
+                self._own_post_ids.popitem(last=False)
 
     async def _create_post(
         self,
@@ -432,11 +458,16 @@ class MattermostAdapter(CollaborationAdapter):
             logger.error("Cannot send message: event loop not initialized")
             return None
         post: dict[str, str] = {"channel_id": channel_id, "message": content}
+        if self._posting_as_admin(driver):
+            pending_post_id = f"switch-{uuid.uuid4()}"
+            post["pending_post_id"] = pending_post_id
+            self._remember_own_post(pending_post_id)
         if thread_root_id is not None:
             post["root_id"] = thread_root_id
         try:
             result = await loop.run_in_executor(None, driver.posts.create_post, post)
             post_id: str = result.get("id", "")
+            self._remember_own_post(post_id)
             return post_id or None
         except Exception as e:
             logger.error("Failed to send Mattermost message to %s: %s", channel_id, e)
@@ -1457,6 +1488,23 @@ class MattermostAdapter(CollaborationAdapter):
 
     # ── WebSocket handling ───────────────────────────────────────────────────
 
+    def _is_own_post(self, post: dict[str, Any]) -> bool:
+        """True when this bridge created the post, not a human.
+
+        Bot identities are always the bridge's own. The admin user is not: a
+        human can post from it, so it is skipped only when the post is one this
+        bridge created.
+        """
+        if post.get("user_id", "") in self._bridge_bot_ids:
+            return True
+        post_id = post.get("id", "")
+        pending_post_id = post.get("pending_post_id", "")
+        with self._seen_lock:
+            return bool(
+                (post_id and post_id in self._own_post_ids)
+                or (pending_post_id and pending_post_id in self._own_post_ids)
+            )
+
     async def _ws_handler(self, event_data: str, agent_name: str) -> None:
         try:
             event = json.loads(event_data)
@@ -1482,15 +1530,15 @@ class MattermostAdapter(CollaborationAdapter):
         except (json.JSONDecodeError, TypeError):
             return
 
-        user_id = post.get("user_id", "")
         post_type = post.get("type", "")
         if post_type:
             return
 
-        if user_id in self._bridge_bot_ids or user_id == self._admin_user_id:
+        post_id = post.get("id", "")
+        if self._is_own_post(post):
             return
 
-        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
         with self._seen_lock:
             if post_id in self._seen_post_ids:
                 return
