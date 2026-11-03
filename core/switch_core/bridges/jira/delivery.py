@@ -667,12 +667,15 @@ class DeliverySupervisor:
             ):
                 return
             scope = state.scope
-            if self._config.jira_worker_delivery_handoff_enabled:
+            if self._config.jira_worker_delivery_handoff_enabled and not active:
                 await self._handoff(ticket_id)
                 return
-            if not self._config.jira_worker_delivery_execution_enabled:
+            if (
+                not self._config.jira_worker_delivery_execution_enabled
+                and not active
+            ):
                 return
-            if await _handoff_fences(
+            if not active and await _handoff_fences(
                 session,
                 instance=ticket.instance,
                 issue_key=ticket.issue_key,
@@ -934,6 +937,19 @@ class DeliverySupervisor:
         command_key = f"handoff:{handoff_id}"
         room_id = ticket.room_id
         agents = tuple(self._config.jira_worker_delivery_handoff_agents)
+        running = await session.scalar(
+            select(JiraWorkerJob.execution_key)
+            .where(
+                JiraWorkerJob.ticket_id == ticket_id,
+                JiraWorkerJob.kind == "role_job",
+                JiraWorkerJob.status.in_(
+                    ("claimed", "running", "uncertain", "cancel_requested")
+                ),
+            )
+            .limit(1)
+        )
+        if running is not None:
+            return None
         existing = await session.scalar(
             select(JiraWorkerOutbox.id).where(
                 JiraWorkerOutbox.instance == ticket.instance,

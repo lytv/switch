@@ -436,9 +436,22 @@ class ForgeDouble:
 
 
 def services(
-    sessions, jira, *, enabled=True, handoff=False, process=None, forge=None, rooms=None
+    sessions,
+    jira,
+    *,
+    enabled=True,
+    handoff=False,
+    observe_only=False,
+    process=None,
+    forge=None,
+    rooms=None,
 ):
-    settings = config(enabled, handoff)
+    if observe_only:
+        settings = config(enabled=False, handoff=False).model_copy(
+            update={"jira_worker_delivery_observe_enabled": True}
+        )
+    else:
+        settings = config(enabled, handoff)
     activity = TicketActivity(
         session_factory=sessions,
         config=settings,
@@ -1791,6 +1804,160 @@ async def test_handoff_notice_survives_park_and_generation_change(session_factor
     assert process.starts == []
 
 
+class ReadbackRooms(ThreadRooms):
+    def __init__(self):
+        super().__init__()
+        self.rooms["room-1"] = {"agents": []}
+
+    async def post_notice(self, room_id, *, body):
+        event_id = await super().post_notice(room_id, body=body)
+        self.messages.append(
+            {
+                "id": event_id,
+                "kind": "message",
+                "sender": "jira-agent",
+                "body": body,
+                "timestamp": 1,
+            }
+        )
+        return event_id
+
+
+async def test_handoff_notice_recovered_after_sending_crash(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    original_body = rows[0].payload["data"]
+    assert rooms.notices == []
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        row.status = "sending"
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert rooms.notices == [("room-1", original_body)]
+    await sender.run_once()
+    assert len(rooms.notices) == 1
+    assert process.starts == []
+
+
+async def test_handoff_notice_not_duplicated_after_crash_before_record(
+    session_factory,
+):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    original_body = rows[0].payload["data"]
+    await rooms.post_notice("room-1", body=original_body)
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        row.status = "sending"
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert rooms.notices == [("room-1", original_body)]
+    await sender.run_once()
+    assert len(rooms.notices) == 1
+    assert process.starts == []
+
+
+async def test_handoff_notice_recovered_from_uncertain(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        row.status = "uncertain"
+        row.error = "simulated restart during post"
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+    await sender.run_once()
+    assert len(rooms.notices) == 1
+    assert process.starts == []
+
+
+async def test_handoff_notice_pending_without_rooms_is_retryable(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    offline = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=None,
+    )
+    await offline.run_once()
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "pending"
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+    assert process.starts == []
+
+
 async def test_handoff_waits_for_inflight_jira_send(session_factory):
     await _seed_with_room(session_factory)
     rooms = _handoff_rooms()
@@ -1853,6 +2020,98 @@ async def test_handed_off_ticket_never_launches_in_delivery_mode(session_factory
     await delivery_supervisor.reconcile("ticket")
     assert delivery_process.starts == []
     assert len(await _handoff_rows(session_factory)) == 1
+
+
+async def test_handoff_refused_while_native_execution_active(session_factory):
+    scope = await seed(session_factory)
+    rooms = _handoff_rooms()
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.room_id = "room-1"
+        await session.commit()
+    jira = DeliveryJira()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, rooms=rooms
+    )
+    jira.approve()
+    await supervisor.reconcile("ticket")
+    assert process.starts == [scope.job.run.execution_key]
+    _, handoff_supervisor, _, _, _ = services(
+        session_factory, jira, handoff=True, process=process, rooms=rooms
+    )
+    await handoff_supervisor.reconcile("ticket")
+    assert await _handoff_rows(session_factory) == []
+    assert process.starts == [scope.job.run.execution_key]
+    async with session_factory() as session:
+        row = (
+            await session.scalars(
+                select(JiraWorkerJob).where(
+                    JiraWorkerJob.ticket_id == "ticket",
+                    JiraWorkerJob.kind == "role_job",
+                )
+            )
+        ).one()
+        row.status = "uncertain"
+        await session.commit()
+    await handoff_supervisor.reconcile("ticket")
+    assert await _handoff_rows(session_factory) == []
+    assert process.starts == [scope.job.run.execution_key]
+    async with session_factory() as session:
+        row = (
+            await session.scalars(
+                select(JiraWorkerJob).where(
+                    JiraWorkerJob.ticket_id == "ticket",
+                    JiraWorkerJob.kind == "role_job",
+                )
+            )
+        ).one()
+        row.status = "running"
+        await session.commit()
+    process.complete(scope.job)
+    await handoff_supervisor.reconcile("ticket")
+    ticket, state = await current(session_factory)
+    assert state.step == "fix"
+    assert await _handoff_rows(session_factory) == []
+    await handoff_supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    assert rows[0].payload["handoff"]["generation"] == 1
+    assert process.starts == [scope.job.run.execution_key]
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+
+
+async def test_observe_mode_keeps_reconciling_active_execution(session_factory):
+    scope = await seed(session_factory)
+    rooms = _handoff_rooms()
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.room_id = "room-1"
+        await session.commit()
+    jira = DeliveryJira()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, rooms=rooms
+    )
+    jira.approve()
+    await supervisor.reconcile("ticket")
+    assert process.starts == [scope.job.run.execution_key]
+    _, observe_supervisor, _, _, _ = services(
+        session_factory, jira, observe_only=True, process=process, rooms=rooms
+    )
+    await observe_supervisor.reconcile("ticket")
+    assert process.starts == [scope.job.run.execution_key]
+    process.complete(scope.job)
+    await observe_supervisor.reconcile("ticket")
+    _, state = await current(session_factory)
+    assert state.step == "fix"
+    assert process.starts == [scope.job.run.execution_key]
 
 
 async def test_handoff_duplicate_and_restart_are_idempotent(session_factory):

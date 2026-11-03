@@ -438,7 +438,13 @@ class JiraOutboxSender:
                                     literal(self._rooms is not None),
                                 ),
                             ),
-                            JiraWorkerOutbox.status.in_(_ACTIVE),
+                            or_(
+                                JiraWorkerOutbox.status.in_(_ACTIVE),
+                                and_(
+                                    JiraWorkerOutbox.command == HANDOFF_COMMAND,
+                                    JiraWorkerOutbox.status == "uncertain",
+                                ),
+                            ),
                             JiraWorkerOutbox.due_at <= self._clock(),
                             or_(*scopes),
                         )
@@ -491,7 +497,16 @@ class JiraOutboxSender:
 
     async def _send_locked(self, session: AsyncSession, command_id: str) -> None:
         row = await session.get(JiraWorkerOutbox, command_id, with_for_update=True)
-        if row is None or row.status not in _ACTIVE or row.due_at > self._clock():
+        recovering = (
+            row is not None
+            and row.command == HANDOFF_COMMAND
+            and row.status == "uncertain"
+        )
+        if (
+            row is None
+            or (row.status not in _ACTIVE and not recovering)
+            or row.due_at > self._clock()
+        ):
             return
         ticket = (
             await session.scalars(
@@ -974,6 +989,32 @@ class JiraOutboxSender:
             row.error = None
         await session.commit()
 
+    async def _handoff_notice_posted(self, *, room_id: str, body: str) -> bool | None:
+        rooms = self._rooms
+        if rooms is None:
+            return None
+        try:
+            after_seq = 0
+            while True:
+                page = await rooms.read_context(room_id, after_seq=after_seq)
+                for group in page["threads"]:
+                    for message in (
+                        group.get("root"),
+                        *group.get("replies", []),
+                    ):
+                        if isinstance(message, dict) and message.get("body") == body:
+                            return True
+                if not page["truncated"]:
+                    return False
+                if page["next_seq"] == after_seq:
+                    return None
+                after_seq = page["next_seq"]
+        except Exception:
+            logger.exception(
+                "Handoff notice read-back failed for room %s", room_id
+            )
+            return None
+
     async def _send_switch_notice(
         self, session: AsyncSession, row: JiraWorkerOutbox
     ) -> None:
@@ -982,18 +1023,32 @@ class JiraOutboxSender:
             or self._rooms is None
         ):
             raise ValueError("Switch notice sender requires ticket rooms")
-        if row.status == "sending":
-            row.status = "uncertain"
-            row.error = "Restart found a room notice with an unknown outcome; automatic replay is unsafe"
-            logger.error("Switch notice %s: %s", row.id, row.error)
-            await session.commit()
-            return
         payload = row.payload or {}
         if row.command == HANDOFF_COMMAND:
             for agent in self._config.jira_worker_delivery_handoff_agents:
                 await self._rooms.ensure_agent_member(
                     payload["room_id"], agent_name=agent
                 )
+            if row.status != "pending":
+                posted = await self._handoff_notice_posted(
+                    room_id=payload["room_id"], body=payload["data"]
+                )
+                if posted is None:
+                    row.status = "uncertain"
+                    row.error = "Room notice outcome is unknown; will recheck on a later run"
+                    await session.commit()
+                    return
+                if posted:
+                    row.status = "done"
+                    row.error = None
+                    await session.commit()
+                    return
+        elif row.status == "sending":
+            row.status = "uncertain"
+            row.error = "Restart found a room notice with an unknown outcome; automatic replay is unsafe"
+            logger.error("Switch notice %s: %s", row.id, row.error)
+            await session.commit()
+            return
         row.status = "sending"
         row.attempts += 1
         await session.commit()
