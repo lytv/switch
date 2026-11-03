@@ -41,21 +41,30 @@ WAIT_REMINDER_COMMAND = "wait_reminder"
 HANDOFF_COMMAND = "handoff"
 
 
-async def _has_handoff(
-    session: AsyncSession, *, instance: str, issue_key: str
+async def _handoff_fences(
+    session: AsyncSession, *, instance: str, issue_key: str, generation: int
 ) -> bool:
-    return (
-        await session.scalar(
-            select(JiraWorkerOutbox.id)
-            .where(
+    """A handoff record fences only its own generation; newer generations pass."""
+    payloads = (
+        await session.scalars(
+            select(JiraWorkerOutbox.payload).where(
                 JiraWorkerOutbox.instance == instance,
                 JiraWorkerOutbox.issue_key == issue_key,
                 JiraWorkerOutbox.command == HANDOFF_COMMAND,
             )
-            .limit(1)
         )
-        is not None
-    )
+    ).all()
+    if not payloads:
+        return False
+    for payload in payloads:
+        handoff_generation = (payload or {}).get("handoff", {}).get("generation")
+        if (
+            not isinstance(handoff_generation, int)
+            or isinstance(handoff_generation, bool)
+            or handoff_generation >= generation
+        ):
+            return True
+    return False
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -169,8 +178,11 @@ async def enqueue_jira_command(
         ticket.instance, []
     ):
         return None
-    if await _has_handoff(
-        session, instance=ticket.instance, issue_key=ticket.issue_key
+    if await _handoff_fences(
+        session,
+        instance=ticket.instance,
+        issue_key=ticket.issue_key,
+        generation=ticket.agent_generation,
     ):
         return None
     if not command_key.strip():
@@ -472,15 +484,23 @@ class JiraOutboxSender:
             ticket.instance, []
         ):
             return
+        payload = row.payload or {}
         if row.channel == "jira" and row.status != "sending":
-            if await _has_handoff(
-                session, instance=row.instance, issue_key=row.issue_key
+            row_generation = payload.get("intake_generation")
+            if not isinstance(row_generation, int) or isinstance(
+                row_generation, bool
+            ):
+                row_generation = ticket.agent_generation
+            if await _handoff_fences(
+                session,
+                instance=row.instance,
+                issue_key=row.issue_key,
+                generation=row_generation,
             ):
                 row.status = "cancelled"
                 row.error = "Ticket handed off to fix-flow; Jira writes stopped"
                 await session.commit()
                 return
-        payload = row.payload or {}
         if row.status != "sending" and (
             "delivery_question" in payload or "delivery_progress_execution" in payload
         ):
@@ -928,6 +948,11 @@ class JiraOutboxSender:
             await session.commit()
             return
         payload = row.payload or {}
+        if row.command == HANDOFF_COMMAND:
+            for agent in self._config.jira_worker_delivery_handoff_agents:
+                await self._rooms.ensure_agent_member(
+                    payload["room_id"], agent_name=agent
+                )
         row.status = "sending"
         row.attempts += 1
         await session.commit()
