@@ -677,6 +677,7 @@ class DeliverySupervisor:
                 instance=ticket.instance,
                 issue_key=ticket.issue_key,
                 generation=ticket.agent_generation,
+                scope_digest=digest(state.scope),
             ):
                 return
             if state.question is not None:

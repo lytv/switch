@@ -41,11 +41,28 @@ WAIT_REMINDER_COMMAND = "wait_reminder"
 HANDOFF_COMMAND = "handoff"
 
 
+def _ticket_scope_digest(ticket: JiraWorkerTicket) -> str | None:
+    try:
+        state = workflow_state_adapter.validate_json(
+            json.dumps(ticket.workflow_state)
+        )
+    except Exception:
+        return None
+    if not isinstance(state, DeliveryWorkflowState) or state.scope is None:
+        return None
+    return digest(state.scope)
+
+
 async def _handoff_fences(
-    session: AsyncSession, *, instance: str, issue_key: str, generation: int
+    session: AsyncSession,
+    *,
+    instance: str,
+    issue_key: str,
+    generation: int,
+    scope_digest: str | None,
 ) -> bool:
-    """A handoff record fences only its own generation; newer generations pass."""
-    payloads = (
+    handoffs: dict[int, Any] = {}
+    for payload in (
         await session.scalars(
             select(JiraWorkerOutbox.payload).where(
                 JiraWorkerOutbox.instance == instance,
@@ -53,18 +70,23 @@ async def _handoff_fences(
                 JiraWorkerOutbox.command == HANDOFF_COMMAND,
             )
         )
-    ).all()
-    if not payloads:
-        return False
-    for payload in payloads:
-        handoff_generation = (payload or {}).get("handoff", {}).get("generation")
-        if (
-            not isinstance(handoff_generation, int)
-            or isinstance(handoff_generation, bool)
-            or handoff_generation >= generation
+    ).all():
+        handoff = (payload or {}).get("handoff", {})
+        handoff_generation = handoff.get("generation")
+        if not isinstance(handoff_generation, int) or isinstance(
+            handoff_generation, bool
         ):
             return True
-    return False
+        handoffs[handoff_generation] = handoff.get("scope_digest")
+    if not handoffs:
+        return False
+    latest = max(handoffs)
+    if generation <= latest:
+        return True
+    latest_digest = handoffs[latest]
+    if not isinstance(latest_digest, str):
+        return True
+    return scope_digest is not None and scope_digest == latest_digest
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -183,6 +205,7 @@ async def enqueue_jira_command(
         instance=ticket.instance,
         issue_key=ticket.issue_key,
         generation=ticket.agent_generation,
+        scope_digest=_ticket_scope_digest(ticket),
     ):
         return None
     if not command_key.strip():
@@ -496,6 +519,7 @@ class JiraOutboxSender:
                 instance=row.instance,
                 issue_key=row.issue_key,
                 generation=row_generation,
+                scope_digest=_ticket_scope_digest(ticket),
             ):
                 row.status = "cancelled"
                 row.error = "Ticket handed off to fix-flow; Jira writes stopped"
