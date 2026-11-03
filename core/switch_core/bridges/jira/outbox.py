@@ -525,8 +525,13 @@ class JiraOutboxSender:
                 row.error = "Ticket handed off to fix-flow; Jira writes stopped"
                 await session.commit()
                 return
-        if row.status != "sending" and (
-            "delivery_question" in payload or "delivery_progress_execution" in payload
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and (
+                "delivery_question" in payload
+                or "delivery_progress_execution" in payload
+            )
         ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
@@ -572,7 +577,11 @@ class JiraOutboxSender:
                 row.error = str(exc)
                 await session.commit()
                 return
-        if row.status != "sending" and "scope_digest" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "scope_digest" in payload
+        ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
             )
@@ -585,7 +594,11 @@ class JiraOutboxSender:
                 row.error = "Frozen delivery scope changed"
                 await session.commit()
                 return
-        if row.status != "sending" and "repository_digest" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "repository_digest" in payload
+        ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
             )
@@ -600,7 +613,11 @@ class JiraOutboxSender:
                 row.error = "Frozen repository confirmation changed"
                 await session.commit()
                 return
-        if row.status != "sending" and "intake_generation" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "intake_generation" in payload
+        ):
             if (
                 ticket.worker_parked_reason
                 or payload["intake_generation"] != ticket.agent_generation

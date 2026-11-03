@@ -1732,6 +1732,65 @@ async def test_handoff_notice_waits_for_all_memberships(session_factory):
     assert process.starts == []
 
 
+async def test_handoff_notice_survives_park_and_generation_change(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = FlakyHandoffRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    with pytest.raises(TimeoutError, match="transient membership failure"):
+        await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    original_body = rows[0].payload["data"]
+    original_binding = rows[0].payload["handoff"]
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        park_ticket(ticket, "Human Jira action")
+        await session.commit()
+    await supervisor.reconcile("ticket")
+    assert len(await _handoff_rows(session_factory)) == 1
+    rooms2 = _handoff_rooms()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms2,
+    )
+    await sender.run_once()
+    assert rooms2.rooms["room-1"]["agents"] == [
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    ]
+    assert rooms2.notices == [("room-1", original_body)]
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        assert row.status == "done"
+        assert row.payload["handoff"] == original_binding
+        assert row.payload["data"] == original_body
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        assert (
+            await enqueue_jira_command(
+                session,
+                config=config(handoff=True),
+                ticket=ticket,
+                command_key="post-park-write",
+                command="comment",
+                data="must stay fenced after park",
+                based_updated=BASE,
+                based_changelog_id="",
+            )
+        ) is None
+    await sender.run_once()
+    assert len(rooms2.notices) == 1
+    assert process.starts == []
+
+
 async def test_handoff_waits_for_inflight_jira_send(session_factory):
     await _seed_with_room(session_factory)
     rooms = _handoff_rooms()
