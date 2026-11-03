@@ -878,47 +878,46 @@ class DeliverySupervisor:
                 return
             handoff_id = f"{ticket.id}/{ticket.agent_generation}"
             command_key = f"handoff:{handoff_id}"
+            room_id = ticket.room_id
+            agents = tuple(self._config.jira_worker_delivery_handoff_agents)
             existing = await session.scalar(
                 select(JiraWorkerOutbox.id).where(
                     JiraWorkerOutbox.instance == ticket.instance,
                     JiraWorkerOutbox.command_key == command_key,
                 )
             )
-            if existing is not None:
-                return
-            approval = state.approvals[0]
-            body = self._config.jira_worker_delivery_handoff_room_line.format(
-                issue_key=ticket.issue_key, handoff_id=handoff_id
-            )
-            command_id = await enqueue_ticket_command(
-                session,
-                config=self._config,
-                ticket=ticket,
-                command_key=command_key,
-                channel="switch",
-                command=HANDOFF_COMMAND,
-                body=body,
-                predecessor=None,
-                now=self._clock(),
-            )
-            row = await session.get(JiraWorkerOutbox, command_id)
-            assert row is not None
-            row.payload = {
-                **(row.payload or {}),
-                "handoff": {
-                    "ticket_id": ticket.id,
-                    "generation": ticket.agent_generation,
-                    "handoff_id": handoff_id,
-                    "approval_history_id": approval.history_id,
-                    "gate_id": approval.gate.id,
-                    "scope_digest": digest(state.scope),
-                    "jira_updated": ticket.jira_read_updated,
-                    "jira_changelog_id": ticket.jira_read_changelog_id,
-                },
-            }
-            room_id = ticket.room_id
-            agents = self._config.jira_worker_delivery_handoff_agents
-            await session.commit()
+            if existing is None:
+                approval = state.approvals[0]
+                body = self._config.jira_worker_delivery_handoff_room_line.format(
+                    issue_key=ticket.issue_key, handoff_id=handoff_id
+                )
+                command_id = await enqueue_ticket_command(
+                    session,
+                    config=self._config,
+                    ticket=ticket,
+                    command_key=command_key,
+                    channel="switch",
+                    command=HANDOFF_COMMAND,
+                    body=body,
+                    predecessor=None,
+                    now=self._clock(),
+                )
+                row = await session.get(JiraWorkerOutbox, command_id)
+                assert row is not None
+                row.payload = {
+                    **(row.payload or {}),
+                    "handoff": {
+                        "ticket_id": ticket.id,
+                        "generation": ticket.agent_generation,
+                        "handoff_id": handoff_id,
+                        "approval_history_id": approval.history_id,
+                        "gate_id": approval.gate.id,
+                        "scope_digest": digest(state.scope),
+                        "jira_updated": ticket.jira_read_updated,
+                        "jira_changelog_id": ticket.jira_read_changelog_id,
+                    },
+                }
+                await session.commit()
         rooms = self._activity.rooms
         if rooms is not None:
             for agent in agents:

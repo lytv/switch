@@ -441,6 +441,8 @@ class TicketActivity:
                 based_updated=ticket.jira_read_updated,
                 based_changelog_id=ticket.jira_read_changelog_id,
             )
+            if command_id is None:
+                return
             row = await session.get(JiraWorkerOutbox, command_id)
             assert row is not None
             row.payload = {**(row.payload or {}), **metadata}

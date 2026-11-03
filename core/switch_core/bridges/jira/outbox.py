@@ -41,6 +41,23 @@ WAIT_REMINDER_COMMAND = "wait_reminder"
 HANDOFF_COMMAND = "handoff"
 
 
+async def _has_handoff(
+    session: AsyncSession, *, instance: str, issue_key: str
+) -> bool:
+    return (
+        await session.scalar(
+            select(JiraWorkerOutbox.id)
+            .where(
+                JiraWorkerOutbox.instance == instance,
+                JiraWorkerOutbox.issue_key == issue_key,
+                JiraWorkerOutbox.command == HANDOFF_COMMAND,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
 def _validate_command(command: str, data: Any) -> None:
     if command == "transition_by_id":
         ExactTransition.model_validate_json(json.dumps(data))
@@ -150,6 +167,10 @@ async def enqueue_jira_command(
     """Enqueue once per instance/key, in the caller's transaction."""
     if ticket.project_key not in config.jira_worker_enabled_projects.get(
         ticket.instance, []
+    ):
+        return None
+    if await _has_handoff(
+        session, instance=ticket.instance, issue_key=ticket.issue_key
     ):
         return None
     if not command_key.strip():
@@ -376,6 +397,7 @@ class JiraOutboxSender:
                                             "wrong_place_notice",
                                             INTAKE_QUESTION_COMMAND,
                                             WAIT_REMINDER_COMMAND,
+                                            HANDOFF_COMMAND,
                                         )
                                     ),
                                     literal(self._rooms is not None),
@@ -450,6 +472,14 @@ class JiraOutboxSender:
             ticket.instance, []
         ):
             return
+        if row.channel == "jira" and row.status != "sending":
+            if await _has_handoff(
+                session, instance=row.instance, issue_key=row.issue_key
+            ):
+                row.status = "cancelled"
+                row.error = "Ticket handed off to fix-flow; Jira writes stopped"
+                await session.commit()
+                return
         payload = row.payload or {}
         if row.status != "sending" and (
             "delivery_question" in payload or "delivery_progress_execution" in payload
@@ -999,6 +1029,8 @@ class JiraOutboxSender:
                     else None
                 ),
             )
+            if command_id is None:
+                continue
             child = await session.get(JiraWorkerOutbox, command_id)
             assert child is not None
             child.payload = {**(child.payload or {}), "failure_of": row.id}

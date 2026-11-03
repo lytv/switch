@@ -259,7 +259,7 @@ class SwitchConfig(BaseSettings):
     # Fixed ticket-room line posted at handoff. {issue_key} and {handoff_id}
     # are replaced with the ticket key and the durable handoff key.
     jira_worker_delivery_handoff_room_line: str = (
-        "fix-flow: {issue_key} scope approved; Switch stops here and hands "
+        "@fix-flow: {issue_key} scope approved; Switch stops here and hands "
         "off delivery (handoff {handoff_id})."
     )
     jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0", "2.0.0-deepseek"] = (

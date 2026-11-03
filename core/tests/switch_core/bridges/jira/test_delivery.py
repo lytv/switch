@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -1643,12 +1643,26 @@ async def test_handoff_writes_record_and_membership_without_launch(session_facto
     assert binding["scope_digest"] == digest(state.scope)
     assert binding["jira_changelog_id"] is not None
     assert "handoff ticket/1" in row.payload["data"]
+    assert row.payload["data"].startswith("@fix-flow")
     assert rooms.rooms["room-1"]["agents"] == [
         "fix-flow",
         "fix-dev",
         "fix-review",
         "fix-qa",
     ]
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == [("room-1", row.payload["data"])]
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, row.id)).status == "done"
+    await sender.run_once()
+    assert len(rooms.notices) == 1
 
 
 async def test_handoff_duplicate_and_restart_are_idempotent(session_factory):
@@ -1671,6 +1685,103 @@ async def test_handoff_duplicate_and_restart_are_idempotent(session_factory):
     rows = await _handoff_rows(session_factory)
     assert [row.command_key for row in rows] == ["handoff:ticket/1"]
     assert process.starts == [] and process2.starts == []
+    assert rooms2.rooms["room-1"]["agents"] == [
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    ]
+
+
+async def test_handoff_blocks_jira_writes_for_ticket_only(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = _handoff_rooms()
+    jira = DeliveryJira()
+    jira.approve()
+    settings = config(handoff=True)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        queued = await enqueue_jira_command(
+            session,
+            config=settings,
+            ticket=ticket,
+            command_key="pre-handoff-comment",
+            command="comment",
+            data="queued before handoff",
+            based_updated=BASE,
+            based_changelog_id="",
+        )
+        assert queued is not None
+        await session.commit()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        assert (
+            await enqueue_jira_command(
+                session,
+                config=settings,
+                ticket=ticket,
+                command_key="post-handoff-comment",
+                command="comment",
+                data="must not queue after handoff",
+                based_updated=BASE,
+                based_changelog_id="",
+            )
+        ) is None
+        other = JiraWorkerTicket(
+            id="other",
+            instance="acme",
+            issue_key="TEST-2",
+            project_key="TEST",
+            status="Waiting for approval",
+        )
+        session.add(other)
+        await session.flush()
+        other_row_id = await enqueue_jira_command(
+            session,
+            config=settings,
+            ticket=other,
+            command_key="other-comment",
+            command="comment",
+            data="other ticket still writes",
+            based_updated=BASE,
+            based_changelog_id="",
+        )
+        assert other_row_id is not None
+        (await session.get(JiraWorkerOutbox, other_row_id)).due_at = NOW + timedelta(
+            days=1
+        )
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=settings,
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert jira.writes == []
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.issue_key == "TEST-1",
+                        JiraWorkerOutbox.channel == "jira",
+                    )
+                )
+            ).all()
+        )
+        assert rows and all(
+            row.status == "cancelled" for row in rows
+        )
+        handoff = (await _handoff_rows(session_factory))[0]
+        assert (await session.get(JiraWorkerOutbox, handoff.id)).status == "done"
+    assert rooms.notices == [("room-1", handoff.payload["data"])]
+    assert process.starts == []
 
 
 async def test_handoff_revised_scope_produces_new_key(session_factory):
