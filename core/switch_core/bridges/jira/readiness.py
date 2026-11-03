@@ -19,7 +19,7 @@ def check_readiness(
     """Return a refusal reason per failed item; None means the local check passed."""
     checks: dict[str, str | None] = {
         "admission_disabled": None
-        if not config.jira_worker_delivery_execution_enabled
+        if not config.jira_worker_delivery_observe_active
         else "Disable delivery admission before preflight.",
         "project_enabled": None
         if project in config.jira_worker_enabled_projects.get(instance, [])

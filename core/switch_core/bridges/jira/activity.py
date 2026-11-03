@@ -308,6 +308,10 @@ class TicketActivity:
         self._accounts: dict[str, str] = {}
         self._comment_refresh_at: dict[str, datetime] = {}
 
+    @property
+    def rooms(self) -> TicketRooms | None:
+        return self._rooms
+
     def _enabled(self, ticket: JiraWorkerTicket) -> bool:
         return ticket.project_key in self._config.jira_worker_enabled_projects.get(
             ticket.instance, []
@@ -677,7 +681,7 @@ class TicketActivity:
             reporter_account=ticket.reporter_account_id,
         )
         observation = self._resume_rejection(ticket, version, observation)
-        if self._config.jira_worker_delivery_execution_enabled:
+        if self._config.jira_worker_delivery_observe_active:
             observation = observe_repository_confirmation(ticket, version, observation)
             observation = observe_scope_approval(ticket, version, observation)
         if observation.park != "regressed":

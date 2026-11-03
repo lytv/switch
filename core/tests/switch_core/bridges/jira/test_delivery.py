@@ -27,6 +27,7 @@ from switch_core.bridges.jira.contracts import (
 from switch_core.bridges.jira.delivery import (
     DeliverySupervisor,
     fix_job,
+    replace_state,
     role_job,
     stage_scope,
 )
@@ -52,7 +53,11 @@ from switch_core.bridges.jira.firstmate_copy import (
 from switch_core.bridges.jira.firstmate_jobs import FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
 from switch_core.bridges.jira.intake import IntakeOrchestrator
-from switch_core.bridges.jira.outbox import JiraOutboxSender, enqueue_jira_command
+from switch_core.bridges.jira.outbox import (
+    HANDOFF_COMMAND,
+    JiraOutboxSender,
+    enqueue_jira_command,
+)
 from switch_core.bridges.jira.packs import FrozenPack, load_pack
 from switch_core.bridges.jira.publisher import (
     DraftPublisher,
@@ -61,7 +66,7 @@ from switch_core.bridges.jira.publisher import (
     PublicationUncertain,
 )
 from switch_core.bridges.jira.state import DeliveryWorkflowState, WorkflowMapping
-from switch_core.bridges.jira.target import delivery_state
+from switch_core.bridges.jira.target import delivery_state, reset_delivery_scope
 from switch_core.bridges.jira.worker import JiraWorkerScheduler
 from switch_core.config import JiraWorkerLanguagePricing
 from switch_core.db.models import JiraWorkerJob, JiraWorkerOutbox, JiraWorkerTicket
@@ -70,6 +75,7 @@ from tests.switch_core.bridges.jira.test_activity import ThreadRooms, message
 from tests.switch_core.bridges.jira.test_admin import FakeAdminBoard, _worker_config
 from tests.switch_core.bridges.jira.test_intake import ModelMock
 from tests.switch_core.bridges.jira.test_outbox import BASE, JiraMock, client_for
+from tests.switch_core.bridges.jira.test_rooms import FakeRooms
 from tests.switch_core.bridges.jira.test_worker import _config
 
 lifecycle_lab = test_firstmate_jobs.lab
@@ -82,13 +88,14 @@ PROFILE = (
 )
 
 
-def config(enabled=True):
+def config(enabled=True, handoff=False):
     return _config(
         jira_worker_enabled_projects={"acme": ["TEST"]},
         jira_worker_delivery_projects={
             "acme": {"TEST": {"service_field": "customfield_12345"}}
         },
-        jira_worker_delivery_execution_enabled=enabled,
+        jira_worker_delivery_execution_enabled=enabled and not handoff,
+        jira_worker_delivery_handoff_enabled=handoff,
         jira_worker_delivery_language_pricing=JiraWorkerLanguagePricing(
             max_usd_per_token=Decimal("0.00001"), price_source="fixture-upper-bound"
         ),
@@ -173,8 +180,7 @@ class DeliveryJira(JiraMock):
         return response
 
 
-async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True):
-    pack = pack or load_pack(config())
+def _scope_for(pack, *, generation, base_sha=BASE_SHA):
     repository = Repository(
         supplied_url=URL,
         canonical_url=URL,
@@ -188,10 +194,10 @@ async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True):
         run=Run(
             instance="acme",
             ticket_id="ticket",
-            generation=1,
+            generation=generation,
             step="reproduce",
             attempt=1,
-            execution_key="ticket/1/reproduce/1",
+            execution_key=f"ticket/{generation}/reproduce/1",
         ),
         pack_digest=pack.digest,
         service="Bug",
@@ -203,7 +209,7 @@ async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True):
     )
     scope = ScopeContract(
         job=job,
-        branch="switch/ticket/1",
+        branch=f"switch/ticket/{generation}",
         allowed_paths=("src", "tests"),
         forbidden_paths=("src/secrets",),
         checks=(
@@ -239,6 +245,12 @@ async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True):
         candidate_sha=None,
         approver_account_ids=("approver",),
     )
+    return repository, scope, gate
+
+
+async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True, generation=1):
+    pack = pack or load_pack(config())
+    repository, scope, gate = _scope_for(pack, generation=generation, base_sha=base_sha)
     state = DeliveryWorkflowState(
         pack=pack,
         service="Bug",
@@ -259,7 +271,7 @@ async def seed(sessions, *, base_sha=BASE_SHA, pack=None, ready=True):
             issue_key="TEST-1",
             project_key="TEST",
             status="Waiting for approval",
-            agent_generation=1,
+            agent_generation=generation,
             reporter_account_id="reporter-account",
             jira_worker_account_id="worker-account",
             jira_read_updated=BASE,
@@ -411,8 +423,10 @@ class ForgeDouble:
         validate_candidate(scope, fix_job(scope), candidate)
 
 
-def services(sessions, jira, *, enabled=True, process=None, forge=None, rooms=None):
-    settings = config(enabled)
+def services(
+    sessions, jira, *, enabled=True, handoff=False, process=None, forge=None, rooms=None
+):
+    settings = config(enabled, handoff)
     activity = TicketActivity(
         session_factory=sessions,
         config=settings,
@@ -1574,3 +1588,153 @@ async def test_github_transport_refuses_credential_redirects(session_factory, tm
         with pytest.raises(ValueError, match="redirects"):
             await forge.branch_head(URL, scope.branch)
     assert len(seen) == 1
+
+
+def _handoff_rooms() -> FakeRooms:
+    rooms = FakeRooms()
+    rooms.rooms["room-1"] = {"agents": []}
+    return rooms
+
+
+async def _seed_with_room(session_factory, *, generation=1) -> None:
+    await seed(session_factory, generation=generation)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.room_id = "room-1"
+        await session.commit()
+
+
+async def _handoff_rows(session_factory) -> list[JiraWorkerOutbox]:
+    async with session_factory() as session:
+        return list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.command == HANDOFF_COMMAND
+                    )
+                )
+            ).all()
+        )
+
+
+async def test_handoff_writes_record_and_membership_without_launch(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = _handoff_rooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+
+    ticket, state = await current(session_factory)
+    assert process.starts == []
+    assert state.step == "reproduce" and state.approvals
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.channel == "switch" and row.command_key == "handoff:ticket/1"
+    binding = row.payload["handoff"]
+    assert binding["ticket_id"] == "ticket"
+    assert binding["generation"] == 1
+    assert binding["handoff_id"] == "ticket/1"
+    assert binding["gate_id"] == "scope-gate"
+    assert binding["approval_history_id"] == state.approvals[0].history_id
+    assert binding["scope_digest"] == digest(state.scope)
+    assert binding["jira_changelog_id"] is not None
+    assert "handoff ticket/1" in row.payload["data"]
+    assert rooms.rooms["room-1"]["agents"] == [
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    ]
+
+
+async def test_handoff_duplicate_and_restart_are_idempotent(session_factory):
+    await _seed_with_room(session_factory)
+    jira = DeliveryJira()
+    jira.approve()
+    rooms = _handoff_rooms()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    await supervisor.reconcile("ticket")
+
+    rooms2 = _handoff_rooms()
+    _, supervisor2, process2, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms2
+    )
+    await supervisor2.reconcile("ticket")
+
+    rows = await _handoff_rows(session_factory)
+    assert [row.command_key for row in rows] == ["handoff:ticket/1"]
+    assert process.starts == [] and process2.starts == []
+
+
+async def test_handoff_revised_scope_produces_new_key(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = _handoff_rooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+
+    pack = load_pack(config())
+    repository, scope2, gate2 = _scope_for(pack, generation=2)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        state = delivery_state(ticket)
+        reset_delivery_scope(ticket, state, service="Bug", supplied_url=URL)
+        state = delivery_state(ticket)
+        replace_state(ticket, state, repository=repository.model_dump(mode="json"))
+        stage_scope(ticket, scope2, gate2)
+        ticket.workflow_state = {**ticket.workflow_state, "gate_ready": True}
+        await session.commit()
+
+    jira.approve()
+    await supervisor.reconcile("ticket")
+
+    rows = await _handoff_rows(session_factory)
+    assert sorted(row.command_key for row in rows) == [
+        "handoff:ticket/1",
+        "handoff:ticket/2",
+    ]
+    assert process.starts == []
+
+
+async def test_handoff_rejected_scope_produces_no_record(session_factory):
+    await _seed_with_room(session_factory)
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.workflow_state = {
+            **ticket.workflow_state,
+            "statuses": [
+                *ticket.workflow_state["statuses"],
+                {"name": "Waiting for input", "jira_id": "input"},
+            ],
+        }
+        await session.commit()
+    rooms = _handoff_rooms()
+    jira = DeliveryJira()
+    jira.reject()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+
+    ticket, state = await current(session_factory)
+    assert await _handoff_rows(session_factory) == []
+    assert process.starts == []
+    assert state.step == "intake" and state.scope is None
+    assert ticket.agent_generation == 2
+    assert rooms.rooms["room-1"]["agents"] == []
+
+
+async def test_delivery_mode_still_launches_workers(session_factory):
+    jira = DeliveryJira()
+    _, _, process, _, _ = await candidate(session_factory, jira)
+    assert process.starts == ["ticket/1/reproduce/1", "ticket/1/fix/1"]

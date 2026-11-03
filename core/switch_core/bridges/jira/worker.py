@@ -982,13 +982,13 @@ class JiraWorkerScheduler:
             rooms=ticket_rooms,
             clock=self._clock,
         )
-        if config.jira_worker_delivery_execution_enabled and delivery_factory is None:
+        if config.jira_worker_delivery_observe_active and delivery_factory is None:
             raise ValueError(
-                "Delivery execution requires an explicitly provisioned supervisor"
+                "Delivery observation requires an explicitly provisioned supervisor"
             )
         self._delivery = (
             delivery_factory(self.activity)
-            if config.jira_worker_delivery_execution_enabled
+            if config.jira_worker_delivery_observe_active
             and delivery_factory is not None
             else None
         )

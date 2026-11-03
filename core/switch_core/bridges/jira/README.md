@@ -172,6 +172,14 @@ repository triage and scope approval before another code job can start.
 
 `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED` defaults to `false`.
 The server provisions `delivery_factory` from `JIRA_WORKER_DELIVERY_RUNTIME` when enabled.
+
+`JIRA_WORKER_DELIVERY_OBSERVE_ENABLED` keeps intake, scope staging, and the exact human
+scope approval observation while disabling worker launch. `JIRA_WORKER_DELIVERY_HANDOFF_ENABLED`
+selects handoff mode: at the launch point Switch writes one durable handoff record and one
+ticket-room line for fix-flow, adds the configured fix-flow identities to the room, and stops.
+`JIRA_WORKER_DELIVERY_HANDOFF_AGENTS` and `JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE`
+configure those identities and the room line text. Delivery mode stays available behind
+`JIRA_WORKER_DELIVERY_EXECUTION_ENABLED`.
 Startup refuses fixture packs, missing policies, mismatched runtime pins, or invalid role prices.
 Direct scheduler callers must still supply their factory explicitly.
 See [local live setup](../../../../docs/jira-delivery-pilot/local-setup.md) for configuration.

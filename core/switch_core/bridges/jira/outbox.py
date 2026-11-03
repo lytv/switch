@@ -38,6 +38,7 @@ _ACTIVE = ("pending", "claimed", "sending")
 WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
 INTAKE_QUESTION_COMMAND = "intake_question"
 WAIT_REMINDER_COMMAND = "wait_reminder"
+HANDOFF_COMMAND = "handoff"
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -885,7 +886,10 @@ class JiraOutboxSender:
     async def _send_switch_notice(
         self, session: AsyncSession, row: JiraWorkerOutbox
     ) -> None:
-        if row.command != "wrong_place_notice" or self._rooms is None:
+        if (
+            row.command not in {"wrong_place_notice", HANDOFF_COMMAND}
+            or self._rooms is None
+        ):
             raise ValueError("Switch notice sender requires ticket rooms")
         if row.status == "sending":
             row.status = "uncertain"

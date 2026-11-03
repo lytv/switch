@@ -1146,7 +1146,7 @@ class LiveAdmission:
 def build_delivery_factory(
     *, session_factory: async_sessionmaker[AsyncSession], config: SwitchConfig
 ) -> Callable[[TicketActivity], DeliverySupervisor] | None:
-    if not config.jira_worker_delivery_execution_enabled:
+    if not config.jira_worker_delivery_observe_active:
         return None
     runtime = runtime_config(config)
     policies = load_policies(config, runtime)

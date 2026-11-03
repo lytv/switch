@@ -239,7 +239,29 @@ class SwitchConfig(BaseSettings):
     # JIRA_WORKER_ENABLED_PROJECTS='{"acme":["KAN"]}'.
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
+    # Intake/observe capability: admission, scope staging, and the human scope
+    # approval observation. Delivery and handoff modes both require it, so
+    # `observe_active` below also treats either mode as observing.
+    jira_worker_delivery_observe_enabled: bool = False
+    # Launch capability: Switch launches its own delivery workers (delivery
+    # mode). Off in handoff mode and observe-only mode.
     jira_worker_delivery_execution_enabled: bool = False
+    # Handoff mode: at the launch point, write one durable handoff record and
+    # one ticket-room line for fix-flow instead of launching Switch's workers.
+    jira_worker_delivery_handoff_enabled: bool = False
+    # Fix-flow Switch identities added to the ticket room at handoff.
+    jira_worker_delivery_handoff_agents: tuple[str, ...] = (
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    )
+    # Fixed ticket-room line posted at handoff. {issue_key} and {handoff_id}
+    # are replaced with the ticket key and the durable handoff key.
+    jira_worker_delivery_handoff_room_line: str = (
+        "fix-flow: {issue_key} scope approved; Switch stops here and hands "
+        "off delivery (handoff {handoff_id})."
+    )
     jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0", "2.0.0-deepseek"] = (
         "2.0.0-draft"
     )
@@ -451,6 +473,15 @@ class SwitchConfig(BaseSettings):
             self.gateway_oidc_issuer_url
             and self.gateway_oidc_client_id
             and self.gateway_oidc_client_secret
+        )
+
+    @property
+    def jira_worker_delivery_observe_active(self) -> bool:
+        """Intake/observe runs when delivery, handoff, or observe-only is on."""
+        return (
+            self.jira_worker_delivery_observe_enabled
+            or self.jira_worker_delivery_execution_enabled
+            or self.jira_worker_delivery_handoff_enabled
         )
 
     @property
