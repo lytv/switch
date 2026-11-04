@@ -38,7 +38,7 @@ from switch_core.bridges.jira.observe import (
 )
 from switch_core.bridges.jira.outbox import (
     HANDOFF_COMMAND,
-    _handoff_fences,
+    _has_handoff,
     enqueue_jira_command,
     park_ticket,
 )
@@ -675,12 +675,10 @@ class DeliverySupervisor:
                 and not active
             ):
                 return
-            if not active and await _handoff_fences(
+            if not active and await _has_handoff(
                 session,
                 instance=ticket.instance,
                 issue_key=ticket.issue_key,
-                generation=ticket.agent_generation,
-                scope_digest=digest(state.scope),
             ):
                 return
             if state.question is not None:

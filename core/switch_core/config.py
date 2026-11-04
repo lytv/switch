@@ -467,6 +467,27 @@ class SwitchConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_handoff(self) -> "SwitchConfig":
+        if "{handoff_id}" not in self.jira_worker_delivery_handoff_room_line:
+            raise ValueError(
+                "JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE must contain "
+                "{handoff_id} so recovery identifies notices by handoff."
+            )
+        if self.jira_worker_delivery_handoff_enabled:
+            agents = self.jira_worker_delivery_handoff_agents
+            if (
+                len(agents) != 4
+                or len(set(agents)) != 4
+                or any(not agent.strip() for agent in agents)
+            ):
+                raise ValueError(
+                    "JIRA_WORKER_DELIVERY_HANDOFF_AGENTS must hold exactly four "
+                    "non-empty distinct identities for fix-flow, fix-dev, "
+                    "fix-review and fix-qa."
+                )
+        return self
+
     @property
     def gateway_oidc_enabled(self) -> bool:
         return bool(

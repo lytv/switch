@@ -12,6 +12,8 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from switch_core.bridges.jira.activity import TicketActivity, TicketTurn
@@ -32,6 +34,7 @@ from switch_core.bridges.jira.delivery import (
     role_job,
     stage_scope,
 )
+from switch_core.bridges.jira.contracts import Meter
 from switch_core.bridges.jira.delivery_contracts import (
     ApprovalRoute,
     ApprovedCheck,
@@ -51,10 +54,16 @@ from switch_core.bridges.jira.firstmate_copy import (
     SecretGuard,
     TaskObservation,
 )
-from switch_core.bridges.jira.firstmate_jobs import FirstmateJobs
+from switch_core.bridges.jira.firstmate_jobs import Execution, FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
 from switch_core.bridges.jira.admin import release_parked_ticket
 from switch_core.bridges.jira.intake import IntakeOrchestrator
+from switch_core.bridges.jira.model_gateway import (
+    DeliveryModelGateway,
+    model_capability,
+    model_identity,
+)
+from switch_core.bridges.jira.model_upstream import model_prices
 from switch_core.bridges.jira.outbox import (
     HANDOFF_COMMAND,
     JiraOutboxSender,
@@ -75,7 +84,11 @@ from switch_core.bridges.jira.target import (
     reset_delivery_scope,
 )
 from switch_core.bridges.jira.worker import JiraWorkerScheduler
-from switch_core.config import JiraWorkerLanguagePricing
+from switch_core.config import (
+    JiraWorkerDeliveryUpstream,
+    JiraWorkerLanguagePricing,
+    JiraWorkerModelPrices,
+)
 from switch_core.db.models import (
     JiraWorkerJob,
     JiraWorkerOutbox,
@@ -2640,3 +2653,241 @@ async def test_delivery_mode_still_launches_workers(session_factory):
     jira = DeliveryJira()
     _, _, process, _, _ = await candidate(session_factory, jira)
     assert process.starts == ["ticket/1/reproduce/1", "ticket/1/fix/1"]
+
+
+async def test_revised_generation_never_launches_in_delivery_mode(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = _handoff_rooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    assert len(await _handoff_rows(session_factory)) == 1
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.agent_generation = 3
+        pack = load_pack(config())
+        _, scope3, gate3 = _scope_for(pack, generation=3)
+        state = delivery_state(ticket)
+        assert state is not None and state.scope is not None
+        assert digest(scope3) != digest(state.scope)
+        replace_state(
+            ticket,
+            state,
+            scope=scope3.model_dump(mode="json"),
+            gate=gate3.model_dump(mode="json"),
+        )
+        await session.commit()
+    _, delivery_supervisor, delivery_process, _, _ = services(
+        session_factory, jira, handoff=False, rooms=rooms
+    )
+    await delivery_supervisor.reconcile("ticket")
+    assert delivery_process.starts == []
+    assert len(await _handoff_rows(session_factory)) == 1
+
+
+async def test_model_gateway_keeps_existing_execution_without_execution_mode(
+    session_factory, monkeypatch
+):
+    scope = await seed(session_factory)
+    rooms = _handoff_rooms()
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.room_id = "room-1"
+        await session.commit()
+    jira = DeliveryJira()
+    _, supervisor, process, _, _ = services(session_factory, jira, rooms=rooms)
+    jira.approve()
+    await supervisor.reconcile("ticket")
+    assert process.starts == [scope.job.run.execution_key]
+    provider_name = load_pack(config()).snapshot.provider
+    handoff_settings = config(handoff=True).model_copy(
+        update={
+            "jira_worker_delivery_upstreams": {
+                provider_name: JiraWorkerDeliveryUpstream(
+                    base_url="https://model.example.invalid/v1",
+                    api_key="placeholder-model",
+                    prices=JiraWorkerModelPrices(
+                        input=Decimal("0.000002"),
+                        output=Decimal("0.000008"),
+                        cache_read=Decimal("0.0000005"),
+                        cache_write=Decimal("0.000002"),
+                        source="fixture-prices",
+                    ),
+                )
+            }
+        }
+    )
+    _, handoff_supervisor, _, _, _ = services(
+        session_factory, jira, handoff=True, process=process, rooms=rooms
+    )
+    await handoff_supervisor.reconcile("ticket")
+    assert await _handoff_rows(session_factory) == []
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(JiraWorkerJob).where(
+                JiraWorkerJob.execution_key == scope.job.run.execution_key
+            )
+        )
+        assert row is not None and row.status == "running"
+        execution = Execution.model_validate_json(json.dumps(row.payload))
+        row.payload = execution.model_copy(
+            update={
+                "meter": Meter(
+                    prices=model_prices(handoff_settings, execution.pack)
+                ),
+                "model_identity": model_identity(scope.job),
+            }
+        ).model_dump(mode="json")
+        await session.commit()
+
+    async def provider(request):
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "completion",
+                "created": 1,
+                "model": body["model"],
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "Checked"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 10,
+                    "total_tokens": 40,
+                },
+            },
+        )
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "switch_core.bridges.jira.model_gateway.httpx.AsyncClient",
+        lambda **kwargs: original_client(
+            transport=httpx.MockTransport(provider), **kwargs
+        ),
+    )
+    app = FastAPI()
+    app.include_router(DeliveryModelGateway(session_factory, handoff_settings).router)
+    identity = model_identity(scope.job)
+    endpoint = f"/integrations/jira/delivery/model/{identity}/v1/chat/completions"
+    headers = {
+        "authorization": "Bearer " + model_capability(handoff_settings, identity)
+    }
+    pack = load_pack(config())
+    body = {
+        "model": pack.snapshot.model,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    async with original_client(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(endpoint, json=body, headers=headers)
+        assert response.status_code == 200
+        unknown_identity = "0" * 64
+        unknown = await client.post(
+            f"/integrations/jira/delivery/model/{unknown_identity}/v1/chat/completions",
+            json=body,
+            headers={
+                "authorization": "Bearer "
+                + model_capability(handoff_settings, unknown_identity)
+            },
+        )
+        assert unknown.status_code == 403
+
+
+async def test_handoff_recovery_matches_handoff_id_not_body(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+    assert process.starts == []
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket", with_for_update=True)
+        ticket.agent_generation = 2
+        first = rows[0].payload
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                instance="acme",
+                issue_key="TEST-1",
+                command_key="handoff:ticket/2",
+                command=HANDOFF_COMMAND,
+                status="sending",
+                payload={
+                    **first,
+                    "data": first["data"],
+                    "handoff": {
+                        **first["handoff"],
+                        "generation": 2,
+                        "handoff_id": "ticket/2",
+                    },
+                },
+                due_at=NOW,
+            )
+        )
+        await session.commit()
+    await sender.run_once()
+    assert len(rooms.notices) == 2
+    assert rooms.notices[1] == ("room-1", rows[0].payload["data"])
+    async with session_factory() as session:
+        retried = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command_key == "handoff:ticket/2"
+            )
+        )
+        assert retried is not None and retried.status == "done"
+
+
+def test_handoff_room_line_requires_handoff_id():
+    with pytest.raises(ValidationError, match="handoff_id"):
+        _config(jira_worker_delivery_handoff_room_line="fixed line without binding")
+
+
+@pytest.mark.parametrize(
+    "agents",
+    [
+        [],
+        ["fix-flow"],
+        ["fix-flow", "fix-dev", "fix-review", "fix-flow"],
+        ["", "fix-dev", "fix-review", "fix-qa"],
+        ["fix-flow", "fix-dev", "fix-review", "fix-qa", "extra"],
+    ],
+)
+def test_handoff_agents_require_four_distinct_identities(agents):
+    with pytest.raises(ValidationError, match="HANDOFF_AGENTS"):
+        _config(
+            jira_worker_delivery_handoff_enabled=True,
+            jira_worker_delivery_handoff_agents=agents,
+        )
+
+
+def test_handoff_agents_default_accepted():
+    settings = _config(jira_worker_delivery_handoff_enabled=True)
+    assert tuple(settings.jira_worker_delivery_handoff_agents) == (
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    )
+    _config(jira_worker_delivery_handoff_agents=[])

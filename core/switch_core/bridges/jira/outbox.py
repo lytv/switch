@@ -89,6 +89,18 @@ async def _handoff_fences(
     return scope_digest is not None and scope_digest == latest_digest
 
 
+async def _has_handoff(session: AsyncSession, *, instance: str, issue_key: str) -> bool:
+    return await session.scalar(
+        select(JiraWorkerOutbox.id)
+        .where(
+            JiraWorkerOutbox.instance == instance,
+            JiraWorkerOutbox.issue_key == issue_key,
+            JiraWorkerOutbox.command == HANDOFF_COMMAND,
+        )
+        .limit(1)
+    ) is not None
+
+
 def _validate_command(command: str, data: Any) -> None:
     if command == "transition_by_id":
         ExactTransition.model_validate_json(json.dumps(data))
@@ -989,7 +1001,9 @@ class JiraOutboxSender:
             row.error = None
         await session.commit()
 
-    async def _handoff_notice_posted(self, *, room_id: str, body: str) -> bool | None:
+    async def _handoff_notice_posted(
+        self, *, room_id: str, handoff_id: str
+    ) -> bool | None:
         rooms = self._rooms
         if rooms is None:
             return None
@@ -1002,8 +1016,20 @@ class JiraOutboxSender:
                         group.get("root"),
                         *group.get("replies", []),
                     ):
-                        if isinstance(message, dict) and message.get("body") == body:
-                            return True
+                        body = (
+                            message.get("body") if isinstance(message, dict) else None
+                        )
+                        if not isinstance(body, str):
+                            continue
+                        start = 0
+                        while True:
+                            found = body.find(handoff_id, start)
+                            if found < 0:
+                                break
+                            after = found + len(handoff_id)
+                            if after >= len(body) or not body[after].isdigit():
+                                return True
+                            start = after
                 if not page["truncated"]:
                     return False
                 if page["next_seq"] == after_seq:
@@ -1030,8 +1056,12 @@ class JiraOutboxSender:
                     payload["room_id"], agent_name=agent
                 )
             if row.status != "pending":
+                handoff = payload.get("handoff") or {}
+                handoff_id = handoff.get("handoff_id")
+                if not isinstance(handoff_id, str) or not handoff_id:
+                    handoff_id = row.command_key.removeprefix("handoff:")
                 posted = await self._handoff_notice_posted(
-                    room_id=payload["room_id"], body=payload["data"]
+                    room_id=payload["room_id"], handoff_id=handoff_id
                 )
                 if posted is None:
                     row.status = "uncertain"

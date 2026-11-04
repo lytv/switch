@@ -178,7 +178,9 @@ scope approval observation while disabling worker launch. `JIRA_WORKER_DELIVERY_
 selects handoff mode: at the launch point Switch writes one durable handoff record and one
 ticket-room line for fix-flow, adds the configured fix-flow identities to the room, and stops.
 `JIRA_WORKER_DELIVERY_HANDOFF_AGENTS` and `JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE`
-configure those identities and the room line text. Delivery mode stays available behind
+configure those identities and the room line text. The room line must contain `{handoff_id}`
+so recovery identifies notices by handoff, and handoff mode refuses to start unless the
+agents hold exactly four non-empty distinct identities. Delivery mode stays available behind
 `JIRA_WORKER_DELIVERY_EXECUTION_ENABLED`.
 Startup refuses fixture packs, missing policies, mismatched runtime pins, or invalid role prices.
 Direct scheduler callers must still supply their factory explicitly.
