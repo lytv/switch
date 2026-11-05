@@ -2972,6 +2972,8 @@ async def test_handoff_recovery_refuses_empty_membership_identities(session_fact
         "@fix-flow: {unknown_field} broke",
         "@fix-flow: {} broke",
         "HANDOFF: @fix-flow {issue_key} without binding",
+        "@fix-flow {handoff_id:.11} truncated",
+        "@fix-flow {handoff_id!r} converted",
     ],
 )
 def test_handoff_room_line_rejects_placeholders_without_handoff_id(line):
@@ -3037,3 +3039,42 @@ async def test_handoff_recovery_recognizes_dash_joined_binding(session_factory):
             )
         )
         assert row is not None and row.status == "done"
+
+
+async def test_handoff_recovery_ignores_longer_worker_identifier(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    handoff_id = rows[0].payload["handoff"]["handoff_id"]
+    rooms.messages.append(
+        {
+            "id": "card-1",
+            "kind": "message",
+            "sender": "jira-agent",
+            "body": f"Ticket card [{handoff_id}/browser] Which browser shows it?",
+            "timestamp": 1,
+        }
+    )
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        row.status = "sending"
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert process.starts == []

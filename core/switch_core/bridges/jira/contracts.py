@@ -361,20 +361,3 @@ def digest(value: Contract) -> str:
         value.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def handoff_id_mentioned(body: str, handoff_id: str) -> bool:
-    if not handoff_id:
-        return False
-    start = 0
-    while True:
-        found = body.find(handoff_id, start)
-        if found < 0:
-            return False
-        before = body[found - 1] if found > 0 else ""
-        after = found + len(handoff_id)
-        if not (before and (before.isalnum() or before == "/")) and (
-            after >= len(body) or not body[after].isalnum()
-        ):
-            return True
-        start = after

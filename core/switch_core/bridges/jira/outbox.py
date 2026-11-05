@@ -22,7 +22,7 @@ from sqlalchemy import and_, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from switch_core.bridges.jira.contracts import digest, handoff_id_mentioned
+from switch_core.bridges.jira.contracts import digest
 from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
@@ -1006,7 +1006,7 @@ class JiraOutboxSender:
         await session.commit()
 
     async def _handoff_notice_posted(
-        self, *, room_id: str, handoff_id: str
+        self, *, room_id: str, body: str, handoff_id: str
     ) -> bool | None:
         rooms = self._rooms
         if rooms is None:
@@ -1020,7 +1020,7 @@ class JiraOutboxSender:
                         group.get("root"),
                         *group.get("replies", []),
                     ):
-                        body = (
+                        message_body = (
                             message.get("body") if isinstance(message, dict) else None
                         )
                         sender = (
@@ -1028,13 +1028,13 @@ class JiraOutboxSender:
                             if isinstance(message, dict)
                             else None
                         )
-                        if not isinstance(body, str):
+                        if not isinstance(message_body, str):
                             continue
                         if not isinstance(sender, str) or not await rooms.is_worker_sender(
                             sender
                         ):
                             continue
-                        if handoff_id_mentioned(body, handoff_id):
+                        if message_body == body and handoff_id in message_body:
                             return True
                 if not page["truncated"]:
                     return False
@@ -1077,7 +1077,9 @@ class JiraOutboxSender:
                 if not isinstance(handoff_id, str) or not handoff_id:
                     handoff_id = row.command_key.removeprefix("handoff:")
                 posted = await self._handoff_notice_posted(
-                    room_id=payload["room_id"], handoff_id=handoff_id
+                    room_id=payload["room_id"],
+                    body=payload["data"],
+                    handoff_id=handoff_id,
                 )
                 if posted is None:
                     row.status = "uncertain"
