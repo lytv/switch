@@ -15,7 +15,11 @@ from switch_core.bridges.jira.admin import _cancel_wait_commands
 from switch_core.bridges.jira.commands import enqueue_ticket_command
 from switch_core.bridges.jira.contracts import Answer
 from switch_core.bridges.jira.delivery import replace_state
-from switch_core.bridges.jira.outbox import INTAKE_QUESTION_COMMAND, park_ticket
+from switch_core.bridges.jira.outbox import (
+    INTAKE_QUESTION_COMMAND,
+    _has_handoff,
+    park_ticket,
+)
 from switch_core.bridges.jira.parse import _plain_text
 from switch_core.bridges.jira.target import delivery_state, reset_delivery_scope
 from switch_core.config import SwitchConfig
@@ -85,6 +89,11 @@ async def relay_question(
         ):
             return TurnResult(decision.tokens_used, None)
         state = current
+        if await _has_handoff(
+            session, instance=ticket.instance, issue_key=ticket.issue_key
+        ):
+            if decision.action != "scope_change":
+                return TurnResult(decision.tokens_used, None)
         key = f"delivery-question:{question.run.execution_key}:{question.id}"
 
         async def queue(

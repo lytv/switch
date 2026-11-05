@@ -33,6 +33,8 @@ from switch_core.bridges.jira.outbox import (
     TURN_FAILED,
     WAIT_COMMAND_PREFIXES,
     WAIT_REMINDER_COMMAND,
+    _handoff_fences,
+    _ticket_scope_digest,
     enqueue_jira_command,
     needs_person,
     read_jira_version,
@@ -1122,6 +1124,14 @@ async def wait_send_cancelled(
     session: AsyncSession, ticket: JiraWorkerTicket, config: SwitchConfig
 ) -> bool:
     """True when a queued wait reminder or Blocked must not be sent."""
+    if await _handoff_fences(
+        session,
+        instance=ticket.instance,
+        issue_key=ticket.issue_key,
+        generation=ticket.agent_generation,
+        scope_digest=_ticket_scope_digest(ticket),
+    ):
+        return True
     statuses = config.jira_worker_statuses
     if ticket.status not in (statuses.waiting_for_input, statuses.waiting_for_approval):
         return True
@@ -1256,6 +1266,17 @@ async def _apply_wait(
     reasons: dict[str, str],
 ) -> None:
     delivery = delivery_state(ticket)
+    if await _handoff_fences(
+        session,
+        instance=ticket.instance,
+        issue_key=ticket.issue_key,
+        generation=ticket.agent_generation,
+        scope_digest=_ticket_scope_digest(ticket),
+    ):
+        ticket.wait_anchor = None
+        ticket.wait_fired = None
+        await _cancel_wait_commands(session, ticket)
+        return
     if (
         delivery is not None
         and delivery.question is not None

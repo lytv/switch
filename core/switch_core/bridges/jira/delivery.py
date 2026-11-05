@@ -8,7 +8,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from switch_core.bridges.jira.accounting import CapacityUnavailable
 from switch_core.bridges.jira.commands import enqueue_ticket_command
@@ -35,7 +36,12 @@ from switch_core.bridges.jira.observe import (
     comment_actor,
     observe_jira,
 )
-from switch_core.bridges.jira.outbox import enqueue_jira_command, park_ticket
+from switch_core.bridges.jira.outbox import (
+    HANDOFF_COMMAND,
+    _has_handoff,
+    enqueue_jira_command,
+    park_ticket,
+)
 from switch_core.bridges.jira.publisher import delivery_lock
 from switch_core.bridges.jira.state import DeliveryWorkflowState
 from switch_core.bridges.jira.target import delivery_state
@@ -627,7 +633,7 @@ class DeliverySupervisor:
                 ).all()
             )
             enabled = (
-                self._config.jira_worker_delivery_execution_enabled
+                self._config.jira_worker_delivery_observe_active
                 and ticket.project_key
                 in self._config.jira_worker_delivery_projects.get(ticket.instance, {})
                 and ticket.project_key
@@ -661,6 +667,17 @@ class DeliverySupervisor:
             ):
                 return
             scope = state.scope
+            if self._config.jira_worker_delivery_handoff_enabled and not active:
+                await self._handoff(ticket_id)
+                return
+            if not self._config.jira_worker_delivery_execution_enabled and not active:
+                return
+            if not active and await _has_handoff(
+                session,
+                instance=ticket.instance,
+                issue_key=ticket.issue_key,
+            ):
+                return
             if state.question is not None:
                 if (
                     state.answer is None
@@ -844,6 +861,127 @@ class DeliverySupervisor:
             except ValueError as exc:
                 park_ticket(ticket, str(exc))
             await session.commit()
+
+    async def _handoff(self, ticket_id: str) -> None:
+        """Write one durable handoff record and one ticket-room line, then stop.
+
+        Keyed by ticket and generation, so a retry or restart never posts a
+        second handoff and never reaches the launch branch. A revised scope
+        bumps the generation and produces a new key; a rejected scope never
+        leaves ``approve_scope`` and produces no record at all. The durable
+        write holds the per-ticket sender lock, so a claimed Jira write
+        either crosses before the handoff commits or is fenced after it.
+        """
+        async with self._sessions() as session:
+            ticket = await session.get(JiraWorkerTicket, ticket_id)
+            if ticket is None:
+                return
+            lock_key = f"jira-outbox:{ticket.instance}:{ticket.issue_key}"
+        engine = cast(AsyncEngine, self._sessions.kw["bind"])
+        async with engine.connect() as connection:
+            try:
+                locked = await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:key, 0))"),
+                    {"key": lock_key},
+                )
+            except BaseException:
+                await connection.invalidate()
+                raise
+            if not locked:
+                return
+            try:
+                await connection.commit()
+                async with self._sessions(bind=connection) as session:
+                    handoff = await self._handoff_locked(session, ticket_id)
+            finally:
+                try:
+                    await connection.rollback()
+                    await connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"),
+                        {"key": lock_key},
+                    )
+                    await connection.commit()
+                except BaseException:
+                    await connection.invalidate()
+                    raise
+        if handoff is None:
+            return
+        room_id, agents = handoff
+        rooms = self._activity.rooms
+        if rooms is not None:
+            for agent in agents:
+                await rooms.ensure_agent_member(room_id, agent_name=agent)
+
+    async def _handoff_locked(
+        self, session: AsyncSession, ticket_id: str
+    ) -> tuple[str, tuple[str, ...]] | None:
+        ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
+        if ticket is None or ticket.worker_parked_reason or ticket.room_id is None:
+            return None
+        state = delivery_state(ticket)
+        if (
+            state is None
+            or state.scope is None
+            or not state.approvals
+            or state.step in {"intake", "approve_scope", "manual_handoff"}
+        ):
+            return None
+        handoff_id = f"{ticket.id}/{ticket.agent_generation}"
+        command_key = f"handoff:{handoff_id}"
+        room_id = ticket.room_id
+        agents = tuple(self._config.jira_worker_delivery_handoff_agents)
+        running = await session.scalar(
+            select(JiraWorkerJob.execution_key)
+            .where(
+                JiraWorkerJob.ticket_id == ticket_id,
+                JiraWorkerJob.kind == "role_job",
+                JiraWorkerJob.status.in_(
+                    ("claimed", "running", "uncertain", "cancel_requested")
+                ),
+            )
+            .limit(1)
+        )
+        if running is not None:
+            return None
+        existing = await session.scalar(
+            select(JiraWorkerOutbox.id).where(
+                JiraWorkerOutbox.instance == ticket.instance,
+                JiraWorkerOutbox.command_key == command_key,
+            )
+        )
+        if existing is None:
+            approval = state.approvals[0]
+            body = self._config.jira_worker_delivery_handoff_room_line.format(
+                issue_key=ticket.issue_key, handoff_id=handoff_id
+            )
+            command_id = await enqueue_ticket_command(
+                session,
+                config=self._config,
+                ticket=ticket,
+                command_key=command_key,
+                channel="switch",
+                command=HANDOFF_COMMAND,
+                body=body,
+                predecessor=None,
+                now=self._clock(),
+            )
+            row = await session.get(JiraWorkerOutbox, command_id)
+            assert row is not None
+            row.payload = {
+                **(row.payload or {}),
+                "handoff": {
+                    "ticket_id": ticket.id,
+                    "generation": ticket.agent_generation,
+                    "handoff_id": handoff_id,
+                    "approval_history_id": approval.history_id,
+                    "gate_id": approval.gate.id,
+                    "scope_digest": digest(state.scope),
+                    "jira_updated": ticket.jira_read_updated,
+                    "jira_changelog_id": ticket.jira_read_changelog_id,
+                },
+            }
+            await session.commit()
+        return room_id, agents
 
     async def _progress(
         self, ticket_id: str, evidence: Handoff | None, job: Job

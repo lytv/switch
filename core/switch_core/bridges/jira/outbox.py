@@ -38,6 +38,68 @@ _ACTIVE = ("pending", "claimed", "sending")
 WAIT_COMMAND_PREFIXES = ("wait-reminder:", "wait-blocked:")
 INTAKE_QUESTION_COMMAND = "intake_question"
 WAIT_REMINDER_COMMAND = "wait_reminder"
+HANDOFF_COMMAND = "handoff"
+
+
+def _ticket_scope_digest(ticket: JiraWorkerTicket) -> str | None:
+    try:
+        state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
+    except Exception:
+        return None
+    if not isinstance(state, DeliveryWorkflowState) or state.scope is None:
+        return None
+    return digest(state.scope)
+
+
+async def _handoff_fences(
+    session: AsyncSession,
+    *,
+    instance: str,
+    issue_key: str,
+    generation: int,
+    scope_digest: str | None,
+) -> bool:
+    handoffs: dict[int, Any] = {}
+    for payload in (
+        await session.scalars(
+            select(JiraWorkerOutbox.payload).where(
+                JiraWorkerOutbox.instance == instance,
+                JiraWorkerOutbox.issue_key == issue_key,
+                JiraWorkerOutbox.command == HANDOFF_COMMAND,
+            )
+        )
+    ).all():
+        handoff = (payload or {}).get("handoff", {})
+        handoff_generation = handoff.get("generation")
+        if not isinstance(handoff_generation, int) or isinstance(
+            handoff_generation, bool
+        ):
+            return True
+        handoffs[handoff_generation] = handoff.get("scope_digest")
+    if not handoffs:
+        return False
+    latest = max(handoffs)
+    if generation <= latest:
+        return True
+    latest_digest = handoffs[latest]
+    if not isinstance(latest_digest, str):
+        return True
+    return scope_digest is not None and scope_digest == latest_digest
+
+
+async def _has_handoff(session: AsyncSession, *, instance: str, issue_key: str) -> bool:
+    return (
+        await session.scalar(
+            select(JiraWorkerOutbox.id)
+            .where(
+                JiraWorkerOutbox.instance == instance,
+                JiraWorkerOutbox.issue_key == issue_key,
+                JiraWorkerOutbox.command == HANDOFF_COMMAND,
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -149,6 +211,14 @@ async def enqueue_jira_command(
     """Enqueue once per instance/key, in the caller's transaction."""
     if ticket.project_key not in config.jira_worker_enabled_projects.get(
         ticket.instance, []
+    ):
+        return None
+    if await _handoff_fences(
+        session,
+        instance=ticket.instance,
+        issue_key=ticket.issue_key,
+        generation=ticket.agent_generation,
+        scope_digest=_ticket_scope_digest(ticket),
     ):
         return None
     if not command_key.strip():
@@ -375,12 +445,19 @@ class JiraOutboxSender:
                                             "wrong_place_notice",
                                             INTAKE_QUESTION_COMMAND,
                                             WAIT_REMINDER_COMMAND,
+                                            HANDOFF_COMMAND,
                                         )
                                     ),
                                     literal(self._rooms is not None),
                                 ),
                             ),
-                            JiraWorkerOutbox.status.in_(_ACTIVE),
+                            or_(
+                                JiraWorkerOutbox.status.in_(_ACTIVE),
+                                and_(
+                                    JiraWorkerOutbox.command == HANDOFF_COMMAND,
+                                    JiraWorkerOutbox.status == "uncertain",
+                                ),
+                            ),
                             JiraWorkerOutbox.due_at <= self._clock(),
                             or_(*scopes),
                         )
@@ -433,7 +510,16 @@ class JiraOutboxSender:
 
     async def _send_locked(self, session: AsyncSession, command_id: str) -> None:
         row = await session.get(JiraWorkerOutbox, command_id, with_for_update=True)
-        if row is None or row.status not in _ACTIVE or row.due_at > self._clock():
+        recovering = (
+            row is not None
+            and row.command == HANDOFF_COMMAND
+            and row.status == "uncertain"
+        )
+        if (
+            row is None
+            or (row.status not in _ACTIVE and not recovering)
+            or row.due_at > self._clock()
+        ):
             return
         ticket = (
             await session.scalars(
@@ -450,8 +536,28 @@ class JiraOutboxSender:
         ):
             return
         payload = row.payload or {}
-        if row.status != "sending" and (
-            "delivery_question" in payload or "delivery_progress_execution" in payload
+        if row.channel == "jira" and row.status != "sending":
+            row_generation = payload.get("intake_generation")
+            if not isinstance(row_generation, int) or isinstance(row_generation, bool):
+                row_generation = ticket.agent_generation
+            if await _handoff_fences(
+                session,
+                instance=row.instance,
+                issue_key=row.issue_key,
+                generation=row_generation,
+                scope_digest=_ticket_scope_digest(ticket),
+            ):
+                row.status = "cancelled"
+                row.error = "Ticket handed off to fix-flow; Jira writes stopped"
+                await session.commit()
+                return
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and (
+                "delivery_question" in payload
+                or "delivery_progress_execution" in payload
+            )
         ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
@@ -472,6 +578,10 @@ class JiraOutboxSender:
                         == payload["delivery_question"]
                         and (state.answer is not None) == payload["requires_answer"]
                     )
+                    if valid and await _has_handoff(
+                        session, instance=row.instance, issue_key=row.issue_key
+                    ):
+                        valid = False
                 if "delivery_progress_execution" in payload:
                     execution = await session.scalar(
                         select(JiraWorkerJob).where(
@@ -497,7 +607,11 @@ class JiraOutboxSender:
                 row.error = str(exc)
                 await session.commit()
                 return
-        if row.status != "sending" and "scope_digest" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "scope_digest" in payload
+        ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
             )
@@ -510,7 +624,11 @@ class JiraOutboxSender:
                 row.error = "Frozen delivery scope changed"
                 await session.commit()
                 return
-        if row.status != "sending" and "repository_digest" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "repository_digest" in payload
+        ):
             state = workflow_state_adapter.validate_json(
                 json.dumps(ticket.workflow_state)
             )
@@ -525,7 +643,11 @@ class JiraOutboxSender:
                 row.error = "Frozen repository confirmation changed"
                 await session.commit()
                 return
-        if row.status != "sending" and "intake_generation" in payload:
+        if (
+            row.command != HANDOFF_COMMAND
+            and row.status != "sending"
+            and "intake_generation" in payload
+        ):
             if (
                 ticket.worker_parked_reason
                 or payload["intake_generation"] != ticket.agent_generation
@@ -882,18 +1004,101 @@ class JiraOutboxSender:
             row.error = None
         await session.commit()
 
+    async def _handoff_notice_posted(
+        self, *, room_id: str, body: str, handoff_id: str
+    ) -> bool | None:
+        rooms = self._rooms
+        if rooms is None:
+            return None
+        try:
+            after_seq = 0
+            while True:
+                page = await rooms.read_context(room_id, after_seq=after_seq)
+                for group in page["threads"]:
+                    for message in (
+                        group.get("root"),
+                        *group.get("replies", []),
+                    ):
+                        message_body = (
+                            message.get("body") if isinstance(message, dict) else None
+                        )
+                        sender = (
+                            message.get("sender") if isinstance(message, dict) else None
+                        )
+                        if not isinstance(message_body, str):
+                            continue
+                        if not isinstance(
+                            sender, str
+                        ) or not await rooms.is_worker_sender(sender):
+                            continue
+                        if message_body == body and handoff_id in message_body:
+                            return True
+                if not page["truncated"]:
+                    return False
+                if page["next_seq"] == after_seq:
+                    return None
+                after_seq = page["next_seq"]
+        except Exception:
+            logger.exception("Handoff notice read-back failed for room %s", room_id)
+            return None
+
     async def _send_switch_notice(
         self, session: AsyncSession, row: JiraWorkerOutbox
     ) -> None:
-        if row.command != "wrong_place_notice" or self._rooms is None:
+        if (
+            row.command not in {"wrong_place_notice", HANDOFF_COMMAND}
+            or self._rooms is None
+        ):
             raise ValueError("Switch notice sender requires ticket rooms")
-        if row.status == "sending":
+        payload = row.payload or {}
+        if row.command == HANDOFF_COMMAND:
+            agents = self._config.jira_worker_delivery_handoff_agents
+            if (
+                len(agents) != 4
+                or len(set(agents)) != 4
+                or any(not agent.strip() for agent in agents)
+            ):
+                row.status = "uncertain"
+                row.error = "Handoff membership identities are invalid; will recheck on a later run"
+                await session.commit()
+                return
+            for agent in agents:
+                await self._rooms.ensure_agent_member(
+                    payload["room_id"], agent_name=agent
+                )
+            if row.status != "pending":
+                handoff = payload.get("handoff") or {}
+                handoff_id = handoff.get("handoff_id")
+                if not isinstance(handoff_id, str) or not handoff_id:
+                    handoff_id = (row.command_key or "").removeprefix("handoff:")
+                if not handoff_id:
+                    row.status = "uncertain"
+                    row.error = "Handoff notice identity is unknown; will recheck on a later run"
+                    await session.commit()
+                    return
+                posted = await self._handoff_notice_posted(
+                    room_id=payload["room_id"],
+                    body=payload["data"],
+                    handoff_id=handoff_id,
+                )
+                if posted is None:
+                    row.status = "uncertain"
+                    row.error = (
+                        "Room notice outcome is unknown; will recheck on a later run"
+                    )
+                    await session.commit()
+                    return
+                if posted:
+                    row.status = "done"
+                    row.error = None
+                    await session.commit()
+                    return
+        elif row.status == "sending":
             row.status = "uncertain"
             row.error = "Restart found a room notice with an unknown outcome; automatic replay is unsafe"
             logger.error("Switch notice %s: %s", row.id, row.error)
             await session.commit()
             return
-        payload = row.payload or {}
         row.status = "sending"
         row.attempts += 1
         await session.commit()
@@ -995,6 +1200,8 @@ class JiraOutboxSender:
                     else None
                 ),
             )
+            if command_id is None:
+                continue
             child = await session.get(JiraWorkerOutbox, command_id)
             assert child is not None
             child.payload = {**(child.payload or {}), "failure_of": row.id}

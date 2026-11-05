@@ -1,5 +1,6 @@
 import re
 import ssl
+import string
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -239,7 +240,29 @@ class SwitchConfig(BaseSettings):
     # JIRA_WORKER_ENABLED_PROJECTS='{"acme":["KAN"]}'.
     jira_worker_enabled_projects: dict[str, list[str]] = {}
     jira_worker_delivery_projects: dict[str, dict[str, JiraWorkerDeliveryProject]] = {}
+    # Intake/observe capability: admission, scope staging, and the human scope
+    # approval observation. Delivery and handoff modes both require it, so
+    # `observe_active` below also treats either mode as observing.
+    jira_worker_delivery_observe_enabled: bool = False
+    # Launch capability: Switch launches its own delivery workers (delivery
+    # mode). Off in handoff mode and observe-only mode.
     jira_worker_delivery_execution_enabled: bool = False
+    # Handoff mode: at the launch point, write one durable handoff record and
+    # one ticket-room line for fix-flow instead of launching Switch's workers.
+    jira_worker_delivery_handoff_enabled: bool = False
+    # Fix-flow Switch identities added to the ticket room at handoff.
+    jira_worker_delivery_handoff_agents: tuple[str, ...] = (
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    )
+    # Fixed ticket-room line posted at handoff. {issue_key} and {handoff_id}
+    # are replaced with the ticket key and the durable handoff key.
+    jira_worker_delivery_handoff_room_line: str = (
+        "@fix-flow: {issue_key} scope approved; Switch stops here and hands "
+        "off delivery (handoff {handoff_id})."
+    )
     jira_worker_delivery_pack: Literal["2.0.0-draft", "2.0.0", "2.0.0-deepseek"] = (
         "2.0.0-draft"
     )
@@ -445,12 +468,56 @@ class SwitchConfig(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_handoff(self) -> "SwitchConfig":
+        fields = [
+            (name, spec, conversion)
+            for _, name, spec, conversion in string.Formatter().parse(
+                self.jira_worker_delivery_handoff_room_line
+            )
+            if name is not None
+        ]
+        if not any(
+            name == "handoff_id" and not spec and conversion is None
+            for name, spec, conversion in fields
+        ) or any(
+            name not in ("handoff_id", "issue_key") or spec or conversion is not None
+            for name, spec, conversion in fields
+        ):
+            raise ValueError(
+                "JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE must contain an "
+                "unmodified {handoff_id} so recovery identifies notices by "
+                "handoff; only {issue_key} and {handoff_id} are allowed."
+            )
+        if self.jira_worker_delivery_handoff_enabled:
+            agents = self.jira_worker_delivery_handoff_agents
+            if (
+                len(agents) != 4
+                or len(set(agents)) != 4
+                or any(not agent.strip() for agent in agents)
+            ):
+                raise ValueError(
+                    "JIRA_WORKER_DELIVERY_HANDOFF_AGENTS must hold exactly four "
+                    "non-empty distinct identities for fix-flow, fix-dev, "
+                    "fix-review and fix-qa."
+                )
+        return self
+
     @property
     def gateway_oidc_enabled(self) -> bool:
         return bool(
             self.gateway_oidc_issuer_url
             and self.gateway_oidc_client_id
             and self.gateway_oidc_client_secret
+        )
+
+    @property
+    def jira_worker_delivery_observe_active(self) -> bool:
+        """Intake/observe runs when delivery, handoff, or observe-only is on."""
+        return (
+            self.jira_worker_delivery_observe_enabled
+            or self.jira_worker_delivery_execution_enabled
+            or self.jira_worker_delivery_handoff_enabled
         )
 
     @property

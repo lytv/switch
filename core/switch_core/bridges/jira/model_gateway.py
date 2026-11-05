@@ -197,7 +197,7 @@ class DeliveryModelGateway:
                 or state is None
                 or state.step != execution.contract.run.step
                 or not state.approvals
-                or not config.jira_worker_delivery_execution_enabled
+                or not config.jira_worker_delivery_observe_active
                 or ticket.project_key
                 not in config.jira_worker_enabled_projects.get(ticket.instance, [])
                 or ticket.project_key
