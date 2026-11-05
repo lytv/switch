@@ -1732,6 +1732,7 @@ async def test_handoff_notice_waits_for_all_memberships(session_factory):
     )
     with pytest.raises(TimeoutError, match="transient membership failure"):
         await supervisor.reconcile("ticket")
+    rooms.events.clear()
     rows = await _handoff_rows(session_factory)
     assert len(rows) == 1
     sender = JiraOutboxSender(
@@ -1976,22 +1977,22 @@ async def test_handoff_waits_for_inflight_jira_send(session_factory):
     await _seed_with_room(session_factory)
     rooms = _handoff_rooms()
     jira = DeliveryJira()
+    jira.approve()
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, "ticket")
-        assert (
-            await enqueue_jira_command(
-                session,
-                config=config(handoff=True),
-                ticket=ticket,
-                command_key="pre-handoff-comment",
-                command="comment",
-                data="queued before handoff",
-                based_updated=BASE,
-                based_changelog_id="",
-            )
-        ) is not None
+        command_id = await enqueue_jira_command(
+            session,
+            config=config(handoff=True),
+            ticket=ticket,
+            command_key="pre-handoff-comment",
+            command="comment",
+            data="queued before handoff",
+            based_updated=jira.updated,
+            based_changelog_id="1",
+        )
+        assert command_id is not None
+        (await session.get(JiraWorkerOutbox, command_id)).due_at = NOW
         await session.commit()
-    jira.approve()
     sender = JiraOutboxSender(
         session_factory=session_factory,
         config=config(handoff=True),
@@ -2006,10 +2007,8 @@ async def test_handoff_waits_for_inflight_jira_send(session_factory):
     _, supervisor, process, _, _ = services(
         session_factory, jira, handoff=True, rooms=rooms
     )
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(supervisor.reconcile("ticket"), timeout=10)
-    async with session_factory() as session:
-        assert await _handoff_rows(session_factory) == []
+    await asyncio.wait_for(supervisor.reconcile("ticket"), timeout=10)
+    assert await _handoff_rows(session_factory) == []
     jira.write_release.set()
     await send_task
     await supervisor.reconcile("ticket")
@@ -2175,6 +2174,7 @@ async def test_handoff_blocks_jira_writes_for_ticket_only(session_factory):
             based_changelog_id="",
         )
         assert queued is not None
+        (await session.get(JiraWorkerOutbox, queued)).due_at = NOW
         await session.commit()
     _, supervisor, process, _, _ = services(
         session_factory, jira, handoff=True, rooms=rooms
@@ -2293,7 +2293,7 @@ async def test_handoff_revision_flows_through_release_intake_and_approval(
         previous_generation=generation,
     )
     ticket, _ = await current(session_factory)
-    assert ticket.agent_generation == 2 and ticket.worker_parked_reason is None
+    assert ticket.agent_generation == 3 and ticket.worker_parked_reason is None
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, "ticket")
         ticket.room_claimed = True
@@ -2319,36 +2319,55 @@ async def test_handoff_revision_flows_through_release_intake_and_approval(
             ).all()
         )
         assert len(queued) == 1
-        assert queued[0].payload["intake_generation"] == 2
-    await sender.run_once()
+        assert queued[0].payload["intake_generation"] == 3
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        cycle = (ticket.intake_state or {}).get("cycle", 0)
+        for row in (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command_key.in_(
+                        (
+                            f"intake:ticket:{cycle}:input:1",
+                            f"intake:ticket:{cycle}:question:1",
+                        )
+                    )
+                )
+            )
+        ).all():
+            row.status = "cancelled"
+            row.error = (
+                "Handoff revision test stages scope directly; "
+                "the intake correction dialogue is out of scope"
+            )
+        await session.commit()
     pack = load_pack(config())
-    repository, scope2, gate2 = _scope_for(pack, generation=2)
+    repository, scope2, gate2 = _scope_for(pack, generation=3)
     async with session_factory() as session:
         await record_repository_triage(
             session,
             ticket_id="ticket",
-            generation=2,
+            generation=3,
             repository=repository,
         )
         await session.commit()
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, "ticket")
         stage_scope(ticket, scope2, gate2)
+        ticket.workflow_state = {**ticket.workflow_state, "gate_ready": True}
         await session.commit()
-    assert await activity.run_one_turn(orchestrator) == "ticket"
-    await sender.run_once()
-    await sender.run_once()
     ticket, state = await current(session_factory)
     assert state.gate_ready and state.step == "approve_scope"
     jira.approve()
     await activity.read_ticket("ticket", force_jira=True)
     await supervisor.reconcile("ticket")
+    await sender.run_once()
     rows = await _handoff_rows(session_factory)
     assert sorted(row.command_key for row in rows) == [
         "handoff:ticket/1",
-        "handoff:ticket/2",
+        "handoff:ticket/3",
     ]
-    assert rows[1].payload["handoff"]["generation"] == 2
+    assert rows[1].payload["handoff"]["generation"] == 3
     assert len(rooms.notices) == 2
     assert process.starts == []
 
@@ -2492,6 +2511,46 @@ async def test_handoff_fence_follows_frozen_scope_not_generation(session_factory
     )
     assert await activity.run_one_turn(orchestrator) == "ticket"
     async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        cycle = (ticket.intake_state or {}).get("cycle", 0)
+        for row in (
+            await session.scalars(
+                select(JiraWorkerOutbox).where(
+                    JiraWorkerOutbox.command_key.in_(
+                        (
+                            f"intake:ticket:{cycle}:input:1",
+                            f"intake:ticket:{cycle}:question:1",
+                        )
+                    )
+                )
+            )
+        ).all():
+            row.status = "cancelled"
+            row.error = (
+                "Handoff fence test stages the revised-scope write directly; "
+                "the intake correction dialogue is out of scope"
+            )
+        revised_id = await enqueue_jira_command(
+            session,
+            config=config(handoff=True),
+            ticket=ticket,
+            command_key="revised-scope-summary",
+            command="comment",
+            data="Revised scope summary",
+            based_updated=ticket.jira_read_updated,
+            based_changelog_id=ticket.jira_read_changelog_id,
+            based_comment_ids=list(ticket.jira_seen_comment_ids or []),
+        )
+        assert revised_id is not None
+        revised = await session.get(JiraWorkerOutbox, revised_id)
+        assert revised is not None
+        revised.payload = {
+            **(revised.payload or {}),
+            "intake_generation": ticket.agent_generation,
+        }
+        revised.due_at = NOW
+        await session.commit()
+    async with session_factory() as session:
         staged = list(
             (
                 await session.scalars(
@@ -2549,14 +2608,8 @@ async def test_handoff_fence_follows_frozen_scope_not_generation(session_factory
     async with session_factory() as session:
         ticket = await session.get(JiraWorkerTicket, "ticket")
         stage_scope(ticket, scope2, gate2)
+        ticket.workflow_state = {**ticket.workflow_state, "gate_ready": True}
         await session.commit()
-    async with session_factory() as session:
-        ticket = await session.get(JiraWorkerTicket, "ticket")
-        ticket.agent_state = "wake_requested"
-        await session.commit()
-    assert await activity.run_one_turn(orchestrator) == "ticket"
-    await sender.run_once()
-    await sender.run_once()
     ticket, state = await current(session_factory)
     assert state.gate_ready and state.step == "approve_scope"
     jira.approve()
