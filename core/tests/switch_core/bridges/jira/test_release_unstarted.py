@@ -42,6 +42,7 @@ from tests.switch_core.bridges.jira.test_firstmate_jobs import (
     _start,
 )
 from tests.switch_core.bridges.jira.test_firstmate_jobs import lab as lab
+from tests.switch_core.bridges.jira.test_firstmate_tmux import _real_tmux_script
 from tests.switch_core.bridges.jira.test_live import live_setup as live_setup
 from tests.switch_core.bridges.jira.test_live import native_lab as native_lab
 from tests.switch_core.bridges.jira.test_outbox import JiraMock, client_for
@@ -50,8 +51,9 @@ from tests.switch_core.gateway.test_jira_release import app_for
 
 
 @pytest.mark.parametrize("human_closed", [False, True])
+@pytest.mark.parametrize("launch_brief", [False, True])
 async def test_release_unstarted_frees_capacity_without_restarting_ticket(
-    session_factory, lab, monkeypatch, human_closed
+    session_factory, lab, monkeypatch, human_closed, launch_brief
 ):
     service = _service(session_factory, lab)
     jobs = [await _job(session_factory, lab, ticket_id=str(n)) for n in range(3)]
@@ -67,6 +69,11 @@ async def test_release_unstarted_frees_capacity_without_restarting_ticket(
         home = lab.copy.location(job)
         assert (home / "data" / lab.copy.task_id(job) / "dispatch").exists()
         assert not (home / "state" / f"{lab.copy.task_id(job)}.meta").exists()
+        if launch_brief:
+            task = home / "data" / lab.copy.task_id(job)
+            (task / "launch-brief.md").write_bytes(
+                b"# Current worker role contract\n\n" + (task / "brief.md").read_bytes()
+            )
     with pytest.raises(CapacityUnavailable):
         await _start(service, jobs[2])
     monkeypatch.setattr(lab.copy, "_command", original)
@@ -155,6 +162,11 @@ async def test_release_unstarted_frees_capacity_without_restarting_ticket(
         )
     assert (await _start(service, jobs[2])).status == "running"
     assert (await service.get(jobs[0].run.execution_key)).status == "cancelled"
+    task = lab.copy.location(jobs[0]) / "data" / lab.copy.task_id(jobs[0])
+    if launch_brief:
+        assert (task / "launch-brief.md").read_bytes() == (
+            b"# Current worker role contract\n\n" + (task / "brief.md").read_bytes()
+        )
     assert not (lab.copy.location(jobs[0]) / "starts").exists()
     assert recovered.json()["payload"]["previous_reason"] == (
         "Human Jira action" if human_closed else None
@@ -205,6 +217,11 @@ async def _uncertain(session_factory, lab):
         "changed-dispatch",
         "symlink",
         "hardlink",
+        "launch-symlink",
+        "launch-hardlink",
+        "launch-oversized",
+        "launch-directory",
+        "data/.launch-brief.md.123",
     ],
 )
 async def test_native_artifacts_keep_reservation(session_factory, lab, artifact):
@@ -215,11 +232,19 @@ async def test_native_artifacts_keep_reservation(session_factory, lab, artifact)
         (task / "dispatch").unlink()
     elif artifact == "changed-dispatch":
         (task / "dispatch").write_text("changed")
-    elif artifact in {"symlink", "hardlink"}:
-        brief = task / "brief.md"
+    elif artifact == "launch-oversized":
+        (task / "launch-brief.md").write_bytes(b"x" * 65537)
+    elif artifact == "launch-directory":
+        (task / "launch-brief.md").mkdir()
+    elif artifact in {"symlink", "hardlink", "launch-symlink", "launch-hardlink"}:
+        brief = task / (
+            "launch-brief.md" if artifact.startswith("launch-") else "brief.md"
+        )
+        if artifact.startswith("launch-"):
+            brief.write_text("native instruction overlay")
         target = home / "original-brief"
         brief.rename(target)
-        if artifact == "symlink":
+        if artifact.endswith("symlink"):
             brief.symlink_to(target)
         else:
             os.link(target, brief)
@@ -370,12 +395,20 @@ async def test_native_session_check_ignores_only_bootstrap_shell(
     sockets = tmux_directory(home, lab.copy._tmux_sockets)
     endpoint = sockets / f"tmux-{os.getuid()}/default"
     env = lab.copy._environment(home)
-    _script(
-        lab.checkout.parent / "tools/tmux",
-        f"import os, sys\nos.execv({tmux!r}, [{tmux!r}, *sys.argv[1:]])\n",
-    )
+    _real_tmux_script(lab.checkout.parent / "tools/tmux", tmux)
     subprocess.run(
-        [tmux, "-f", "/dev/null", "new-session", "-d", "-s", "firstmate", "/bin/sh"],
+        [
+            str(lab.checkout.parent / "tools/tmux"),
+            "-S",
+            str(endpoint),
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            "firstmate",
+            "/bin/sh",
+        ],
         env=env,
         check=True,
     )
@@ -448,7 +481,16 @@ async def test_native_session_check_ignores_only_bootstrap_shell(
                 await service.release_unstarted(**request)
             ).event_kind == "admin_release_unstarted"
     finally:
-        subprocess.run([tmux, "-S", str(endpoint), "kill-server"], env=env, check=True)
+        subprocess.run(
+            [
+                str(lab.checkout.parent / "tools/tmux"),
+                "-S",
+                str(endpoint),
+                "kill-server",
+            ],
+            env=env,
+            check=True,
+        )
 
 
 async def test_inflight_native_launch_keeps_reservation(session_factory, lab):
