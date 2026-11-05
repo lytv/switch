@@ -17,9 +17,11 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from switch_core.bridges.jira.activity import TicketActivity, TicketTurn
+from switch_core.bridges.jira.admin import release_parked_ticket
 from switch_core.bridges.jira.contracts import (
     Gate,
     Job,
+    Meter,
     Repository,
     Reservation,
     Result,
@@ -34,7 +36,6 @@ from switch_core.bridges.jira.delivery import (
     role_job,
     stage_scope,
 )
-from switch_core.bridges.jira.contracts import Meter
 from switch_core.bridges.jira.delivery_contracts import (
     ApprovalRoute,
     ApprovedCheck,
@@ -56,7 +57,6 @@ from switch_core.bridges.jira.firstmate_copy import (
 )
 from switch_core.bridges.jira.firstmate_jobs import Execution, FirstmateJobs
 from switch_core.bridges.jira.forge import GitHubDraftForge
-from switch_core.bridges.jira.admin import release_parked_ticket
 from switch_core.bridges.jira.intake import IntakeOrchestrator
 from switch_core.bridges.jira.model_gateway import (
     DeliveryModelGateway,
@@ -1753,9 +1753,12 @@ async def test_handoff_notice_waits_for_all_memberships(session_factory):
     post_index = next(
         index for index, event in enumerate(rooms.events) if event[0] == "post"
     )
-    assert [
-        name for kind, name in rooms.events[:post_index] if kind == "ensure"
-    ] == ["fix-flow", "fix-dev", "fix-review", "fix-qa"]
+    assert [name for kind, name in rooms.events[:post_index] if kind == "ensure"] == [
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    ]
     assert process.starts == []
 
 
@@ -2043,9 +2046,7 @@ async def test_handoff_refused_while_native_execution_active(session_factory):
         ticket.room_id = "room-1"
         await session.commit()
     jira = DeliveryJira()
-    _, supervisor, process, _, _ = services(
-        session_factory, jira, rooms=rooms
-    )
+    _, supervisor, process, _, _ = services(session_factory, jira, rooms=rooms)
     jira.approve()
     await supervisor.reconcile("ticket")
     assert process.starts == [scope.job.run.execution_key]
@@ -2109,9 +2110,7 @@ async def test_observe_mode_keeps_reconciling_active_execution(session_factory):
         ticket.room_id = "room-1"
         await session.commit()
     jira = DeliveryJira()
-    _, supervisor, process, _, _ = services(
-        session_factory, jira, rooms=rooms
-    )
+    _, supervisor, process, _, _ = services(session_factory, jira, rooms=rooms)
     jira.approve()
     await supervisor.reconcile("ticket")
     assert process.starts == [scope.job.run.execution_key]
@@ -2238,9 +2237,7 @@ async def test_handoff_blocks_jira_writes_for_ticket_only(session_factory):
                 )
             ).all()
         )
-        assert rows and all(
-            row.status == "cancelled" for row in rows
-        )
+        assert rows and all(row.status == "cancelled" for row in rows)
         handoff = (await _handoff_rows(session_factory))[0]
         assert (await session.get(JiraWorkerOutbox, handoff.id)).status == "done"
     assert rooms.notices == [("room-1", handoff.payload["data"])]
@@ -2616,9 +2613,7 @@ async def test_handoff_fence_follows_frozen_scope_not_generation(session_factory
     await activity.read_ticket("ticket", force_jira=True)
     await supervisor.reconcile("ticket")
     await sender.run_once()
-    rows = sorted(
-        await _handoff_rows(session_factory), key=lambda row: row.command_key
-    )
+    rows = sorted(await _handoff_rows(session_factory), key=lambda row: row.command_key)
     assert [row.command_key for row in rows] == [
         "handoff:ticket/1",
         f"handoff:ticket/{new_generation}",
@@ -2789,9 +2784,7 @@ async def test_model_gateway_keeps_existing_execution_without_execution_mode(
         execution = Execution.model_validate_json(json.dumps(row.payload))
         row.payload = execution.model_copy(
             update={
-                "meter": Meter(
-                    prices=model_prices(handoff_settings, execution.pack)
-                ),
+                "meter": Meter(prices=model_prices(handoff_settings, execution.pack)),
                 "model_identity": model_identity(scope.job),
             }
         ).model_dump(mode="json")

@@ -922,9 +922,21 @@ async def test_scope_change_reply_after_handoff_still_revises_scope(session_fact
 
 async def test_queued_native_question_cancelled_after_handoff(session_factory):
     lab = await setup(session_factory)
-    scope, _, _, _, rooms, process, _, activity, _, supervisor, _, orchestrator, sender = (
-        lab
-    )
+    (
+        scope,
+        _,
+        _,
+        _,
+        rooms,
+        process,
+        _,
+        activity,
+        _,
+        supervisor,
+        _,
+        orchestrator,
+        sender,
+    ) = lab
     await ask(process, scope.job)
     await supervisor.reconcile("ticket")
     assert await activity.run_one_turn(orchestrator) == "ticket"

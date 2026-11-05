@@ -1070,7 +1070,12 @@ class JiraOutboxSender:
                 handoff = payload.get("handoff") or {}
                 handoff_id = handoff.get("handoff_id")
                 if not isinstance(handoff_id, str) or not handoff_id:
-                    handoff_id = row.command_key.removeprefix("handoff:")
+                    handoff_id = (row.command_key or "").removeprefix("handoff:")
+                if not handoff_id:
+                    row.status = "uncertain"
+                    row.error = "Handoff notice identity is unknown; will recheck on a later run"
+                    await session.commit()
+                    return
                 posted = await self._handoff_notice_posted(
                     room_id=payload["room_id"],
                     body=payload["data"],
