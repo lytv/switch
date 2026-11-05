@@ -22,7 +22,7 @@ from sqlalchemy import and_, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from switch_core.bridges.jira.contracts import digest
+from switch_core.bridges.jira.contracts import digest, handoff_id_mentioned
 from switch_core.bridges.jira.delivery_contracts import ExactTransition
 from switch_core.bridges.jira.observe import _stamp, observe_jira
 from switch_core.bridges.jira.state import DeliveryWorkflowState, workflow_state_adapter
@@ -1034,28 +1034,8 @@ class JiraOutboxSender:
                             sender
                         ):
                             continue
-                        start = 0
-                        while True:
-                            found = body.find(handoff_id, start)
-                            if found < 0:
-                                break
-                            before = body[found - 1] if found > 0 else ""
-                            after = found + len(handoff_id)
-                            if (
-                                not (
-                                    before
-                                    and (
-                                        before.isalnum()
-                                        or before in "/_-."
-                                    )
-                                )
-                                and (
-                                    after >= len(body)
-                                    or not body[after].isalnum()
-                                )
-                            ):
-                                return True
-                            start = after
+                        if handoff_id_mentioned(body, handoff_id):
+                            return True
                 if not page["truncated"]:
                     return False
                 if page["next_seq"] == after_seq:

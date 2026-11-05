@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from switch_core.bridges.jira.contracts import handoff_id_mentioned
 
 # A Postgres time value: a bare count of milliseconds, or a count with a unit.
 _PG_INTERVAL_RE = re.compile(r"^\d+\s*(us|ms|s|min|h|d)?$")
@@ -469,9 +470,10 @@ class SwitchConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_handoff(self) -> "SwitchConfig":
+        probe_id = "9f2c4d1a/12"
         try:
             rendered = self.jira_worker_delivery_handoff_room_line.format(
-                issue_key="ISSUE", handoff_id="HANDOFF"
+                issue_key="TEST-1", handoff_id=probe_id
             )
         except (KeyError, IndexError, ValueError) as exc:
             raise ValueError(
@@ -479,7 +481,7 @@ class SwitchConfig(BaseSettings):
                 "placeholder or syntax; only {issue_key} and {handoff_id} "
                 "are allowed."
             ) from exc
-        if "HANDOFF" not in rendered:
+        if not handoff_id_mentioned(rendered, probe_id):
             raise ValueError(
                 "JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE must contain "
                 "{handoff_id} so recovery identifies notices by handoff."

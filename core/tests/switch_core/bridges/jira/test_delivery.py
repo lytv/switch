@@ -2971,8 +2971,69 @@ async def test_handoff_recovery_refuses_empty_membership_identities(session_fact
         "@fix-flow: {{handoff_id}} escaped",
         "@fix-flow: {unknown_field} broke",
         "@fix-flow: {} broke",
+        "HANDOFF: @fix-flow {issue_key} without binding",
     ],
 )
 def test_handoff_room_line_rejects_placeholders_without_handoff_id(line):
     with pytest.raises(ValidationError):
         _config(jira_worker_delivery_handoff_room_line=line)
+
+
+def test_handoff_room_line_accepts_dash_joined_binding():
+    settings = _config(
+        jira_worker_delivery_handoff_room_line="handoff-{handoff_id} for {issue_key}"
+    )
+    assert "handoff-" in settings.jira_worker_delivery_handoff_room_line
+
+
+async def test_handoff_recovery_recognizes_dash_joined_binding(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    body = "handoff-ticket/1 for TEST-1 by @fix-flow"
+    async with session_factory() as session:
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                instance="acme",
+                issue_key="TEST-1",
+                command_key="handoff:ticket/1",
+                command=HANDOFF_COMMAND,
+                status="sending",
+                payload={
+                    "data": body,
+                    "room_id": "room-1",
+                    "handoff": {
+                        "ticket_id": "ticket",
+                        "generation": 1,
+                        "handoff_id": "ticket/1",
+                    },
+                },
+                due_at=NOW,
+            )
+        )
+        await session.commit()
+    rooms.messages.append(
+        {
+            "id": "notice-1",
+            "kind": "message",
+            "sender": "jira-agent",
+            "body": body,
+            "timestamp": 1,
+        }
+    )
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(DeliveryJira())},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == []
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(JiraWorkerOutbox).where(
+                JiraWorkerOutbox.command_key == "handoff:ticket/1"
+            )
+        )
+        assert row is not None and row.status == "done"

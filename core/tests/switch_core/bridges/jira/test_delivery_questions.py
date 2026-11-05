@@ -942,3 +942,65 @@ async def test_queued_native_question_cancelled_after_handoff(session_factory):
             ).all()
         )
         assert rows and all(row.status == "cancelled" for row in rows)
+
+
+async def test_obsolete_native_wait_sends_nothing_after_handoff(session_factory):
+    lab = await open_question(session_factory)
+    (
+        scope,
+        settings,
+        clock,
+        _,
+        rooms,
+        process,
+        board,
+        _,
+        _,
+        supervisor,
+        _,
+        _,
+        sender,
+    ) = lab
+    sent_before_handoff = (list(rooms.questions), list(rooms.notices))
+    async with session_factory() as session:
+        ticket = await session.get(JiraWorkerTicket, "ticket")
+        ticket.wait_anchor = (NOW - timedelta(days=3)).replace(hour=9)
+        await session.commit()
+    clock[0] = NOW.replace(hour=11)
+    await sync_admin_card(
+        session_factory,
+        engine=session_factory.kw["bind"],
+        board=board,
+        config=settings,
+        ticket_id="ticket",
+        now=clock[0],
+    )
+    await _commit_handoff(session_factory)
+    clock[0] = NOW.replace(hour=17)
+    await sync_admin_card(
+        session_factory,
+        engine=session_factory.kw["bind"],
+        board=board,
+        config=settings,
+        ticket_id="ticket",
+        now=clock[0],
+    )
+    await send_all(sender)
+    await supervisor.reconcile("ticket")
+    ticket, state = await snapshot(session_factory)
+    assert ticket.worker_parked_reason is None
+    assert state.question is not None and state.answer is None
+    assert (list(rooms.questions), list(rooms.notices)) == sent_before_handoff
+    async with session_factory() as session:
+        waits = list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        (JiraWorkerOutbox.command == "wait_reminder")
+                        | JiraWorkerOutbox.command_key.like("wait-blocked:%")
+                    )
+                )
+            ).all()
+        )
+        assert waits and all(row.status == "cancelled" for row in waits)
+    assert process.starts == [scope.job.run.execution_key]
