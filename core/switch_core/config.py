@@ -469,7 +469,17 @@ class SwitchConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_handoff(self) -> "SwitchConfig":
-        if "{handoff_id}" not in self.jira_worker_delivery_handoff_room_line:
+        try:
+            rendered = self.jira_worker_delivery_handoff_room_line.format(
+                issue_key="ISSUE", handoff_id="HANDOFF"
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE has an unsupported "
+                "placeholder or syntax; only {issue_key} and {handoff_id} "
+                "are allowed."
+            ) from exc
+        if "HANDOFF" not in rendered:
             raise ValueError(
                 "JIRA_WORKER_DELIVERY_HANDOFF_ROOM_LINE must contain "
                 "{handoff_id} so recovery identifies notices by handoff."

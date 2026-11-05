@@ -846,3 +846,99 @@ async def test_budget_receipt_is_idempotent_and_never_resets_unknown_usage(
             actor="admin",
             now=clock[0],
         )
+
+
+async def _commit_handoff(sessions):
+    async with sessions() as session:
+        session.add(
+            JiraWorkerOutbox(
+                channel="switch",
+                instance="acme",
+                issue_key="TEST-1",
+                command_key="handoff:ticket/1",
+                command="handoff",
+                status="done",
+                payload={
+                    "data": "notice",
+                    "room_id": "room-1",
+                    "handoff": {
+                        "ticket_id": "ticket",
+                        "generation": 1,
+                        "handoff_id": "ticket/1",
+                    },
+                },
+                due_at=NOW,
+            )
+        )
+        await session.commit()
+
+
+async def test_answer_reply_after_handoff_sends_no_resume(session_factory):
+    lab = await open_question(session_factory)
+    (
+        scope,
+        _,
+        _,
+        _,
+        rooms,
+        process,
+        _,
+        activity,
+        _,
+        supervisor,
+        model,
+        orchestrator,
+        sender,
+    ) = lab
+    await _commit_handoff(session_factory)
+    model.action = "answer"
+    rooms.messages.append({**message(1), "body": "Browser version 123"})
+    assert await activity.run_one_turn(orchestrator) == "ticket"
+    ticket, state = await snapshot(session_factory)
+    assert state.answer is None and ticket.worker_parked_reason is None
+    await send_all(sender)
+    await supervisor.reconcile("ticket")
+    ticket, _ = await snapshot(session_factory)
+    assert ticket.worker_parked_reason is None
+    assert process.starts == [scope.job.run.execution_key]
+
+
+async def test_scope_change_reply_after_handoff_still_revises_scope(session_factory):
+    lab = await open_question(session_factory)
+    (_, _, _, _, rooms, _, _, activity, _, supervisor, model, orchestrator, _) = lab
+    await _commit_handoff(session_factory)
+    model.action = "scope_change"
+    rooms.messages.append(
+        {
+            **message(1),
+            "body": "Support a different browser and change the expected behavior.",
+        }
+    )
+    await activity.run_one_turn(orchestrator)
+    await supervisor.reconcile("ticket")
+    ticket, state = await snapshot(session_factory)
+    assert ticket.agent_generation == 2 and state.step == "intake"
+
+
+async def test_queued_native_question_cancelled_after_handoff(session_factory):
+    lab = await setup(session_factory)
+    scope, _, _, _, rooms, process, _, activity, _, supervisor, _, orchestrator, sender = (
+        lab
+    )
+    await ask(process, scope.job)
+    await supervisor.reconcile("ticket")
+    assert await activity.run_one_turn(orchestrator) == "ticket"
+    await _commit_handoff(session_factory)
+    await send_all(sender)
+    assert rooms.questions == []
+    async with session_factory() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(JiraWorkerOutbox).where(
+                        JiraWorkerOutbox.command == "intake_question"
+                    )
+                )
+            ).all()
+        )
+        assert rows and all(row.status == "cancelled" for row in rows)

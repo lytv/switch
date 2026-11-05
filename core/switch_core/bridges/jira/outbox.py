@@ -579,6 +579,10 @@ class JiraOutboxSender:
                         == payload["delivery_question"]
                         and (state.answer is not None) == payload["requires_answer"]
                     )
+                    if valid and await _has_handoff(
+                        session, instance=row.instance, issue_key=row.issue_key
+                    ):
+                        valid = False
                 if "delivery_progress_execution" in payload:
                     execution = await session.scalar(
                         select(JiraWorkerJob).where(
@@ -1019,15 +1023,37 @@ class JiraOutboxSender:
                         body = (
                             message.get("body") if isinstance(message, dict) else None
                         )
+                        sender = (
+                            message.get("sender")
+                            if isinstance(message, dict)
+                            else None
+                        )
                         if not isinstance(body, str):
+                            continue
+                        if not isinstance(sender, str) or not await rooms.is_worker_sender(
+                            sender
+                        ):
                             continue
                         start = 0
                         while True:
                             found = body.find(handoff_id, start)
                             if found < 0:
                                 break
+                            before = body[found - 1] if found > 0 else ""
                             after = found + len(handoff_id)
-                            if after >= len(body) or not body[after].isdigit():
+                            if (
+                                not (
+                                    before
+                                    and (
+                                        before.isalnum()
+                                        or before in "/_-."
+                                    )
+                                )
+                                and (
+                                    after >= len(body)
+                                    or not body[after].isalnum()
+                                )
+                            ):
                                 return True
                             start = after
                 if not page["truncated"]:
@@ -1051,7 +1077,17 @@ class JiraOutboxSender:
             raise ValueError("Switch notice sender requires ticket rooms")
         payload = row.payload or {}
         if row.command == HANDOFF_COMMAND:
-            for agent in self._config.jira_worker_delivery_handoff_agents:
+            agents = self._config.jira_worker_delivery_handoff_agents
+            if (
+                len(agents) != 4
+                or len(set(agents)) != 4
+                or any(not agent.strip() for agent in agents)
+            ):
+                row.status = "uncertain"
+                row.error = "Handoff membership identities are invalid; will recheck on a later run"
+                await session.commit()
+                return
+            for agent in agents:
                 await self._rooms.ensure_agent_member(
                     payload["room_id"], agent_name=agent
                 )

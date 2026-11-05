@@ -1821,6 +1821,7 @@ class ReadbackRooms(ThreadRooms):
     def __init__(self):
         super().__init__()
         self.rooms["room-1"] = {"agents": []}
+        self.worker_senders.add("jira-agent")
 
     async def post_notice(self, room_id, *, body):
         event_id = await super().post_notice(room_id, body=body)
@@ -2891,3 +2892,87 @@ def test_handoff_agents_default_accepted():
         "fix-qa",
     )
     _config(jira_worker_delivery_handoff_agents=[])
+
+
+async def test_handoff_recovery_ignores_reporter_branch_mention(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    handoff_id = rows[0].payload["handoff"]["handoff_id"]
+    rooms.messages.append(
+        {**message(1), "body": f"approved branch switch/{handoff_id} looks good"}
+    )
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        row.status = "sending"
+        await session.commit()
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=config(handoff=True),
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    assert rooms.notices == [("room-1", rows[0].payload["data"])]
+    async with session_factory() as session:
+        assert (await session.get(JiraWorkerOutbox, rows[0].id)).status == "done"
+    assert process.starts == []
+
+
+async def test_handoff_recovery_refuses_empty_membership_identities(session_factory):
+    await _seed_with_room(session_factory)
+    rooms = ReadbackRooms()
+    jira = DeliveryJira()
+    jira.approve()
+    _, supervisor, process, _, _ = services(
+        session_factory, jira, handoff=True, rooms=rooms
+    )
+    await supervisor.reconcile("ticket")
+    rows = await _handoff_rows(session_factory)
+    assert len(rows) == 1
+    degraded = config(handoff=True).model_copy(
+        update={
+            "jira_worker_delivery_handoff_enabled": False,
+            "jira_worker_delivery_handoff_agents": [],
+        }
+    )
+    sender = JiraOutboxSender(
+        session_factory=session_factory,
+        config=degraded,
+        clients={"acme": client_for(jira)},
+        clock=lambda: NOW,
+        rooms=rooms,
+    )
+    await sender.run_once()
+    async with session_factory() as session:
+        row = await session.get(JiraWorkerOutbox, rows[0].id)
+        assert row.status == "uncertain"
+    assert rooms.notices == []
+    assert rooms.rooms["room-1"]["agents"] == [
+        "fix-flow",
+        "fix-dev",
+        "fix-review",
+        "fix-qa",
+    ]
+    assert process.starts == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "@fix-flow: {{handoff_id}} escaped",
+        "@fix-flow: {unknown_field} broke",
+        "@fix-flow: {} broke",
+    ],
+)
+def test_handoff_room_line_rejects_placeholders_without_handoff_id(line):
+    with pytest.raises(ValidationError):
+        _config(jira_worker_delivery_handoff_room_line=line)
