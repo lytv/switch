@@ -670,10 +670,7 @@ class DeliverySupervisor:
             if self._config.jira_worker_delivery_handoff_enabled and not active:
                 await self._handoff(ticket_id)
                 return
-            if (
-                not self._config.jira_worker_delivery_execution_enabled
-                and not active
-            ):
+            if not self._config.jira_worker_delivery_execution_enabled and not active:
                 return
             if not active and await _has_handoff(
                 session,
@@ -918,9 +915,7 @@ class DeliverySupervisor:
     async def _handoff_locked(
         self, session: AsyncSession, ticket_id: str
     ) -> tuple[str, tuple[str, ...]] | None:
-        ticket = await session.get(
-            JiraWorkerTicket, ticket_id, with_for_update=True
-        )
+        ticket = await session.get(JiraWorkerTicket, ticket_id, with_for_update=True)
         if ticket is None or ticket.worker_parked_reason or ticket.room_id is None:
             return None
         state = delivery_state(ticket)

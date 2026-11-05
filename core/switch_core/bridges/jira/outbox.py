@@ -43,9 +43,7 @@ HANDOFF_COMMAND = "handoff"
 
 def _ticket_scope_digest(ticket: JiraWorkerTicket) -> str | None:
     try:
-        state = workflow_state_adapter.validate_json(
-            json.dumps(ticket.workflow_state)
-        )
+        state = workflow_state_adapter.validate_json(json.dumps(ticket.workflow_state))
     except Exception:
         return None
     if not isinstance(state, DeliveryWorkflowState) or state.scope is None:
@@ -90,15 +88,18 @@ async def _handoff_fences(
 
 
 async def _has_handoff(session: AsyncSession, *, instance: str, issue_key: str) -> bool:
-    return await session.scalar(
-        select(JiraWorkerOutbox.id)
-        .where(
-            JiraWorkerOutbox.instance == instance,
-            JiraWorkerOutbox.issue_key == issue_key,
-            JiraWorkerOutbox.command == HANDOFF_COMMAND,
+    return (
+        await session.scalar(
+            select(JiraWorkerOutbox.id)
+            .where(
+                JiraWorkerOutbox.instance == instance,
+                JiraWorkerOutbox.issue_key == issue_key,
+                JiraWorkerOutbox.command == HANDOFF_COMMAND,
+            )
+            .limit(1)
         )
-        .limit(1)
-    ) is not None
+        is not None
+    )
 
 
 def _validate_command(command: str, data: Any) -> None:
@@ -537,9 +538,7 @@ class JiraOutboxSender:
         payload = row.payload or {}
         if row.channel == "jira" and row.status != "sending":
             row_generation = payload.get("intake_generation")
-            if not isinstance(row_generation, int) or isinstance(
-                row_generation, bool
-            ):
+            if not isinstance(row_generation, int) or isinstance(row_generation, bool):
                 row_generation = ticket.agent_generation
             if await _handoff_fences(
                 session,
@@ -1024,15 +1023,13 @@ class JiraOutboxSender:
                             message.get("body") if isinstance(message, dict) else None
                         )
                         sender = (
-                            message.get("sender")
-                            if isinstance(message, dict)
-                            else None
+                            message.get("sender") if isinstance(message, dict) else None
                         )
                         if not isinstance(message_body, str):
                             continue
-                        if not isinstance(sender, str) or not await rooms.is_worker_sender(
-                            sender
-                        ):
+                        if not isinstance(
+                            sender, str
+                        ) or not await rooms.is_worker_sender(sender):
                             continue
                         if message_body == body and handoff_id in message_body:
                             return True
@@ -1042,9 +1039,7 @@ class JiraOutboxSender:
                     return None
                 after_seq = page["next_seq"]
         except Exception:
-            logger.exception(
-                "Handoff notice read-back failed for room %s", room_id
-            )
+            logger.exception("Handoff notice read-back failed for room %s", room_id)
             return None
 
     async def _send_switch_notice(
@@ -1083,7 +1078,9 @@ class JiraOutboxSender:
                 )
                 if posted is None:
                     row.status = "uncertain"
-                    row.error = "Room notice outcome is unknown; will recheck on a later run"
+                    row.error = (
+                        "Room notice outcome is unknown; will recheck on a later run"
+                    )
                     await session.commit()
                     return
                 if posted:

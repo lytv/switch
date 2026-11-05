@@ -481,9 +481,7 @@ class SwitchConfig(BaseSettings):
             name == "handoff_id" and not spec and conversion is None
             for name, spec, conversion in fields
         ) or any(
-            name not in ("handoff_id", "issue_key")
-            or spec
-            or conversion is not None
+            name not in ("handoff_id", "issue_key") or spec or conversion is not None
             for name, spec, conversion in fields
         ):
             raise ValueError(
